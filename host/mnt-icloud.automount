@@ -1,0 +1,10 @@
+# Copy to /etc/systemd/system/mnt-icloud.automount
+[Unit]
+Description=Automount for iCloud Drive
+
+[Automount]
+Where=/mnt/icloud
+TimeoutIdleSec=0
+
+[Install]
+WantedBy=multi-user.target

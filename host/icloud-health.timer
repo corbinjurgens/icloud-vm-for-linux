@@ -1,0 +1,10 @@
+# Copy to /etc/systemd/system/icloud-health.timer
+[Unit]
+Description=Run iCloud VM health check every 10 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target

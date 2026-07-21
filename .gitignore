@@ -1,0 +1,8 @@
+# Operator secrets and machine-specific values
+.env
+
+# VM disk image / dockur working dir (huge, machine-local)
+/storage/
+
+# Provisioning logs written into the repo dir, if any
+*.log

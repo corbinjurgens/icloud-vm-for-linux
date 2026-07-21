@@ -1,0 +1,17 @@
+# Copy to /etc/systemd/system/mnt-icloud.mount
+# uid/gid 1000 = the primary desktop user; adjust to `id -u` / `id -g`.
+# actimeo=1 keeps metadata fresh so remote-side changes appear within ~1s of listing.
+[Unit]
+Description=iCloud Drive via Windows VM (CIFS)
+Requires=docker.service
+After=docker.service
+
+[Mount]
+What=//127.0.0.1/icloud
+Where=/mnt/icloud
+Type=cifs
+Options=credentials=/etc/credentials-icloud,port=10445,vers=3.1.1,uid=1000,gid=1000,file_mode=0664,dir_mode=0775,actimeo=1,echo_interval=15,_netdev
+TimeoutSec=30
+
+[Install]
+WantedBy=multi-user.target

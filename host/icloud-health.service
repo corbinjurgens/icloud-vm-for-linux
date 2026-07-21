@@ -1,0 +1,7 @@
+# Copy to /etc/systemd/system/icloud-health.service
+[Unit]
+Description=iCloud VM health check
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/icloud-health.sh

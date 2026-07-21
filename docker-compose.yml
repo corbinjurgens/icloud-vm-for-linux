@@ -1,0 +1,35 @@
+# iCloud-on-Linux Windows guest, built on dockur/windows.
+# See docs/implementation-plan.md sections 3 and 12 for the rationale behind
+# every setting here. Operator values come from .env (copy .env.example).
+services:
+  windows:
+    image: dockurr/windows
+    container_name: icloud-windows
+    environment:
+      VERSION: "11"            # Windows 11 Pro, auto-downloaded from Microsoft
+      RAM_SIZE: "${RAM_SIZE}"
+      CPU_CORES: "${CPU_CORES}"
+      DISK_SIZE: "${DISK_SIZE}"
+      USERNAME: "icloud"       # auto-logon desktop user (blank password by design, plan D8)
+      LANGUAGE: "English"
+      REGION: "en-US"          # adjust if the Apple ID region requires it
+      KEYBOARD: "en-US"
+    devices:
+      - /dev/kvm
+      - /dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "127.0.0.1:8006:8006"          # web viewer (noVNC) — install & login only
+      - "127.0.0.1:3389:3389/tcp"      # RDP — admin access
+      - "127.0.0.1:3389:3389/udp"
+      - "127.0.0.1:10445:445"          # guest SMB share -> host mount
+    volumes:
+      - /srv/icloud-vm/storage:/storage
+      # Enhancement over the plan's manual paste (plan sections 4-5): dockur copies
+      # this folder to C:\OEM and runs install.bat at the end of installation, so
+      # the debloat step is applied unattended. Store-dependent iCloud install and
+      # the secret-bearing SMB share stay operator-run — see provision/install.bat.
+      - ./provision:/oem
+    stop_grace_period: 2m
+    restart: unless-stopped
