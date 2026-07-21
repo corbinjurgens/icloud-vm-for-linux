@@ -57,7 +57,10 @@ immediately — a live, bidirectional bridge, not a one-way mirror.
 │   ├── 01-debloat.ps1
 │   ├── 02-install-icloud.ps1
 │   └── 03-create-share.ps1
-├── host/                  # host-side systemd units + health check
+├── host/                  # host-side setup, systemd units + health check
+│   ├── setup-prereqs.sh   # install docker + cifs-utils, verify KVM (plan §1)
+│   ├── setup-host.sh      # build credentials from .env, install mount + timer
+│   ├── acceptance-tests.sh# host-side subset of the acceptance tests (plan §11)
 │   ├── mnt-icloud.mount
 │   ├── mnt-icloud.automount
 │   ├── icloud-health.sh
@@ -66,6 +69,41 @@ immediately — a live, bidirectional bridge, not a one-way mirror.
 └── docs/
     └── implementation-plan.md   # full, authoritative build handoff
 ```
+
+## Quickstart
+
+```bash
+# On the Linux host:
+sudo ./host/setup-prereqs.sh          # docker + cifs-utils + KVM check (§1)
+# log out/in so docker works without sudo
+cp .env.example .env && $EDITOR .env  # set DISK_SIZE / RAM_SIZE / CPU_CORES / SHARE_PASS
+docker compose up -d                  # boots the guest; watch http://127.0.0.1:8006
+```
+
+Then, once the Windows desktop is up (debloat has already run unattended via the
+`/oem` mount), do the one-time in-guest steps — details in the plan §5–§7:
+
+1. `C:\OEM\02-install-icloud.ps1` (or install "iCloud" from the Store).
+2. Launch iCloud, sign in + 2FA, turn **iCloud Drive ON**, **disable Files
+   On-Demand**, wait for initial sync, then pin: `attrib +P -U "%USERPROFILE%\iCloudDrive\*" /S /D`.
+3. Edit `C:\OEM\03-create-share.ps1` (set `SHARE_PASS`) and run it as Administrator.
+
+Back on the host:
+
+```bash
+sudo ./host/setup-host.sh             # mount the share + enable health checks (§8–§9)
+./host/acceptance-tests.sh            # verify (§11)
+ls /mnt/icloud                        # your iCloud files
+```
+
+## Status
+
+Build scaffolding is **complete**; all host and guest automation is written and
+committed. What remains is a real end-to-end run on KVM hardware plus the manual
+Apple ID sign-in — i.e. executing the Quickstart above and passing the
+acceptance tests in [`docs/implementation-plan.md`](docs/implementation-plan.md)
+§11. Everything that can be prepared without your Apple session and physical
+host is in place.
 
 ## Status
 
