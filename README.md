@@ -101,15 +101,9 @@ ls /mnt/icloud                        # your iCloud files
 Build scaffolding is **complete**; all host and guest automation is written and
 committed. What remains is a real end-to-end run on KVM hardware plus the manual
 Apple ID sign-in — i.e. executing the Quickstart above and passing the
-acceptance tests in [`docs/implementation-plan.md`](docs/implementation-plan.md)
-§11. Everything that can be prepared without your Apple session and physical
-host is in place.
-
-## Status
-
-Groundwork in progress. The authoritative, step-by-step build instructions —
-all component decisions, provisioning scripts, host mount config, health
-monitoring, acceptance tests, and the failure runbook — live in
+acceptance tests in the plan's §11. The authoritative, step-by-step build
+instructions — all component decisions, provisioning scripts, host mount
+config, health monitoring, acceptance tests, and the failure runbook — live in
 [`docs/implementation-plan.md`](docs/implementation-plan.md).
 
 ## Security posture

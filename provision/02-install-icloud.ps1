@@ -8,6 +8,14 @@
 winget install --id AppleInc.iCloud --source msstore `
   --accept-package-agreements --accept-source-agreements
 
+# Some winget builds resolve msstore entries only by Store product id, not by
+# the AppleInc.iCloud moniker. Retry with iCloud's Store id before falling back
+# to a manual Store install.
+if ($LASTEXITCODE -ne 0) {
+  winget install --id 9PKTQ5699M62 --source msstore `
+    --accept-package-agreements --accept-source-agreements
+}
+
 # Verify:
 Get-AppxPackage AppleInc.iCloud
 # =====================================================================

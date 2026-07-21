@@ -26,8 +26,10 @@ if [ ! -f "$repo_root/.env" ]; then
   echo "Missing $repo_root/.env (copy .env.example and fill SHARE_PASS)." >&2
   exit 1
 fi
-# shellcheck disable=SC1090
-SHARE_PASS="$(grep -E '^SHARE_PASS=' "$repo_root/.env" | cut -d= -f2-)"
+# Take the last assignment; strip CRLF and optional surrounding quotes so the
+# credentials file never silently carries a stray \r or quote into the password.
+SHARE_PASS="$(grep -E '^SHARE_PASS=' "$repo_root/.env" | tail -n1 | cut -d= -f2- | tr -d '\r')"
+SHARE_PASS="${SHARE_PASS#\"}"; SHARE_PASS="${SHARE_PASS%\"}"
 if [ -z "${SHARE_PASS:-}" ] || [ "$SHARE_PASS" = "CHANGE_ME_STRONG_PASSWORD" ]; then
   echo "SHARE_PASS is unset or still the placeholder in .env." >&2
   exit 1
