@@ -67,7 +67,8 @@ immediately — a live, bidirectional bridge, not a one-way mirror.
 │   ├── icloud-health.service
 │   └── icloud-health.timer
 └── docs/
-    └── implementation-plan.md   # full, authoritative build handoff
+    ├── implementation-plan.md        # full, authoritative build handoff (v1)
+    └── plan-gui-selective-sync.md    # v2 plan: host GUI + tray icon, selective sync
 ```
 
 ## Quickstart
