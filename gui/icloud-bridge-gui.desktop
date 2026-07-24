@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=iCloud bridge
+GenericName=iCloud Drive status
+Comment=Health of the iCloud Drive bridge, and which folders sync to this computer
+# install-gui.sh rewrites __LAUNCHER__ / __ICON__ to absolute paths: .desktop
+# files do not expand ~ or shell variables.
+Exec=__LAUNCHER__
+Icon=__ICON__
+Terminal=false
+Categories=Utility;System;FileTools;
+Keywords=iCloud;sync;selective;
+StartupNotify=true

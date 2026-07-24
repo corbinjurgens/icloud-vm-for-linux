@@ -25,11 +25,24 @@ if ! kvm-ok; then
   exit 1
 fi
 
-echo "==> Installing Docker Engine (not Docker Desktop — it cannot pass /dev/kvm)"
-if ! command -v docker >/dev/null 2>&1; then
+echo "==> Installing native Docker Engine (Docker Desktop cannot pass /dev/kvm)"
+# Test for the daemon binary `dockerd`, NOT the `docker` CLI: Docker Desktop ships
+# the CLI on the host but runs its daemon inside a LinuxKit VM, so `command -v
+# docker` is true even when no host Engine (and no /dev/kvm passthrough) exists.
+if ! command -v dockerd >/dev/null 2>&1; then
   curl -fsSL https://get.docker.com | sh
 fi
 systemctl enable --now docker
+
+# If Docker Desktop is also installed, the operator's CLI likely defaults to its
+# context. Point it at the native Engine so `docker compose up` reaches the host
+# daemon that can pass /dev/kvm. Context selection is per-user, so switch it for
+# TARGET_USER (the sudo caller) — the 'desktop-linux' context is theirs, not root's.
+if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ] \
+   && sudo -u "$TARGET_USER" docker context ls 2>/dev/null | grep -q 'desktop-linux'; then
+  echo "==> Docker Desktop detected; selecting the native 'default' context for $TARGET_USER"
+  sudo -u "$TARGET_USER" docker context use default >/dev/null 2>&1 || true
+fi
 
 if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
   echo "==> Adding $TARGET_USER to the docker group (re-login required)"
@@ -46,8 +59,10 @@ cat <<'EOF'
 
 Prerequisites installed. Next:
   1. Log out/in (or run: newgrp docker) so docker works without sudo.
-  2. cp .env.example .env  and fill in DISK_SIZE / RAM_SIZE / CPU_CORES / SHARE_PASS.
-  3. docker compose up -d   then open http://127.0.0.1:8006 and wait for the desktop.
-  4. Follow docs/implementation-plan.md sections 5-7 inside the guest.
-  5. sudo ./host/setup-host.sh   to mount the share and enable health checks.
+  2. Confirm the CLI targets the native Engine:  docker context ls   (expect 'default *',
+     not 'desktop-linux'; switch with:  docker context use default).
+  3. cp .env.example .env  and fill in DISK_SIZE / RAM_SIZE / CPU_CORES / SHARE_PASS.
+  4. docker compose up -d   then open http://127.0.0.1:8006 and wait for the desktop.
+  5. Follow docs/implementation-plan.md sections 5-7 inside the guest.
+  6. sudo ./host/setup-host.sh   to mount the share and enable health checks.
 EOF

@@ -6,3 +6,6 @@
 
 # Provisioning logs written into the repo dir, if any
 *.log
+
+# Python bytecode (gui/ and tools/ scripts)
+__pycache__/

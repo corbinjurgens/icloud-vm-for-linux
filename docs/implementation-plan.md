@@ -1,6 +1,21 @@
 # iCloud Drive on Linux via Minimal Windows VM — Implementation Handoff
 
-**Version:** 1.0 · **Status:** Ready to execute · **Audience:** an executor (human or model) who follows instructions literally. All decisions are already made. Do not substitute components unless a step explicitly offers a fallback.
+**Version:** 1.1 · **Status:** Ready to execute · **Audience:** an executor (human or model) who follows instructions literally. All decisions are already made. Do not substitute components unless a step explicitly offers a fallback.
+
+**v1.1 change note (2026-07-23).** This document is amended by
+[`../plan-gui-selective-sync.md`](../plan-gui-selective-sync.md) ("the v2 plan"),
+which adds a host GUI, a guest bridge agent, and selective sync. Where the two
+disagree, **v2 wins**. The changes folded in here are:
+
+- **D5 is disproven and superseded** — see the D5 row and §6. Files On-Demand
+  stays **on**, nothing is pinned, and placeholders hydrate on read.
+- The sizing rule (§1) no longer assumes the whole library is resident.
+- §2's layout is the real repository, including the v2 paths.
+- §7's share script grants at the root only, not `/T`.
+- §8 gains the bridge control mount.
+- §11's pinned-file check is replaced by the E0 gate.
+- §13 is new: it lists the v2 artifacts and records which of them are
+  deliberately not embedded verbatim here.
 
 ---
 
@@ -20,7 +35,7 @@ Why this approach (context for the executor; do not deviate): every native-Linux
 | D2 | VM management | `dockur/windows` container | Automated unattended install, VirtIO drivers injected, reproducible via one compose file |
 | D3 | Windows edition | Stock **Windows 11 Pro** (`VERSION: "11"`), debloated post-install by script | Avoids building a custom ISO (tiny11builder requires a Windows machine to run DISM — chicken-and-egg). Runtime debloat recovers most of the savings |
 | D4 | iCloud install method | `winget` from the `msstore` source; manual Store install as fallback | Scriptable |
-| D5 | Files On-Demand | **Disabled**, folder pinned with `attrib +P` | Placeholders (dataless files) served over SMB stall or fail; host must see real bytes |
+| D5 | Files On-Demand | ~~**Disabled**, folder pinned with `attrib +P`~~ — **DISPROVEN 2026-07-22/23, superseded by v2 D14/D25/D26.** Files On-Demand stays **ON** and this project pins nothing | The premise ("placeholders served over SMB stall or fail") is false. Live tests against the running guest hydrated dataless placeholders on demand for SMB reads, with correct content and checksums, exactly like OneDrive. Evidence: v2 plan §0.5; scripts `tools/test-smb-hydration.ps1` and `tools/test-smb-read.sh`. Pinning is therefore unnecessary, and avoiding it removes the requirement to hold the entire library on the guest disk. The first run of the guest bridge agent clears any legacy `P` intent with `attrib -P`, **without** requesting eviction of content already on disk. It never runs a global `+U`. Cold reads block for the duration of the download — that trade is gated by E0 (§11) |
 | D6 | Guest→host export | SMB share **from the guest**, mounted on host via `cifs` + systemd automount | Only live-bidirectional option: host writes land directly in the Cloud Files sync root and upload immediately. (A robocopy mirror to a host folder was considered and rejected: one-way, polling delay, dangerous for bidirectional) |
 | D7 | Sync root location | Guest-local NTFS virtual disk (default `%USERPROFILE%\iCloudDrive`) | Cloud Files API requires local NTFS with reparse points; cannot point it at a network path |
 | D8 | Share account | Dedicated local Windows user `syncshare` (SMB only), separate from the auto-logon user | Auto-logon user has a blank password (required for unattended logon); SMB must be password-protected |
@@ -56,30 +71,74 @@ sudo apt-get install -y cifs-utils
 sudo mkdir -p /srv/icloud-vm/storage
 ```
 
-**Sizing rule (D10):** `DISK_SIZE = 40 GB + (total iCloud Drive data) rounded up to the next 20 GB`. Example: 70 GB of iCloud data → `DISK_SIZE: "120G"`. The qcow2 image grows on demand, so oversizing costs nothing upfront. RAM: 3 GB allocated (do not go below 2.5 GB; Windows update servicing needs it). Host must therefore have ≥ 3 GB free RAM permanently.
+**Sizing rule (D10, amended by v2 D25/D26):** size the disk for **Windows plus
+the cached working set you expect**, not for the whole library. With Files
+On-Demand on and nothing pinned, files occupy guest disk only after something
+reads them, and the reclamation sweep releases the coldest in-sync content when
+free space drops below 20 GB, aiming for 30 GB.
+
+`DISK_SIZE: "120G"` is the selected starting size for the measured 101 GB
+library — it is a starting point, not a promise that 120 GB suits every library.
+Reclamation cannot free content that is open, modified, or still uploading, so
+a disk that is too small for the live working set will sit below the floor and
+report yellow. Growing the disk (§10) stays in the runbook.
+
+The qcow2 image grows on demand, so oversizing costs nothing upfront. RAM: 3 GB allocated (do not go below 2.5 GB; Windows update servicing needs it). Host must therefore have ≥ 3 GB free RAM permanently.
 
 ---
 
 ## 2. Project repository layout
 
-Create this exact structure (a git repo is recommended):
+This is the actual repository, including the v2 additions (v2 plan D24):
 
 ```
-icloud-vm/
+icloud-vm-for-linux/
 ├── docker-compose.yml
-├── .env                      # operator-specific values (gitignore this)
-├── provision/                # scripts to run INSIDE the Windows guest
-│   ├── 01-debloat.ps1
-│   ├── 02-install-icloud.ps1
-│   └── 03-create-share.ps1
-├── host/
+├── .env                          # operator-specific values (gitignored)
+├── .env.example
+├── AGENTS.md  (== CLAUDE.md)     # working rules for coding agents
+├── README.md                     # overview, usage, selective-sync summary
+├── SETUP.md                      # annotated real-machine runbook
+├── plan-gui-selective-sync.md    # the v2 plan (amends this document)
+├── provision/                    # run INSIDE the Windows guest
+│   ├── install.bat               # dockur OEM bootstrap (auto-runs 01)
+│   ├── 01-debloat.ps1            # auto-run; no network, no secrets
+│   ├── 02-install-icloud.ps1     # operator-run
+│   ├── 03-create-share.ps1       # operator-run; placeholder password by design
+│   ├── 04-bridge-agent.ps1       # operator-run; bridge share, agent task, ABE, ACLs
+│   └── agent.ps1                 # byte-identical copy of guest-agent/agent.ps1
+├── guest-agent/
+│   └── agent.ps1                 # source of truth for the guest agent
+├── gui/                          # host GUI + tray icon (PySide6)
+│   ├── icloud_bridge_gui/        # health.py, bridge.py, tray.py, window.py, __main__.py, icons/
+│   ├── tests/                    # pytest: test_health.py, test_bridge.py
+│   ├── install-gui.sh
+│   ├── icloud-bridge-gui.desktop
+│   └── autostart/icloud-bridge-tray.desktop
+├── host/                         # Linux host
+│   ├── setup-prereqs.sh          # docker + cifs-utils + KVM check (§1)
+│   ├── setup-host.sh             # credentials from .env, install units (§8–§9)
+│   ├── acceptance-tests.sh       # host-checkable subset of §11
 │   ├── mnt-icloud.mount
 │   ├── mnt-icloud.automount
+│   ├── mnt-icloud_bridge.mount   # v2 control share (v2 plan D16)
+│   ├── mnt-icloud_bridge.automount
 │   ├── icloud-health.sh
 │   ├── icloud-health.service
 │   └── icloud-health.timer
-└── README.md                 # copy of this document
+├── tools/                        # host-side helpers for driving/verifying the guest
+│   ├── guest-ctl.sh, qemu-monitor.py, rdp-ready.py, keep-iso.sh
+│   ├── watch-sync.sh, icloud-status.ps1, icloud-folders.ps1
+│   └── test-smb-hydration.ps1, test-smb-read.sh   # the D5 evidence
+└── docs/
+    ├── implementation-plan.md    # this document
+    ├── selective-sync.md         # user page + deployment checklist
+    └── automation-notes.md       # first-run record: what was manual and why
 ```
+
+`agent.ps1` exists twice on purpose: `guest-agent/agent.ps1` is the source of
+truth, and `provision/agent.ps1` is the copy dockur places in `C:\OEM` at install
+time. `host/acceptance-tests.sh` §8 fails if the two diverge.
 
 `.env` contents (operator fills in; `SHARE_PASS` must be strong — 20+ random chars):
 
@@ -120,6 +179,11 @@ services:
       - "127.0.0.1:10445:445"          # guest SMB share → host mount
     volumes:
       - /srv/icloud-vm/storage:/storage
+      # Enhancement over the plan's manual paste (plan sections 4-5): dockur copies
+      # this folder to C:\OEM and runs install.bat at the end of installation, so
+      # the debloat step is applied unattended. Store-dependent iCloud install and
+      # the secret-bearing SMB share stay operator-run — see provision/install.bat.
+      - ./provision:/oem
     stop_grace_period: 2m
     restart: unless-stopped
 ```
@@ -133,7 +197,7 @@ Notes for the executor:
 
 ## 4. Guest provisioning — script 01: debloat
 
-Open the web viewer (or RDP as user `icloud`, blank password). Start **PowerShell as Administrator** (right-click Start → Terminal (Admin)). Run the following as `provision/01-debloat.ps1` (paste whole block):
+This script runs unattended: dockur copies `./provision` to `C:\OEM` and `install.bat` invokes it as Administrator at the end of installation (see §3's `/oem` volume). Nothing to do by hand on a normal install; to re-run it after a Windows feature update (§10), open the web viewer (or RDP as user `icloud`, blank password), start **PowerShell as Administrator** (right-click Start → Terminal (Admin)) and run `C:\OEM\01-debloat.ps1`. The script is `provision/01-debloat.ps1`:
 
 ```powershell
 # ============ 01-debloat.ps1 — run as Administrator ============
@@ -207,13 +271,33 @@ Then run `Restart-Computer` and wait for the desktop to return (auto-logon).
 
 ## 5. Guest provisioning — script 02: install iCloud
 
-PowerShell as Administrator again:
+PowerShell as Administrator again. Windows 11 ships with the PowerShell execution
+policy set to `Restricted`, so launching a `.ps1` directly fails with *"running
+scripts is disabled on this system"*. Invoke it with an explicit bypass — the same
+way `install.bat` runs script 01:
+
+```powershell
+powershell -ExecutionPolicy Bypass -NoProfile -File C:\OEM\02-install-icloud.ps1
+```
+
+(Or set it for the current window only: `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force`.
+This step is a single command, so you can also just paste the `winget` line below.)
+
+Script body:
 
 ```powershell
 # ============ 02-install-icloud.ps1 ============
-winget install --id AppleInc.iCloud --source msstore `
+# With --source msstore the --id is the Store PRODUCT ID, not the AppX package
+# name. "AppleInc.iCloud" fails with "No package found matching input criteria".
+winget install --id 9PKTQ5699M62 --source msstore `
   --accept-package-agreements --accept-source-agreements
 ```
+
+Confirmed on the first real run (2026-07-22): `winget search iCloud` lists
+`iCloud → 9PKTQ5699M62 → msstore`, and the install reports
+`Successfully installed` with `AppleInc.iCloud 15.8.118.0`. The `winget` source
+also carries `Apple.iCloud`, but that is the **legacy** standalone build
+(7.21.x) — not the Store client this design assumes.
 
 **Fallback (if winget/msstore errors, e.g. region or Store-source issues):** open Microsoft Store from the Start menu, search "iCloud", install manually. No Microsoft account sign-in is required for free apps — if prompted, choose the option to proceed without signing in.
 
@@ -231,22 +315,35 @@ Do this via the **web viewer** (`http://127.0.0.1:8006`) so 2FA prompts are visi
 4. When asked to trust this browser/device, choose **Trust**.
 5. In the iCloud app settings:
    - **iCloud Drive: ON.**
-   - Open iCloud Drive options and **disable Files On-Demand** (checkbox may be labeled "Files On-Demand" or similar). If the running version has no such toggle, proceed — step 7 pins everything regardless. **(D5 — this is the single most important setting in the whole document.)**
+   - **Leave Files On-Demand ON.** (This reverses v1's instruction — see the D5
+     row. Do not turn it off, and do not pin anything.)
    - Photos, Passwords, Bookmarks, Mail/Contacts/Calendar: **OFF** (out of scope; Photos especially would bloat the disk).
-6. Wait for the initial sync to complete. Progress is visible in the iCloud tray icon. For large libraries this takes hours and is Apple-server-bound; leave it running.
-7. Pin all content as always-local (belt and braces for D5). PowerShell (normal user is fine):
-
-```powershell
-attrib +P -U "$env:USERPROFILE\iCloudDrive\*" /S /D
-```
-
+6. Wait for the initial **metadata population** to settle: the client creates
+   online-only placeholders for the whole library, which is far faster and far
+   smaller than downloading it. `./tools/watch-sync.sh` on the host watches the
+   guest image stop growing and is a good enough proxy. Progress is also visible
+   in the iCloud tray icon.
+7. **Do not pin.** There is no pinning step in v2. If a guest was provisioned
+   under v1 and already carries `P` intent, the bridge agent's first run clears
+   it with `attrib -P` — which drops the always-keep request without evicting
+   content already on disk — and records a marker so it never repeats. It never
+   runs a global `+U`.
 8. Note the exact sync root path for §7: it is `C:\Users\icloud\iCloudDrive` under this document's compose settings.
 
 ---
 
 ## 7. Guest provisioning — script 03: SMB share
 
-PowerShell as Administrator:
+PowerShell as Administrator. As in §5, the execution policy blocks a direct
+`.ps1` launch — edit the file first to set the password, then invoke it with a
+bypass:
+
+```powershell
+notepad C:\OEM\03-create-share.ps1     # set $pass to SHARE_PASS from .env
+powershell -ExecutionPolicy Bypass -NoProfile -File C:\OEM\03-create-share.ps1
+```
+
+Script body:
 
 ```powershell
 # ============ 03-create-share.ps1 ============
@@ -254,19 +351,30 @@ PowerShell as Administrator:
 $pass = ConvertTo-SecureString "STRONG_PASSWORD_HERE" -AsPlainText -Force
 
 # D8: dedicated password-protected account, SMB use only, hidden from logon
-New-LocalUser -Name "syncshare" -Password $pass -PasswordNeverExpires `
-  -AccountNeverExpires -Description "SMB access for Linux host"
+if (-not (Get-LocalUser -Name "syncshare" -ErrorAction SilentlyContinue)) {
+  New-LocalUser -Name "syncshare" -Password $pass -PasswordNeverExpires `
+    -AccountNeverExpires -Description "SMB access for Linux host"
+} else {
+  Set-LocalUser -Name "syncshare" -Password $pass
+}
 # Hide from the Windows login screen
 $wl = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList"
 New-Item -Path $wl -Force | Out-Null
 New-ItemProperty -Path $wl -Name "syncshare" -Value 0 -PropertyType DWord -Force | Out-Null
 
-# Filesystem permission for syncshare on the sync root
+# Filesystem permission for syncshare on the sync root.
+# One inheritable grant at the root only -- deliberately NOT /T. A recursive
+# grant stamps explicit allow ACEs on every descendant, and an explicit allow
+# outranks an inherited folder deny, which would let a known child path stay
+# readable through a v2 exclusion (v2 plan D15). Script 04 cleans up the
+# explicit descendant grants left by earlier runs of this script.
 $root = "C:\Users\icloud\iCloudDrive"
-icacls $root /grant "syncshare:(OI)(CI)M" /T /Q
+icacls $root /grant "syncshare:(OI)(CI)M" /Q
 
 # The SMB share itself
-New-SmbShare -Name "icloud" -Path $root -FullAccess "syncshare"
+if (-not (Get-SmbShare -Name "icloud" -ErrorAction SilentlyContinue)) {
+  New-SmbShare -Name "icloud" -Path $root -FullAccess "syncshare"
+}
 
 # SMB service + firewall (guest firewall only sees the container network; keep scope tight anyway)
 Set-Service -Name LanmanServer -StartupType Automatic
@@ -328,12 +436,54 @@ TimeoutIdleSec=0
 WantedBy=multi-user.target
 ```
 
-Enable:
+`host/mnt-icloud_bridge.mount` → `/etc/systemd/system/mnt-icloud_bridge.mount`
+(v2 plan D16 — the control channel between the host GUI and the guest agent).
+The mount-path component is `icloud_bridge` with an underscore, so the only
+hyphen in the unit name is systemd's encoding of the `/mnt/…` slash and no
+literal-hyphen escaping is needed:
+
+```ini
+[Unit]
+Description=iCloud bridge control share (CIFS)
+Requires=docker.service
+After=docker.service
+
+[Mount]
+What=//127.0.0.1/bridge
+Where=/mnt/icloud_bridge
+Type=cifs
+Options=credentials=/etc/credentials-icloud,port=10445,vers=3.1.1,uid=1000,gid=1000,file_mode=0664,dir_mode=0775,actimeo=1,echo_interval=15,_netdev
+TimeoutSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`host/mnt-icloud_bridge.automount` → `/etc/systemd/system/mnt-icloud_bridge.automount`:
+
+```ini
+[Unit]
+Description=Automount for the iCloud bridge control share
+
+[Automount]
+Where=/mnt/icloud_bridge
+TimeoutIdleSec=0
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Both shares use the same `syncshare` credentials file.
+
+Enable (`host/setup-host.sh` does all of this, patching `uid`/`gid` from
+`MOUNT_UID`/`MOUNT_GID`):
 
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now mnt-icloud.automount
-ls /mnt/icloud     # must list iCloud Drive contents
+sudo systemctl enable --now mnt-icloud_bridge.automount
+ls /mnt/icloud            # must list iCloud Drive contents
+ls /mnt/icloud_bridge     # status.json, tree.json, exclusions.json
 ```
 
 **Usage rules for the mount (document these in README):** normal document/media workflows only. Do not place git repositories, build trees, or SQLite databases inside it — both SMB semantics and iCloud's own sync semantics make those unsafe. For read-heavy bulk work, rsync out to a local directory first.
@@ -413,8 +563,12 @@ systemctl status icloud-health.service   # after first run
 | Canary writes but files stop appearing on other Apple devices | **Apple session expired** (expected every few months) | Open `http://127.0.0.1:8006`, click the iCloud tray icon, sign in + 2FA again. No other changes needed |
 | Guest disk full | iCloud data grew past DISK_SIZE | Stop container; edit `DISK_SIZE` in compose; `docker compose up -d` (dockur expands the disk); extend the partition in guest Disk Management |
 | New files on host not uploading | File written into the share while guest's iCloud app crashed | RDP in, relaunch iCloud from Start menu; consider adding it to `shell:startup` (do this during provisioning if desired) |
-| Everything broken after Windows feature update | Update reset a setting | Re-run scripts 01 and 03 (both are idempotent) |
-| Mount hangs / IO errors on host | Guest hard-crashed mid-operation | `sudo systemctl restart mnt-icloud.automount` after guest is back |
+| Everything broken after Windows feature update | Update reset a setting | Re-run scripts 01, 03 and 04 (all idempotent) |
+| Mount hangs / IO errors on host | Guest hard-crashed mid-operation | `sudo systemctl restart mnt-icloud.automount` after guest is back (same for `mnt-icloud_bridge.automount`) |
+| Tray yellow, `status.json` stale | The agent task is not running — it only runs in the logged-on `icloud` session | Check auto-logon at `:8006`, then `Start-ScheduledTask icloud-bridge-agent` |
+| Guest disk below the floor and staying there | Reclamation has nothing eligible: content open, modified, or still uploading | Wait for uploads to finish, or grow `DISK_SIZE` as above |
+| An exclusion reports `acl-write-denied` | §4's agent `RC,WDAC` grant did not take, or that object has a protected DACL | Re-run `04-bridge-agent.ps1` elevated and read its protected-DACL report |
+| Excluded item reappeared under a new name | Renames of excluded items are not followed (accepted limitation) | Exclude the new path; clear the old one from *Missing configured items* |
 
 **Backup stance:** the VM is disposable *except* for the Apple session; the data's canonical copy is iCloud itself. For belt-and-braces, an optional host cron `rsync -a --delete /mnt/icloud/ /srv/icloud-backup/` onto snapshotted storage gives point-in-time recovery that iCloud's own trash does not.
 
@@ -422,17 +576,51 @@ systemctl status icloud-health.service   # after first run
 
 ## 11. Acceptance tests (all must pass)
 
+`host/acceptance-tests.sh` automates the host-checkable subset; the rest are
+manual. **E0 (test 8) gates the others** — run it before trusting the mount with
+real work.
+
 1. `kvm-ok` reports acceleration usable.
 2. `docker compose up -d` from a clean state reaches a Windows desktop on `:8006` with no manual intervention before §4.
 3. After provisioning: guest idles < 5% host CPU and RSS of the container ≈ RAM_SIZE (check `docker stats`).
-4. iCloud tray icon shows signed-in, sync complete.
-5. `ls /mnt/icloud` on the host lists the operator's real iCloud files.
+4. iCloud tray icon shows signed-in and syncing.
+5. `ls /mnt/icloud` on the host lists the operator's real iCloud files, at their
+   real sizes, as online-only placeholders.
 6. **Round-trip down:** create a note file in iCloud Drive from an iPhone/Mac → appears in `/mnt/icloud` within 2 minutes.
 7. **Round-trip up:** `echo test > /mnt/icloud/linux-up.txt` on the host → visible on iPhone/Mac Files app within 2 minutes.
-8. `attrib` check in guest: files under `iCloudDrive` show `P` (pinned), not `U`/`O` (online-only).
-9. Health timer green: `systemctl list-timers | grep icloud` and last service run exit 0.
-10. Host reboot test: after `reboot`, container auto-starts, automount works on first `ls /mnt/icloud`, health check passes within 10 minutes — no human action.
-11. All four published ports answer only on `127.0.0.1` (verify with `ss -tlnp | grep -E '8006|3389|10445'`).
+8. **E0 — kernel-CIFS gate (replaces v1's pinned-`P` check).** The prior
+   hydration evidence used userland `smbclient`; the real mount uses the kernel
+   cifs client with `actimeo=1,echo_interval=15`, and the largest file read was
+   1.17 MB. So:
+   1. On a file the guest reports as `RECALL_ON_DATA_ACCESS` and ≥ 100 MB, whose
+      SHA-256 is known from another Apple device,
+      `time timeout 30m sha256sum /mnt/icloud/<file>` completes without EIO,
+      hang or timeout and the hash matches. Record size and elapsed time.
+   2. The same for a multi-GB online-only file, with a documented generous
+      timeout. Record the sustained rate and judge whether a read that blocks
+      that long is acceptable.
+   3. A uniquely named disposable file written on the host appears on another
+      Apple device with a matching hash; editing it on the host produces a
+      matching new hash; deleting it on the host propagates. Never use an
+      existing user file for this.
+
+   Failing 8.1 or 8.2 means D25 is not accepted — investigate mount/client
+   timeout behaviour or reintroduce scoped pinning. Failing 8.3 means the
+   bidirectional D6 architecture itself is not accepted. `TimeoutSec=30` in the
+   mount unit bounds mount *establishment*, not later reads.
+9. **Online-only placeholders read correctly and stay online-only otherwise.**
+   In the guest, a file never read from the host still reports
+   `RECALL_ON_DATA_ACCESS` after a full agent tree scan and allocation report —
+   proving the metadata path does not hydrate. A file that *was* read reports
+   fully local afterwards. `attrib` showing `O`/`o` is the expected steady
+   state; `P` is not.
+10. Health timer green: `systemctl list-timers | grep icloud` and last service run exit 0.
+11. Host reboot test: after `reboot`, container auto-starts, both automounts work on first `ls`, health check passes within 10 minutes — no human action.
+12. All published ports answer only on `127.0.0.1` (verify with `ss -tlnp | grep -E '8006|3389|10445'`).
+13. Bridge: `/mnt/icloud_bridge` is mounted, `status.json` is under 90 s old, and
+    `status.json`, `tree.json` and `exclusions.json` all parse as JSON.
+14. Selective sync: v2 plan E1–E7, reproduced for operators in
+    [`selective-sync.md`](selective-sync.md#deployment-checklist).
 
 ---
 
@@ -440,6 +628,42 @@ systemctl status icloud-health.service   # after first run
 
 - **Server-side semantics:** iCloud resolves conflicts last-writer-wins with timestamps; concurrent edits on two devices can silently produce duplicates or drop one version. This is Apple-side behavior every client inherits (see arXiv 2602.19433 for the full failure catalogue). Mitigation is the backup rsync in §10.
 - Session re-login is manual by design (2FA cannot be automated and attempting to would risk account lockout).
+- **Cold reads block for the whole download.** With Files On-Demand on (D5 as
+  amended), the first read of a file fetches it from Apple while the reading
+  process sits in the read call: seconds for small files, potentially far longer
+  for multi-GB ones, with no progress indication on the host side. E0 (§11)
+  measures whether this is tolerable on the target host before deployment.
+- **Disk reclamation is asynchronous and can fail to reach its target.** The
+  agent asks Windows to make cold, in-sync files online-only when free space
+  drops below 20 GB, aiming for 30 GB, but Cloud Files refuses to dehydrate
+  content that is open, modified, or not yet uploaded. Free space can therefore
+  stay below the floor; the tray reports it and the fix is to wait or grow the
+  disk (§10), not to delete anything.
 - SMB metadata operations are slower than local disk; bulk `find`-style workloads should rsync out first.
 - Windows base image is ~15–20 GB even debloated; that is the floor for the stock-ISO path (D3). Optional future optimization: rebuild on an LTSC IoT ISO — out of scope for v1.
 - Photos sync is deliberately out of scope (separate, larger problem; icloudpd covers it better).
+
+---
+
+## 13. v2 artifacts (GUI, bridge agent, selective sync)
+
+Specified in [`../plan-gui-selective-sync.md`](../plan-gui-selective-sync.md).
+Summary of what exists and where:
+
+| Artifact | Runs on | Purpose |
+|---|---|---|
+| `guest-agent/agent.ps1` | Windows guest, as `icloud`, unelevated | Enforces the exclusion list (deny ACE on each excluded item + `DELETE_CHILD` guard on its parent, then an online-only request), reclaims disk below the 20 GB floor, publishes `status.json` / `tree.json`, answers per-folder list requests |
+| `provision/agent.ps1` | — | Byte-identical copy so dockur places it in `C:\OEM`; guarded by `host/acceptance-tests.sh` §8 |
+| `provision/04-bridge-agent.ps1` | Windows guest, elevated | Creates the `bridge` share over `C:\ProgramData\icloud-bridge\io`, normalises the `syncshare` ACL, grants the agent `RC,WDAC`, sets the D27 privilege boundary, turns on Access-Based Enumeration for the `icloud` share, registers the scheduled task |
+| `host/mnt-icloud_bridge.{mount,automount}` | Linux host | §8 above, verbatim |
+| `gui/` | Linux host, desktop user | Tray icon + status window + selective-sync UI; `pytest gui/tests` covers the health precedence rules and the bridge protocol |
+
+**Deliberate exception to the verbatim-embedding rule.** §3, §4, §7, §8 and §9 of
+this document embed their files verbatim, and `AGENTS.md` requires those copies
+to be updated in the same commit as the file. That rule is **not** extended to
+`guest-agent/agent.ps1` (~1,100 lines) or `provision/04-bridge-agent.ps1`
+(~250 lines): duplicating them here would create two copies that silently
+diverge, which is the exact failure the rule exists to prevent. For those two
+files, **the file is the source of truth**; their *specification* is v2 plan §3
+and §4 respectively, and that is what must be kept in step with them. The
+smaller v2 artifacts (the two systemd units) are embedded above as usual.

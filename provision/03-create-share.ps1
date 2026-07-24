@@ -21,9 +21,14 @@ $wl = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccoun
 New-Item -Path $wl -Force | Out-Null
 New-ItemProperty -Path $wl -Name "syncshare" -Value 0 -PropertyType DWord -Force | Out-Null
 
-# Filesystem permission for syncshare on the sync root
+# Filesystem permission for syncshare on the sync root.
+# One inheritable grant at the root only -- deliberately NOT /T. A recursive
+# grant stamps explicit allow ACEs on every descendant, and an explicit allow
+# outranks an inherited folder deny, which would let a known child path stay
+# readable through a v2 exclusion (v2 plan D15). Script 04 cleans up the
+# explicit descendant grants left by earlier runs of this script.
 $root = "C:\Users\icloud\iCloudDrive"
-icacls $root /grant "syncshare:(OI)(CI)M" /T /Q
+icacls $root /grant "syncshare:(OI)(CI)M" /Q
 
 # The SMB share itself
 if (-not (Get-SmbShare -Name "icloud" -ErrorAction SilentlyContinue)) {

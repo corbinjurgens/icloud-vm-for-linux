@@ -40,17 +40,23 @@ password=$SHARE_PASS
 EOF
 chmod 600 /etc/credentials-icloud
 mkdir -p /mnt/icloud
+# v2 bridge control share (plan D16); same credentials, syncshare reaches both.
+mkdir -p /mnt/icloud_bridge
 
 # --- install units, patching uid/gid ---
 sed -e "s/uid=1000/uid=$MOUNT_UID/" -e "s/gid=1000/gid=$MOUNT_GID/" \
   "$here/mnt-icloud.mount" > /etc/systemd/system/mnt-icloud.mount
 install -m 0644 "$here/mnt-icloud.automount" /etc/systemd/system/mnt-icloud.automount
+sed -e "s/uid=1000/uid=$MOUNT_UID/" -e "s/gid=1000/gid=$MOUNT_GID/" \
+  "$here/mnt-icloud_bridge.mount" > /etc/systemd/system/mnt-icloud_bridge.mount
+install -m 0644 "$here/mnt-icloud_bridge.automount" /etc/systemd/system/mnt-icloud_bridge.automount
 install -m 0644 "$here/icloud-health.service" /etc/systemd/system/icloud-health.service
 install -m 0644 "$here/icloud-health.timer"   /etc/systemd/system/icloud-health.timer
 install -m 0755 "$here/icloud-health.sh"       /usr/local/bin/icloud-health.sh
 
 systemctl daemon-reload
 systemctl enable --now mnt-icloud.automount
+systemctl enable --now mnt-icloud_bridge.automount
 systemctl enable --now icloud-health.timer
 
-echo "Done. Verify with:  ls /mnt/icloud"
+echo "Done. Verify with:  ls /mnt/icloud  &&  ls /mnt/icloud_bridge"

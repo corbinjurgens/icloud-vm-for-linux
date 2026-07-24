@@ -1,0 +1,10 @@
+# Copy to /etc/systemd/system/mnt-icloud_bridge.automount
+[Unit]
+Description=Automount for the iCloud bridge control share
+
+[Automount]
+Where=/mnt/icloud_bridge
+TimeoutIdleSec=0
+
+[Install]
+WantedBy=multi-user.target

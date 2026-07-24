@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=iCloud bridge (tray)
+Comment=Keeps the iCloud bridge tray icon running
+# install-gui.sh rewrites __LAUNCHER__ / __ICON__ to absolute paths: .desktop
+# files do not expand ~ or shell variables.
+Exec=__LAUNCHER__ --minimized
+Icon=__ICON__
+Terminal=false
+Categories=Utility;System;
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

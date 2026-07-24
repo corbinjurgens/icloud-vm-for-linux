@@ -1,0 +1,19 @@
+# Copy to /etc/systemd/system/mnt-icloud_bridge.mount
+# The mount-path component is icloud_bridge (underscore) so the only hyphen in
+# the unit name is systemd's encoding of the /mnt/... slash -- no literal-hyphen
+# escaping is needed (v2 plan D16).
+# uid/gid 1000 = the primary desktop user; adjust to `id -u` / `id -g`.
+[Unit]
+Description=iCloud bridge control share (CIFS)
+Requires=docker.service
+After=docker.service
+
+[Mount]
+What=//127.0.0.1/bridge
+Where=/mnt/icloud_bridge
+Type=cifs
+Options=credentials=/etc/credentials-icloud,port=10445,vers=3.1.1,uid=1000,gid=1000,file_mode=0664,dir_mode=0775,actimeo=1,echo_interval=15,_netdev
+TimeoutSec=30
+
+[Install]
+WantedBy=multi-user.target
