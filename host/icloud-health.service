@@ -1,6 +1,10 @@
 # Copy to /etc/systemd/system/icloud-health.service
 [Unit]
 Description=iCloud VM health check
+# Durable desired-off marker (v2 plan D29): a queued timer job must not write the
+# canary into a mount that is being torn down. Gating the service as well as the
+# timer closes the race where the job was already queued when shutdown began.
+ConditionPathExists=!/var/lib/icloud-bridge/powered-off
 
 [Service]
 Type=oneshot

@@ -214,6 +214,7 @@ Continues the v1 register (D1–D13).
 | D25 | Default hydration policy | **Files On-Demand on; nothing pinned by this project; hydrate lazily on read.** On first agent run, clear legacy v1 `P` intent with `attrib -P` but do not evict cached data. Initial cloud placeholders stay online-only; reads and host writes remain cached until D26 needs space | Verified for small SMB reads in §0.5, pending E0 for the real mount/large files. Avoids an upfront library download without falsely claiming every included file is always dataless |
 | D26 | Disk reclamation | When volume free space < **20 GB**, request online-only (`attrib +U -P`) for included, in-sync files with local content, oldest first, until **requested on-disk bytes** cover the deficit to 30 GB. Dehydration is asynchronous: re-measure on later cycles and continue until free ≥ **30 GB** or no eligible allocation remains. The sweep is **two-stage**: stage 1 considers files **without** `RECALL_ON_DATA_ACCESS` (fully local — the hydrated working set and the bulk of reclaimable bytes); only if stage 1 cannot cover the deficit does stage 2 examine `RECALL` files in bounded, cursor-based batches to find partially hydrated placeholders. Read `OnDiskDataSize`, `ModifiedDataSize`, and `InSyncState` with `CfGetPlaceholderInfo`; use `GetCompressedFileSizeW` only for non-placeholders. Use `LastAccessTime` only when NTFS last-access updates are enabled; otherwise use `LastWriteTime` as an explicitly approximate fallback. Dirty/open/not-in-sync files remain local and are reported, not deleted | Hysteresis prevents thrash. Cloud Files exposes the exact state needed and permits dehydration only for in-sync placeholders; free-space delta reports bytes truly reclaimed. Staging keeps the expensive per-file query proportional to the hydrated working set instead of the whole library, while stage 2 preserves correctness — a partially hydrated file has `RECALL` **and** `OnDiskDataSize > 0`, so the attribute alone cannot rule it out |
 | D27 | Bridge privilege boundary | SMB exports only `C:\ProgramData\icloud-bridge\io`; scheduled code is `...\agent.ps1` and private state is `...\state`, both outside the share. `syncshare` gets Modify only on `io`; `icloud` gets Modify on `io` and `state` and read/execute on the script | The host must be able to write requests/config, but SMB credentials must not grant code execution by allowing replacement of the scheduled agent script or its trusted state |
+| D29 | GUI-managed bridge lifecycle | An explicit GUI **Quit** confirms and then records a durable desired-off state (`/var/lib/icloud-bridge/powered-off`), quiesces health and CIFS activity, unmounts both shares, and gracefully stops `icloud-windows` (`docker stop --timeout 130`); starting a new GUI process automatically restores an existing stopped bridge before doing any CIFS I/O. All of this runs through one root helper, `host/icloud-bridge-power on\|off`, serialized by `flock`. The six mount/automount/health units gain `ConditionPathExists=!/var/lib/icloud-bridge/powered-off` so the marker survives a reboot without disabling the units. Window-close only hides when a tray exists; without a tray, close routes through the same confirmation. The confirmation retains **Quit GUI only** for maintenance. A checkable tray item **Start when the computer starts** toggles the XDG autostart entry (`Hidden=`), making start-at-login a user setting rather than an installer constant. `restart: unless-stopped` gives Docker the matching semantics, so no compose change is needed. | Makes the GUI the normal on/off boundary without confusing window management with shutdown. The marker keeps automounts and health checks off across reboot, while ordered teardown (health -> automount -> mount, then container) avoids stale CIFS mounts and refuses to interrupt open files. Power-on retries a real CIFS activation because a published-port TCP connect is not SMB readiness. Only the explicit confirmed action powers off — logout, signals, crashes, and `aboutToQuit` do not. Amends the v1/v2 always-on assumption |
 | D28 | Agent ACL authority | The task stays `RunLevel Limited`. Elevated provisioning grants the `icloud` **SID** an inheritable allow ACE of exactly `RC,WDAC` on the sync root (`(OI)(CI)(RC,WDAC)`), repeated explicitly on any protected child DACL that does not inherit. The agent preflights `READ_CONTROL\|WRITE_DAC` on every new target and parent before changing anything, reporting `acl-write-denied` per exclusion on failure | Editing a DACL needs `WRITE_DAC`. An owner gets it implicitly, but ownership of a new object depends on who created it — cloud-created items are owned by `icloud` while items created through SMB may be owned by `syncshare` — so ownership is not a dependable basis. Two rights are the minimum: no `WO`/`D`/data access is granted, and the ACE names `icloud`, never `syncshare`, so it cannot weaken an exclusion deny |
 
 **Known accepted limitations (do not attempt to fix):**
@@ -746,6 +747,7 @@ the only hyphen in `mnt-icloud_bridge.mount` is systemd's normal encoding of the
 Description=iCloud bridge control share (CIFS)
 Requires=docker.service
 After=docker.service
+ConditionPathExists=!/var/lib/icloud-bridge/powered-off
 
 [Mount]
 What=//127.0.0.1/bridge
@@ -759,11 +761,70 @@ WantedBy=multi-user.target
 ```
 
 `host/mnt-icloud_bridge.automount` — same as the v1 automount but
-`Where=/mnt/icloud_bridge`.
+`Where=/mnt/icloud_bridge`. It carries the same `ConditionPathExists` gate (D29).
 
 `host/setup-host.sh` changes: also `mkdir -p /mnt/icloud_bridge`, install both new
 units, `systemctl enable --now mnt-icloud_bridge.automount`. Same credentials file
 (the `syncshare` user has access to both shares).
+
+### 5.1 GUI-managed lifecycle: helper, marker, and sudoers (D29)
+
+The durable desired-off state is `/var/lib/icloud-bridge/powered-off`: readable,
+root-only writable, meaning "host bridge services must remain disarmed" (during
+an interrupted transition the VM itself may still be running). `setup-host.sh`
+creates the directory `root:root` 0755 but **never the marker**; the helper owns
+its lifecycle. All six units — both `.mount`, both `.automount`,
+`icloud-health.service`, and `icloud-health.timer` — carry
+`ConditionPathExists=!/var/lib/icloud-bridge/powered-off` in `[Unit]`. Gating the
+timer *and* its service closes the race where a timer job was already queued when
+shutdown began; gating the mounts as well as the automounts holds the invariant
+even if some other unit starts a mount directly. Conditions are checked on start
+and do not stop active units, so the helper stops them explicitly and the units
+stay enabled (an idempotent `setup-host.sh` rerun does not undo an intentional
+off state).
+
+`host/icloud-bridge-power` (installed `root:root` 0755 at
+`/usr/local/bin/icloud-bridge-power`) is the single privileged helper: `set
+-euo pipefail`, a fixed trusted `PATH`, `id -u` root check, `on`/`off` only, a
+bounded `flock` under `/run/lock` serializing every transition, `==> ` progress,
+and distinct exit codes for usage / busy / container / readiness / unit / lock /
+ambiguous. It never uses `umount -l`, `umount -f`, `docker kill`, or `systemctl
+disable`.
+
+- **off**: create the marker (recording whether it pre-existed); stop the health
+  timer then service; stop both automounts; stop both mounts while the guest SMB
+  server is still live. A mount that will not stop (open file, a shell `cwd`
+  inside it, an active copy) aborts before the container is touched, rolls back to
+  the entry desired state, and reports files in use — never a lazy/forced unmount.
+  Then `docker stop --timeout 130 icloud-windows` (a missing/stopped container is
+  already success). If stop errors, the container's *actual* final state decides:
+  stopped is success, running rolls back to on, unknown keeps everything disarmed
+  and fails.
+- **on**: a missing container fails without disturbing the marker (creation stays
+  the explicit `docker compose up -d` step). Otherwise start the container if
+  needed, then for up to five minutes retry a **real** CIFS activation — clear
+  failed state, drop the marker, start both automounts, trigger each with a
+  bounded metadata access, and require the `.mount` units active plus `mountpoint`
+  — because a published-port TCP connect is not SMB readiness. Between failed
+  attempts re-arm the marker and tear down partial jobs. On success the marker is
+  absent and the health timer starts; on timeout the VM is left running for
+  inspection and the timer is never armed against an unverified mount.
+
+`setup-host.sh` resolves the operator as `TARGET_USER="${SUDO_USER:-${TARGET_USER:-}}"`,
+failing if that is empty or root, validating with `id`, and deriving the mount
+UID/GID from it (deliberate `MOUNT_UID`/`MOUNT_GID` overrides still win). It
+installs a `root:root` 0440 `/etc/sudoers.d/icloud-bridge` granting exactly:
+
+```sudoers
+alice ALL=(root) NOPASSWD: /usr/local/bin/icloud-bridge-power on, /usr/local/bin/icloud-bridge-power off
+```
+
+The `on`/`off` arguments are part of the command specs because a bare path would
+permit arbitrary arguments (sudoers matches arguments exactly). The render is
+validated with `visudo -cf`, installed atomically, and the whole policy
+re-validated with `visudo -c`; a valid installed policy is never replaced with an
+invalid render. Helper, marker directory, units, and sudoers are all installed
+before `daemon-reload`/`enable --now`.
 
 ---
 
@@ -779,10 +840,13 @@ gui/
 │   ├── health.py          # host-side checks (no bridge): container/mount/canary
 │   ├── bridge.py          # bridge share I/O: read status/tree, write exclusions,
 │   │                      #   list-request round-trip; worker-thread I/O
-│   ├── tray.py            # QSystemTrayIcon: icon state (D23), menu
+│   ├── power.py           # Qt-free: docker inspect + marker read, startup plan,
+│   │                      #   and `sudo -n icloud-bridge-power on|off` (D29)
+│   ├── autostart.py       # Qt-free: read/toggle the XDG autostart entry (D29)
+│   ├── tray.py            # QSystemTrayIcon: icon state (D23), menu, autostart item
 │   ├── window.py          # QMainWindow with 2 tabs: Status, Selective Sync
-│   └── icons/             # icloud-green.svg, icloud-yellow.svg, icloud-red.svg
-│                          #   (simple cloud glyph, solid fill in the state color)
+│   └── icons/             # icloud-green.svg, icloud-yellow.svg, icloud-red.svg,
+│                          #   icloud-starting.svg (blue disc, the D29 transition)
 ├── icloud-bridge-gui.desktop        # launches the app (window)
 ├── autostart/icloud-bridge-tray.desktop  # launches the app minimized to tray
 └── install-gui.sh
@@ -889,6 +953,55 @@ tray menu.
 normal launch sends `show\n` then exits; the primary shows/raises/activates its
 window. A second `--minimized` launch just exits. This makes the desktop launcher
 useful when the tray instance already exists.
+
+**Bridge lifecycle (`power.py`, `autostart.py`, and the controller) — D29:**
+
+- `power.py` is Qt-free and does no mount I/O. `inspect_container()` classifies
+  `docker inspect` output (5 s timeout) into `absent` / `stopped` / `running` /
+  `error`; `marker_exists()` reads `/var/lib/icloud-bridge/powered-off` through an
+  injectable path; `plan_startup(marker, status)` returns one of **power_on**
+  (marker set, or a cleanly stopped container — including a running container that
+  is still marked off, which `on` reconciles), **already_on**, **provision_needed**
+  (no container: preserve today's red first-run state, never `docker compose up`),
+  or **inspect_error** (shown, never mutated). `power_on()`/`power_off()` run the
+  exact argv `sudo -n /usr/local/bin/icloud-bridge-power on|off` — never a shell —
+  and return the helper's own stderr for display.
+- **Startup precedes all CIFS I/O.** The controller pauses bridge I/O, runs the
+  inspection in a worker, and only then acts. **power_on** shows a dedicated
+  **Starting Windows VM…** state — the fourth `icloud-starting.svg` tray icon,
+  distinct from the three health colours because a multi-minute boot must not read
+  as the yellow "degraded" fault — disables the file/selective-sync actions, keeps
+  **Open VM screen**, and runs `power_on()` asynchronously. On success it enables
+  bridge I/O, loads selective-sync, starts the 5 s refresh, and gathers. On failure
+  it does **not** retry every five seconds: it shows the helper error, keeps **Open
+  VM screen** and **Retry start**, and leaves mount work paused (a minimized launch
+  uses a tray notification, not an invisible modal).
+- **Quit** presents a three-way confirmation: **Quit and power off VM** (default),
+  **Quit GUI only (leave bridge running)**, **Cancel**. The message says quitting
+  stops syncing and disconnects `/mnt/icloud`, that unuploaded changes resume next
+  start, and does **not** claim the Apple upload queue is empty (v1 §9). Power-off
+  stops the 5 s timer and the request/response poller, rejects new reads/writes/
+  Apply/list, waits asynchronously for in-flight mount-touching tasks to drain
+  within a bound slightly longer than the CIFS 30 s timeout (aborting with an
+  "operation still in progress" message rather than a lazy unmount, and never while
+  an Apply write is in flight), then runs `power_off()` behind a non-cancellable
+  **Shutting down… about three minutes** progress state. It exits only on helper
+  success; on failure it shows the error and keeps running.
+- **Close vs Quit.** With a tray, `closeEvent` hides with no prompt. Without a
+  tray, close emits a quit request routed through the same confirmation, and
+  `QuitOnLastWindowClosed` is off so it cannot bypass the controller. OS logout,
+  signals, crashes and `aboutToQuit` never power off the bridge.
+- **Autostart.** A checkable **Start when the computer starts** item sits after
+  **Open VM screen** and before the Quit separator. `autostart.py` (Qt-free)
+  toggles `Hidden=`/`X-GNOME-Autostart-enabled=` in
+  `~/.config/autostart/icloud-bridge-tray.desktop` rather than deleting it, so the
+  installer's absolute `Exec` survives, and recreates the file from the launcher
+  path if missing. The checkbox reflects the file on menu open; absent or
+  `Hidden=true` reads as unchecked.
+
+The privileged half of D29 — the `icloud-bridge-power` helper, the marker, the
+unit `ConditionPathExists` gates, and the `sudoers` grant — is specified with the
+host side in §5.1 and installed by `host/setup-host.sh`.
 
 ### 6.3 `install-gui.sh` (run as the desktop user, not root)
 
@@ -1035,6 +1148,14 @@ still applies. This v2 document is not permission to let
   (`python3 -m json.tool`); plus the A3 diff guard.
 - [ ] **B4** Done-when: `ls /mnt/icloud_bridge/status.json` works on a live
   system and the extended acceptance script passes.
+- [ ] **B5** (D29) Add the marker `ConditionPathExists` to all six units, the
+  `host/icloud-bridge-power` helper (§5.1), and the `setup-host.sh`
+  target-user/marker-dir/helper/sudoers install. Extend
+  `host/acceptance-tests.sh` with the installed ownership/mode, unit-condition,
+  marker-dir, and non-mutating `sudo -n -l /usr/local/bin/icloud-bridge-power
+  on`/`off` checks. Done-when: `sudo ./host/setup-host.sh` installs a
+  `visudo`-clean policy; acceptance passes with the bridge on; `icloud-bridge-power
+  off` then `on` round-trips on a live host.
 
 ### Phase C — GUI
 
@@ -1059,6 +1180,15 @@ still applies. This v2 document is not permission to let
   these env overrides, they are also what the tests use) shows the window, the
   tray icon, and a working exclude→Apply→`exclusions.json` flow; `pytest gui/tests`
   passes.
+- [ ] **C7** (D29) Add Qt-free `power.py` and `autostart.py` with
+  `test_power.py`/`test_autostart.py` (fake runner, injected marker, tmpdir home;
+  no Qt/docker/sudo import). Wire the controller so power inspection precedes all
+  CIFS I/O, add the `icloud-starting.svg` transition icon, worker-drain quiescing,
+  the three-way Quit confirmation with progress/error/Retry surfaces, the no-tray
+  close routing, and the autostart checkbox; make `install-gui.sh` preserve an
+  existing `Hidden=true`. Note the `run_async` fix: keep a reference to each
+  `_Task` until its signal fires, or the queued completion callback is dropped.
+  Done-when: `pytest gui/tests` passes with **and** without PySide6 installed.
 
 ### Phase D — docs
 
@@ -1071,8 +1201,9 @@ still applies. This v2 document is not permission to let
 
 ### Pre-deployment repository verification
 
-- [ ] Run `bash -n host/*.sh` and `docker compose config` exactly as required by
-  AGENTS.md. Run `pytest gui/tests` in the GUI development environment.
+- [ ] Run `bash -n host/*.sh host/icloud-bridge-power` and `docker compose config`
+  exactly as required by AGENTS.md. Run `pytest gui/tests` in the GUI development
+  environment.
 - [ ] Confirm every published compose port still begins with `127.0.0.1:`,
   `.env` remains ignored, placeholder passwords remain unchanged, all edited
   scripts are LF, and `guest-agent/agent.ps1` is byte-identical to
@@ -1131,6 +1262,31 @@ still applies. This v2 document is not permission to let
   (hidden + protected + dataless), no manual action. Launching the desktop entry
   while the tray is already running raises the existing window rather than
   silently exiting.
+- [ ] **E8** (D29) **Clean Quit/relaunch:** with both mounts active, choose **Quit
+  and power off VM**. Both mounts/automounts and the health service/timer go
+  inactive, the marker appears, the container stops, and `ls /mnt/icloud` returns
+  promptly on the empty mount-point; the journal shows no intentional-off
+  failures. Relaunch: a transitional state shows without early CIFS access, the VM
+  boots, both mounts activate, the marker disappears, the timer starts, and health
+  goes green. **Quit GUI only** exits immediately leaving everything up.
+- [ ] **E9** (D29) **Busy refusal:** repeat E8's power-off with (a) an open file,
+  (b) a shell `cwd` under the mount, and (c) a large host write in flight.
+  Shutdown aborts, the VM stays running, nothing is lazily detached; after
+  releasing the holder, retry succeeds.
+- [ ] **E10** (D29) **Reboot semantics + failure paths:** power off through the
+  GUI, reboot without logging in → container, automounts, and health timer stay
+  off with no FAIL spam; log in → autostart restores the bridge. Separately leave
+  the bridge on and reboot → existing auto-recovery still works. Then deny helper
+  authorization, and test a missing container and an SMB-readiness timeout: the
+  GUI stays responsive, performs no repeated automatic retries, and never arms the
+  timer against a dead mount. Confirm the installed dockur image received SIGTERM
+  and completed ACPI shutdown rather than reaching its force-kill fallback.
+- [ ] **E11** (D29) **No-tray + autostart toggle:** with the tray unavailable, the
+  window X presents the same three-way Quit dialog; with a tray it only hides.
+  Untick **Start when the computer starts**, log out/in → the GUI does not launch
+  and (if powered off) the bridge stays off; re-run `install-gui.sh` while
+  unticked and confirm the choice survives. Tick it again, log out/in → the GUI
+  starts minimized and restores the bridge.
 
 ---
 

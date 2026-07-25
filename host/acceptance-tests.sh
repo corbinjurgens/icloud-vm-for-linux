@@ -111,6 +111,67 @@ else
   bad "one of guest-agent/agent.ps1 / provision/agent.ps1 is missing"
 fi
 
+echo "== 9. GUI-managed lifecycle install (v2 plan D29) =="
+# The durable desired-off marker directory (never the marker itself here).
+if [ -d /var/lib/icloud-bridge ]; then
+  ok "/var/lib/icloud-bridge exists"
+else
+  bad "/var/lib/icloud-bridge is missing (setup-host.sh creates it)"
+fi
+if [ -e /var/lib/icloud-bridge/powered-off ]; then
+  echo "  INFO: the desired-off marker is present — the bridge was intentionally"
+  echo "        powered off from the GUI, so the on-state checks above are expected"
+  echo "        to fail until it is started again."
+fi
+
+# The power helper: installed, root-owned, 0755.
+HELPER=/usr/local/bin/icloud-bridge-power
+if [ -x "$HELPER" ]; then
+  meta=$(stat -c '%U:%G %a' "$HELPER" 2>/dev/null)
+  if [ "$meta" = "root:root 755" ]; then
+    ok "$HELPER is root:root 0755"
+  else
+    bad "$HELPER has wrong ownership/mode: $meta (want root:root 755)"
+  fi
+else
+  bad "$HELPER is missing or not executable"
+fi
+
+# The sudoers grant: installed, root-owned, 0440.
+SUDOERS=/etc/sudoers.d/icloud-bridge
+if [ -f "$SUDOERS" ]; then
+  meta=$(stat -c '%U:%G %a' "$SUDOERS" 2>/dev/null)
+  if [ "$meta" = "root:root 440" ]; then
+    ok "$SUDOERS is root:root 0440"
+  else
+    bad "$SUDOERS has wrong ownership/mode: $meta (want root:root 440)"
+  fi
+else
+  bad "$SUDOERS is missing (setup-host.sh installs it)"
+fi
+
+# Every installed unit carries the desired-off condition.
+for u in mnt-icloud.mount mnt-icloud.automount mnt-icloud_bridge.mount \
+         mnt-icloud_bridge.automount icloud-health.service icloud-health.timer; do
+  f="/etc/systemd/system/$u"
+  if grep -qF 'ConditionPathExists=!/var/lib/icloud-bridge/powered-off' "$f" 2>/dev/null; then
+    ok "$u carries the desired-off condition"
+  else
+    bad "$u is missing the desired-off condition (see $f)"
+  fi
+done
+
+# Non-mutating sudo authorization check: the operator may invoke exactly the two
+# argument forms without a password, and nothing runs. setup-host.sh (root) owns
+# the full `visudo` validation; this only confirms the effective grant.
+for arg in on off; do
+  if sudo -n -l "$HELPER" "$arg" >/dev/null 2>&1; then
+    ok "sudo -n permits 'icloud-bridge-power $arg'"
+  else
+    bad "sudo -n does not permit 'icloud-bridge-power $arg' for $(id -un) — check $SUDOERS"
+  fi
+done
+
 echo
 echo "== MANUAL tests (cannot be automated from the host) =="
 cat <<'EOF'

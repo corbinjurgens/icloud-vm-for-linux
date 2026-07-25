@@ -1,6 +1,8 @@
 # Copy to /etc/systemd/system/mnt-icloud_bridge.automount
 [Unit]
 Description=Automount for the iCloud bridge control share
+# Durable desired-off marker (v2 plan D29); see mnt-icloud.automount for rationale.
+ConditionPathExists=!/var/lib/icloud-bridge/powered-off
 
 [Automount]
 Where=/mnt/icloud_bridge

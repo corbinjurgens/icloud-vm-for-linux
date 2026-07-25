@@ -213,6 +213,35 @@ destructive.
   Launching the desktop entry while the tray is already running raises the
   existing window instead of silently doing nothing.
 
+### E8–E11 — GUI-managed lifecycle (v2 plan D29)
+
+- **E8** With both mounts active, tray **Quit → Quit and power off VM**. Both
+  mounts/automounts and the health service/timer go inactive, the marker
+  `/var/lib/icloud-bridge/powered-off` appears, the container stops, and
+  `ls /mnt/icloud` returns promptly on the now-empty mount point with no
+  intentional-off failures in the journal. Relaunch the GUI: it shows the blue
+  *Starting* state without touching CIFS early, the VM boots, both mounts
+  activate, the marker disappears, the health timer starts, and status goes
+  green. **Quit GUI only** exits immediately leaving the bridge up.
+- **E9** Repeat the power-off with (a) a file held open on the mount, (b) a shell
+  whose `cwd` is inside it, and (c) a large host write in flight. Each aborts the
+  shutdown, leaves the VM running, and lazily detaches nothing; after releasing
+  the holder, Quit succeeds.
+- **E10** Power off through the GUI, reboot **without** logging in → container,
+  automounts, and health timer stay off with no FAIL spam; log in → autostart
+  restores the bridge. Separately, leave the bridge **on** and reboot → the
+  existing automatic recovery still works. Then deny the helper `sudoers` grant,
+  and test a missing container and an SMB-readiness timeout: the GUI stays
+  responsive, never auto-retries, and never arms the health timer against a dead
+  mount. Confirm from the logs that the VM received SIGTERM and completed ACPI
+  shutdown rather than reaching dockur's force-kill fallback.
+- **E11** With the tray unavailable, the window **X** presents the same three-way
+  Quit dialog; with a tray it only hides. Untick **Start when the computer
+  starts**, log out and back in → the GUI does not launch and (if powered off)
+  the bridge stays off; re-run `install-gui.sh` while unticked and confirm the
+  choice survives. Tick it again, log out and in → the GUI starts minimized and
+  restores the bridge.
+
 ---
 
 ## Where things live
@@ -225,6 +254,9 @@ destructive.
 | Agent script (guest) | `C:\ProgramData\icloud-bridge\agent.ps1` |
 | Agent private state (guest) | `C:\ProgramData\icloud-bridge\state\` — not shared over SMB |
 | Scheduled task (guest) | `icloud-bridge-agent`, runs as `icloud`, unelevated |
+| Desired-off marker (host) | `/var/lib/icloud-bridge/powered-off` — present ⇒ the GUI powered the bridge off (v2 plan D29) |
+| Power helper (host) | `/usr/local/bin/icloud-bridge-power on\|off`, root, run by the GUI via `sudo -n` |
+| Autostart entry (host) | `~/.config/autostart/icloud-bridge-tray.desktop` — the **Start when the computer starts** toggle flips its `Hidden=` |
 
 All three JSON files are plain UTF-8 and safe to `cat` when something looks
 wrong. Editing `exclusions.json` by hand works, but the revision number must

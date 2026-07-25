@@ -1,6 +1,9 @@
 # Copy to /etc/systemd/system/mnt-icloud.automount
 [Unit]
 Description=Automount for iCloud Drive
+# Durable desired-off marker (v2 plan D29): gate the automount too, so a stray
+# access cannot re-arm the mount trap while the bridge is intentionally off.
+ConditionPathExists=!/var/lib/icloud-bridge/powered-off
 
 [Automount]
 Where=/mnt/icloud

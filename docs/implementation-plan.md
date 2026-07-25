@@ -110,15 +110,18 @@ icloud-vm-for-linux/
 ├── guest-agent/
 │   └── agent.ps1                 # source of truth for the guest agent
 ├── gui/                          # host GUI + tray icon (PySide6)
-│   ├── icloud_bridge_gui/        # health.py, bridge.py, tray.py, window.py, __main__.py, icons/
-│   ├── tests/                    # pytest: test_health.py, test_bridge.py
+│   ├── icloud_bridge_gui/        # health.py, bridge.py, power.py, autostart.py,
+│   │                            #   tray.py, window.py, __main__.py, icons/
+│   ├── tests/                    # pytest: test_health/bridge/power/autostart.py
 │   ├── install-gui.sh
 │   ├── icloud-bridge-gui.desktop
 │   └── autostart/icloud-bridge-tray.desktop
 ├── host/                         # Linux host
 │   ├── setup-prereqs.sh          # docker + cifs-utils + KVM check (§1)
-│   ├── setup-host.sh             # credentials from .env, install units (§8–§9)
+│   ├── setup-host.sh             # credentials from .env, install units (§8–§9),
+│   │                            #   power helper + marker + sudoers (v2 plan D29)
 │   ├── acceptance-tests.sh       # host-checkable subset of §11
+│   ├── icloud-bridge-power       # root helper: on/off the whole bridge (D29)
 │   ├── mnt-icloud.mount
 │   ├── mnt-icloud.automount
 │   ├── mnt-icloud_bridge.mount   # v2 control share (v2 plan D16)
@@ -126,6 +129,7 @@ icloud-vm-for-linux/
 │   ├── icloud-health.sh
 │   ├── icloud-health.service
 │   └── icloud-health.timer
+│   #  all six units carry ConditionPathExists=!/var/lib/icloud-bridge/powered-off
 ├── tools/                        # host-side helpers for driving/verifying the guest
 │   ├── guest-ctl.sh, qemu-monitor.py, rdp-ready.py, keep-iso.sh
 │   ├── watch-sync.sh, icloud-status.ps1, icloud-folders.ps1
@@ -408,6 +412,7 @@ sudo mkdir -p /mnt/icloud
 Description=iCloud Drive via Windows VM (CIFS)
 Requires=docker.service
 After=docker.service
+ConditionPathExists=!/var/lib/icloud-bridge/powered-off
 
 [Mount]
 What=//127.0.0.1/icloud
@@ -427,6 +432,7 @@ WantedBy=multi-user.target
 ```ini
 [Unit]
 Description=Automount for iCloud Drive
+ConditionPathExists=!/var/lib/icloud-bridge/powered-off
 
 [Automount]
 Where=/mnt/icloud
@@ -447,6 +453,7 @@ literal-hyphen escaping is needed:
 Description=iCloud bridge control share (CIFS)
 Requires=docker.service
 After=docker.service
+ConditionPathExists=!/var/lib/icloud-bridge/powered-off
 
 [Mount]
 What=//127.0.0.1/bridge
@@ -464,6 +471,7 @@ WantedBy=multi-user.target
 ```ini
 [Unit]
 Description=Automount for the iCloud bridge control share
+ConditionPathExists=!/var/lib/icloud-bridge/powered-off
 
 [Automount]
 Where=/mnt/icloud_bridge
@@ -528,6 +536,7 @@ exit $FAIL
 # icloud-health.service
 [Unit]
 Description=iCloud VM health check
+ConditionPathExists=!/var/lib/icloud-bridge/powered-off
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/icloud-health.sh
@@ -537,6 +546,7 @@ ExecStart=/usr/local/bin/icloud-health.sh
 # icloud-health.timer
 [Unit]
 Description=Run iCloud VM health check every 10 minutes
+ConditionPathExists=!/var/lib/icloud-bridge/powered-off
 [Timer]
 OnBootSec=5min
 OnUnitActiveSec=10min
@@ -549,6 +559,13 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now icloud-health.timer
 systemctl status icloud-health.service   # after first run
 ```
+
+All six units also carry `ConditionPathExists=!/var/lib/icloud-bridge/powered-off`
+(v2 plan D29): the GUI's **Quit and power off VM** writes that marker so the
+mounts and health checks stay disarmed across a reboot without disabling the
+units. `host/setup-host.sh` additionally installs the `icloud-bridge-power`
+helper, creates the marker directory, and installs the `sudoers` grant that lets
+the desktop operator run it; see v2 plan §5.1.
 
 **Limitation to note:** the canary proves the share and guest are alive; it cannot prove Apple-side upload succeeded (the client exposes no API for that). The Apple-session check is manual: if sync stops while health checks pass, open `:8006` and check the iCloud tray icon for a re-login prompt.
 
@@ -569,6 +586,17 @@ systemctl status icloud-health.service   # after first run
 | Guest disk below the floor and staying there | Reclamation has nothing eligible: content open, modified, or still uploading | Wait for uploads to finish, or grow `DISK_SIZE` as above |
 | An exclusion reports `acl-write-denied` | §4's agent `RC,WDAC` grant did not take, or that object has a protected DACL | Re-run `04-bridge-agent.ps1` elevated and read its protected-DACL report |
 | Excluded item reappeared under a new name | Renames of excluded items are not followed (accepted limitation) | Exclude the new path; clear the old one from *Missing configured items* |
+| Bridge stays off after a reboot; `ls /mnt/icloud` empty, no automount | The GUI's **Quit and power off VM** left `/var/lib/icloud-bridge/powered-off`, and the unit `ConditionPathExists` gates keep everything down (v2 plan D29). Intended | Launch the GUI (autostart does this at login) — it runs `icloud-bridge-power on`. To reconcile by hand: `sudo /usr/local/bin/icloud-bridge-power on` |
+| **Quit and power off VM** aborts saying a file is in use | A mount is busy (open file, a shell `cwd` inside `/mnt/icloud[_bridge]`, or an active copy); teardown refuses a lazy unmount by design | Close the holder — `lsof /mnt/icloud` / `fuser -m` — then Quit again. The VM stayed running the whole time |
+| GUI is stuck on **Starting Windows VM…** or shows a start error | The VM did not boot, or its SMB never became ready within five minutes | Open the VM screen (`:8006`), confirm iCloud is signed in, then **Retry start**. The GUI never auto-retries or arms health against a dead mount |
+
+**Desired-on vs desired-off reboot.** With the bridge **on** (no marker), the
+enabled units and `restart: unless-stopped` restore the container, both mounts,
+and the health timer automatically on reboot — v1 behaviour, unchanged. With the
+bridge **off** (marker present from a GUI power-off), the container stays stopped
+and every unit's `ConditionPathExists` suppresses it before login, with no FAIL
+spam; XDG autostart powers the bridge back on when the operator logs in, or it
+stays off until the GUI is launched if autostart is unticked.
 
 **Backup stance:** the VM is disposable *except* for the Apple session; the data's canonical copy is iCloud itself. For belt-and-braces, an optional host cron `rsync -a --delete /mnt/icloud/ /srv/icloud-backup/` onto snapshotted storage gives point-in-time recovery that iCloud's own trash does not.
 
@@ -621,6 +649,12 @@ real work.
     `status.json`, `tree.json` and `exclusions.json` all parse as JSON.
 14. Selective sync: v2 plan E1–E7, reproduced for operators in
     [`selective-sync.md`](selective-sync.md#deployment-checklist).
+15. GUI-managed lifecycle (v2 plan D29): `host/acceptance-tests.sh` checks that
+    `/var/lib/icloud-bridge` exists, `icloud-bridge-power` is `root:root` 0755,
+    `/etc/sudoers.d/icloud-bridge` is `root:root` 0440, all six units carry the
+    `ConditionPathExists` marker gate, and `sudo -n -l icloud-bridge-power on`/`off`
+    are permitted. The live on/off/busy/reboot behaviour is v2 plan E8–E11,
+    reproduced in [`selective-sync.md`](selective-sync.md#deployment-checklist).
 
 ---
 
@@ -656,7 +690,8 @@ Summary of what exists and where:
 | `provision/agent.ps1` | — | Byte-identical copy so dockur places it in `C:\OEM`; guarded by `host/acceptance-tests.sh` §8 |
 | `provision/04-bridge-agent.ps1` | Windows guest, elevated | Creates the `bridge` share over `C:\ProgramData\icloud-bridge\io`, normalises the `syncshare` ACL, grants the agent `RC,WDAC`, sets the D27 privilege boundary, turns on Access-Based Enumeration for the `icloud` share, registers the scheduled task |
 | `host/mnt-icloud_bridge.{mount,automount}` | Linux host | §8 above, verbatim |
-| `gui/` | Linux host, desktop user | Tray icon + status window + selective-sync UI; `pytest gui/tests` covers the health precedence rules and the bridge protocol |
+| `host/icloud-bridge-power` | Linux host, root (via the GUI's `sudo -n`) | Serialized `on`/`off` of the whole bridge as one transaction: durable off marker, ordered CIFS teardown (never lazy), graceful `docker stop --timeout 130`, and a real CIFS-readiness retry on startup (v2 plan D29) |
+| `gui/` | Linux host, desktop user | Tray icon + status window + selective-sync UI; Qt-free `power.py`/`autostart.py` drive the D29 lifecycle (power-on before any CIFS I/O, three-way Quit, autostart toggle); `pytest gui/tests` covers health precedence, the bridge protocol, the power model, and the autostart entry |
 
 **Deliberate exception to the verbatim-embedding rule.** §3, §4, §7, §8 and §9 of
 this document embed their files verbatim, and `AGENTS.md` requires those copies

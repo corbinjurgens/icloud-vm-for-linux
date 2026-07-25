@@ -5,6 +5,10 @@
 Description=iCloud Drive via Windows VM (CIFS)
 Requires=docker.service
 After=docker.service
+# Durable desired-off marker (v2 plan D29): a GUI "Quit and power off VM" writes
+# it so this mount stays down across a host reboot. The power helper still stops
+# an already-active mount explicitly; the condition only suppresses (re)starts.
+ConditionPathExists=!/var/lib/icloud-bridge/powered-off
 
 [Mount]
 What=//127.0.0.1/icloud

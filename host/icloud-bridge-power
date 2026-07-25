@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+# icloud-bridge-power — start or stop the whole iCloud bridge as one transaction.
+#
+# Runs on:   the Linux host, as root (via the GUI's `sudo -n`, or by hand).
+# Installed: /usr/local/bin/icloud-bridge-power, root:root 0755, by setup-host.sh.
+# Invoke:    icloud-bridge-power on
+#            icloud-bridge-power off
+#
+# This is the one privileged helper behind the GUI's "Quit and power off VM"
+# (v2 plan D29). Unmounting the CIFS shares and controlling the systemd units
+# needs root, and folding the Docker start/stop into the same root-owned helper
+# makes the mount/VM ordering and its rollback a single serialized transaction
+# rather than two independently failing operations.
+#
+# `off`  records a durable desired-off marker, quiesces the health checks, cleanly
+#        unmounts both shares while the guest SMB server is still alive, then
+#        gracefully stops the container. A busy mount aborts the whole thing with
+#        the VM left running; never a lazy or forced unmount.
+# `on`   starts the container and retries a *real* CIFS activation until both
+#        mounts are live (a TCP connect to the published port is not readiness,
+#        see docs/automation-notes.md), then re-arms the health timer.
+#
+# Idempotent: repeated `on`/`off` reconcile toward the same state and succeed once
+# it is reached. If the process is killed mid-transition the marker deliberately
+# remains (fail safe = off); a later `on`/`off` reconciles the partial state.
+#
+# A bounded flock under /run/lock serializes transitions so a concurrent GUI and
+# manual request cannot interleave.
+set -euo pipefail
+
+# A fixed, trusted PATH: this runs as root from sudo, so do not inherit one.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+# --- documented exit statuses (the GUI shows stderr; it does not parse these) --
+EXIT_USAGE=1        # bad arguments
+EXIT_NOTROOT=2      # not run as root
+EXIT_BUSY=3         # a mount is in use; unmount refused, VM left running
+EXIT_CONTAINER=4    # container missing, or start/stop failed
+EXIT_READINESS=5    # container is up but SMB never became usable in time
+EXIT_UNIT=6         # a systemd mount/automount/health unit could not be driven
+EXIT_LOCK=7         # could not acquire the transition lock
+EXIT_STATE=8        # final state could not be confirmed (ambiguous)
+
+MARKER=/var/lib/icloud-bridge/powered-off
+LOCKFILE=/run/lock/icloud-bridge-power.lock
+CONTAINER=icloud-windows
+
+# dockur traps SIGTERM, sends ACPI shutdown, waits up to 105 s, then force-kills
+# QEMU; compose grants 120 s. Ask Docker for 130 s so it does not pre-empt
+# dockur's own handler (v2 plan D29 review; verified against dockur commit
+# 99ac4035). The outer `timeout` sits just above that so a wedged daemon call
+# still returns to the GUI.
+DOCKER_STOP_TIMEOUT=130
+DOCKER_STOP_DEADLINE=200
+
+LOCK_WAIT=60            # seconds to wait for the transition lock
+SYSTEMCTL_TIMEOUT=45    # bound each systemctl call
+ACCESS_TIMEOUT=35       # bound each mount-triggering access (> mount TimeoutSec=30)
+READY_DEADLINE=300      # up to five minutes for SMB to come up
+READY_BACKOFF=10        # pause between readiness attempts
+
+AUTOMOUNTS=(mnt-icloud.automount mnt-icloud_bridge.automount)
+MOUNTS=(mnt-icloud.mount mnt-icloud_bridge.mount)
+MOUNT_POINTS=(/mnt/icloud /mnt/icloud_bridge)
+HEALTH_UNITS=(icloud-health.timer icloud-health.service)
+
+progress() { echo "==> $*"; }
+warn()     { echo "$*" >&2; }
+die()      { local code="$1"; shift; echo "$*" >&2; exit "$code"; }
+
+usage() {
+  cat >&2 <<EOF
+usage: icloud-bridge-power on|off
+
+  on   start the Windows VM and mount both iCloud shares, then arm health checks
+  off  unmount both shares and gracefully power off the Windows VM
+EOF
+}
+
+# --- small bounded wrappers ---------------------------------------------------
+# Every systemctl call is bounded so a wedged unit job cannot hang the GUI.
+scq() { timeout "$SYSTEMCTL_TIMEOUT" systemctl "$@" >/dev/null 2>&1; }
+
+unit_active() { scq is-active "$1"; }
+
+marker_present() { [ -e "$MARKER" ]; }
+
+create_marker() {
+  # Readable, root-only writable: "host bridge services must remain disarmed".
+  mkdir -p "$(dirname "$MARKER")"
+  install -m 0644 /dev/null "$MARKER"
+}
+
+remove_marker() { rm -f "$MARKER"; }
+
+# Print the container's State.Status, or the sentinel `absent` when no such
+# container exists, or `error:<message>` for a daemon/inspect failure we must
+# not mistake for "stopped".
+container_state() {
+  local out
+  if out=$(timeout 10 docker inspect -f '{{.State.Status}}' "$CONTAINER" 2>&1); then
+    printf '%s\n' "${out:-unknown}"
+    return 0
+  fi
+  case "$out" in
+    *"No such object"*|*"No such container"*) printf 'absent\n' ;;
+    *) printf 'error:%s\n' "$out" ;;
+  esac
+}
+
+# =============================================================================
+# off
+# =============================================================================
+do_off() {
+  local marker_pre_existed=false
+  marker_present && marker_pre_existed=true
+
+  # Roll the host units back to the desired-on state, but only undo the marker
+  # if this very call created it; a marker that pre-dated the call means we were
+  # already off and a failure must not silently switch things on.
+  rollback_to_on() {
+    if [ "$marker_pre_existed" = false ]; then
+      remove_marker
+      scq start "${AUTOMOUNTS[@]}" || true
+      scq start icloud-health.timer || true
+    fi
+  }
+
+  # 2. Create the marker before stopping anything, so a queued timer job or an
+  #    automount cannot re-arm mid-transition, and interruption fails safe.
+  progress "Recording desired-off state ($MARKER)"
+  create_marker
+
+  # 3. Quiesce the health checks (timer first, then any in-flight service run).
+  progress "Stopping health checks"
+  if ! scq stop icloud-health.timer icloud-health.service; then
+    rollback_to_on
+    die "$EXIT_UNIT" "Could not stop the health timer/service."
+  fi
+
+  # 4. Stop the automount traps so an access cannot re-trigger a mount.
+  progress "Stopping automount traps"
+  if ! scq stop "${AUTOMOUNTS[@]}"; then
+    rollback_to_on
+    die "$EXIT_UNIT" "Could not stop the automount units."
+  fi
+
+  # 5. Unmount both shares while the guest SMB server is still available, so CIFS
+  #    tears down cleanly. Never lazy/forced: a busy mount must abort the whole
+  #    transition with the VM left running (v2 plan D29).
+  progress "Unmounting the iCloud shares"
+  local i mp busy=false
+  for i in "${!MOUNTS[@]}"; do
+    scq stop "${MOUNTS[$i]}" || true
+    if unit_active "${MOUNTS[$i]}" || mountpoint -q "${MOUNT_POINTS[$i]}"; then
+      busy=true
+      break
+    fi
+  done
+  if [ "$busy" = true ]; then
+    # Leave the still-mounted share exactly as it was; re-arm what we stopped.
+    rollback_to_on
+    die "$EXIT_BUSY" \
+      "A filesystem operation is still using an iCloud share, so it cannot be unmounted. Close open files (and any shell whose working directory is inside /mnt/icloud or /mnt/icloud_bridge) and try again. The VM is still running."
+  fi
+
+  # 6. Only now, with nothing mounted, stop the container gracefully. A missing
+  #    or already-stopped container already satisfies the off state.
+  local state
+  state=$(container_state)
+  case "$state" in
+    absent|exited|created|dead)
+      progress "Container already stopped ($state)"
+      ;;
+    error:*)
+      die "$EXIT_CONTAINER" "Cannot inspect the container: ${state#error:}"
+      ;;
+    *)
+      progress "Stopping the Windows VM gracefully (up to ${DOCKER_STOP_TIMEOUT}s for ACPI shutdown)"
+      if ! timeout "$DOCKER_STOP_DEADLINE" docker stop --timeout "$DOCKER_STOP_TIMEOUT" "$CONTAINER" >/dev/null 2>&1; then
+        # Decide by the container's actual final state, not the stop exit code.
+        local after
+        after=$(container_state)
+        case "$after" in
+          exited|created|dead|absent)
+            progress "Container is stopped despite the stop error ($after)" ;;
+          running|restarting|paused)
+            rollback_to_on
+            die "$EXIT_CONTAINER" "The Windows VM did not stop (state: $after); left running." ;;
+          *)
+            die "$EXIT_STATE" "The Windows VM stop failed and its state is unknown (${after#error:}); the marker and mounts stay disarmed." ;;
+        esac
+      fi
+      ;;
+  esac
+
+  # 7. Confirm the off state before reporting success.
+  local u
+  for u in "${MOUNTS[@]}" "${AUTOMOUNTS[@]}" icloud-health.timer; do
+    if unit_active "$u"; then
+      die "$EXIT_STATE" "$u is still active after shutdown; the bridge is only partly off."
+    fi
+  done
+  state=$(container_state)
+  case "$state" in
+    exited|created|dead|absent) ;;
+    *) die "$EXIT_STATE" "The container is in state '$state' after shutdown." ;;
+  esac
+
+  progress "Bridge is off: both shares unmounted, health checks stopped, VM powered off."
+}
+
+# =============================================================================
+# on
+# =============================================================================
+do_on() {
+  # 2. A missing container is a provisioning gap, never something this helper
+  #    creates. Fail without disturbing the marker.
+  local state
+  state=$(container_state)
+  case "$state" in
+    absent)
+      die "$EXIT_CONTAINER" "No '$CONTAINER' container exists. First-time creation is the explicit 'docker compose up -d' provisioning step."
+      ;;
+    error:*)
+      die "$EXIT_CONTAINER" "Cannot inspect the container: ${state#error:}"
+      ;;
+  esac
+
+  # 3. Keep host checks from racing startup, and make sure the marker is present
+  #    while we bring the VM up so a concurrent reboot cannot arm the mounts.
+  create_marker
+  scq stop icloud-health.timer icloud-health.service || true
+
+  state=$(container_state)
+  if [ "$state" != "running" ]; then
+    progress "Starting the Windows VM"
+    if ! timeout 60 docker start "$CONTAINER" >/dev/null 2>&1; then
+      create_marker
+      die "$EXIT_CONTAINER" "Could not start the '$CONTAINER' container."
+    fi
+  else
+    progress "Container already running"
+  fi
+
+  # 4. Retry a real CIFS activation until both mounts are live, or time out. A
+  #    published-port TCP connect is not evidence the guest SMB is ready
+  #    (docs/automation-notes.md), so we require an actual metadata access plus
+  #    the .mount units reporting active.
+  progress "Waiting for the guest SMB server and mounting both shares (up to ${READY_DEADLINE}s)"
+  local deadline=$((SECONDS + READY_DEADLINE))
+  local ready=false
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    state=$(container_state)
+    if [ "$state" != "running" ]; then
+      create_marker
+      die "$EXIT_CONTAINER" "The Windows VM exited while waiting for it to boot (state: $state)."
+    fi
+
+    # Clear any prior failed jobs and drop the marker just long enough for the
+    # unit conditions to pass while we trigger the mounts.
+    scq reset-failed "${MOUNTS[@]}" "${AUTOMOUNTS[@]}" || true
+    remove_marker
+    if scq start "${AUTOMOUNTS[@]}"; then
+      local i
+      for i in "${!MOUNT_POINTS[@]}"; do
+        timeout "$ACCESS_TIMEOUT" ls -d "${MOUNT_POINTS[$i]}" >/dev/null 2>&1 || true
+      done
+      if unit_active mnt-icloud.mount && unit_active mnt-icloud_bridge.mount \
+          && mountpoint -q /mnt/icloud && mountpoint -q /mnt/icloud_bridge; then
+        ready=true
+        break
+      fi
+    fi
+
+    # Not ready: re-arm the marker, tear down the partial attempt, and wait.
+    create_marker
+    scq stop "${MOUNTS[@]}" "${AUTOMOUNTS[@]}" || true
+    sleep "$READY_BACKOFF"
+  done
+
+  if [ "$ready" != true ]; then
+    # Leave the VM running so the operator can inspect its web screen and retry.
+    create_marker
+    scq stop "${MOUNTS[@]}" "${AUTOMOUNTS[@]}" || true
+    die "$EXIT_READINESS" \
+      "The Windows VM is running but its iCloud shares did not become usable within ${READY_DEADLINE}s. Open the VM screen (http://127.0.0.1:8006) to check that iCloud is signed in, then retry. Health checks were not armed against an unverified mount."
+  fi
+
+  # 5/6. Both mounts are live; the marker is already absent. Arm the health timer.
+  progress "Mounts are live; starting the health timer"
+  if ! scq start icloud-health.timer; then
+    die "$EXIT_UNIT" "Both shares mounted, but the health timer could not be started."
+  fi
+
+  # 7. Confirm the on state.
+  local u
+  for u in mnt-icloud.mount mnt-icloud_bridge.mount icloud-health.timer; do
+    unit_active "$u" || die "$EXIT_STATE" "$u is not active after startup."
+  done
+  if marker_present; then
+    die "$EXIT_STATE" "The desired-off marker is still present after a successful start."
+  fi
+
+  progress "Bridge is on: both shares mounted, health checks running."
+}
+
+# =============================================================================
+# entry
+# =============================================================================
+main() {
+  local action="${1:-}"
+  case "$action" in
+    on|off) ;;
+    ""|-h|--help|help) usage; exit "$EXIT_USAGE" ;;
+    *) usage; exit "$EXIT_USAGE" ;;
+  esac
+  if [ "$#" -ne 1 ]; then usage; exit "$EXIT_USAGE"; fi
+
+  if [ "$(id -u)" -ne 0 ]; then
+    die "$EXIT_NOTROOT" "icloud-bridge-power must run as root (the GUI calls it through sudo)."
+  fi
+
+  # Serialize every transition. fd 9 stays held for the life of the process.
+  exec 9>"$LOCKFILE" || die "$EXIT_LOCK" "Cannot open the lock file $LOCKFILE."
+  if ! flock -w "$LOCK_WAIT" 9; then
+    die "$EXIT_LOCK" "Another icloud-bridge-power transition is already in progress."
+  fi
+
+  case "$action" in
+    on)  do_on ;;
+    off) do_off ;;
+  esac
+}
+
+main "$@"

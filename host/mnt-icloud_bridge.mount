@@ -7,6 +7,8 @@
 Description=iCloud bridge control share (CIFS)
 Requires=docker.service
 After=docker.service
+# Durable desired-off marker (v2 plan D29); see mnt-icloud.mount for rationale.
+ConditionPathExists=!/var/lib/icloud-bridge/powered-off
 
 [Mount]
 What=//127.0.0.1/bridge

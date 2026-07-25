@@ -353,8 +353,12 @@ ls /mnt/icloud               # your iCloud files
 ls /mnt/icloud_bridge        # status.json, tree.json, exclusions.json
 ```
 
-If the mount owner should be someone other than uid/gid 1000, pass
-`MOUNT_UID`/`MOUNT_GID` to `setup-host.sh`.
+Run `setup-host.sh` with `sudo` from your desktop account: it derives the mount
+owner and the GUI power-helper permission from that account (`SUDO_USER`). From a
+root shell instead, set `TARGET_USER=<name>`. Override the mount owner with
+`MOUNT_UID`/`MOUNT_GID` if it should differ. Alongside the mounts and health
+timer, this installs `/usr/local/bin/icloud-bridge-power` and a `sudoers` grant
+so the GUI can power the bridge on and off (v2 plan D29).
 
 **Run the E0 gate before trusting the mount with real work.** It checks that a
 cold, online-only file reads back correctly through the *kernel* CIFS client
@@ -378,6 +382,15 @@ exist and from a dedicated venv otherwise (never `pip install --user`).
 **GNOME users:** install the *AppIndicator and KStatusNotifierItem Support*
 extension, or the tray icon will not be visible.
 
+The GUI is the bridge's on/off switch (v2 plan D29). Launching it powers the
+Windows VM on and mounts the shares; the tray's **Quit → Quit and power off VM**
+cleanly disconnects both mounts and powers the VM off (leaving unuploaded changes
+to resume next start). **Quit GUI only** leaves the bridge running. The tray's
+**Start when the computer starts** toggles the autostart entry. A reboot while
+powered off stays off (a marker plus systemd conditions suppress the mounts and
+health timer) until you log in with autostart enabled, or run
+`sudo /usr/local/bin/icloud-bridge-power on`.
+
 ---
 
 ## Troubleshooting quick reference
@@ -396,3 +409,7 @@ extension, or the tray icon will not be visible.
 | An exclusion is stuck at `pending-dehydrate` | Cloud Files refuses to dehydrate content that is open, modified, or not yet uploaded | Wait for the upload; the item is already hidden and inaccessible from the host. See `docs/selective-sync.md` |
 | An exclusion reports `acl-write-denied` | Provisioning step 4 (the agent's `RC,WDAC` grant) did not take, or that object has a protected DACL | Re-run `04-bridge-agent.ps1` as Administrator and read its protected-DACL report |
 | No tray icon on GNOME | GNOME has no built-in tray | Install the *AppIndicator and KStatusNotifierItem Support* extension |
+| **Quit and power off VM** aborts: *"a file operation … is still in progress"* | A mount is busy — an open file, a shell `cwd` inside `/mnt/icloud[_bridge]`, or a running copy; teardown refuses a lazy unmount | Close the holder (`lsof /mnt/icloud`, `fuser -m /mnt/icloud`) and Quit again; the VM stayed up the whole time |
+| GUI stuck on *Starting Windows VM…* or shows a start error | The VM did not boot or its SMB was not ready within five minutes | Open `:8006`, confirm iCloud is signed in, then **Retry start**. The GUI never auto-retries or arms health against a dead mount |
+| After a reboot the bridge is off and `/mnt/icloud` is empty | The GUI powered it off; the marker + unit conditions keep it down (intended, D29) | Launch the GUI (autostart does this at login), or `sudo /usr/local/bin/icloud-bridge-power on` |
+| GUI: *"sudo: a password is required"* when starting/quitting | `setup-host.sh` was not run for this account, so the power-helper `sudoers` grant is missing | Re-run `sudo ./host/setup-host.sh` from your desktop account (or with `TARGET_USER=<name>`) |

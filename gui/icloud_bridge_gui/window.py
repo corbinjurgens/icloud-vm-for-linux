@@ -56,12 +56,27 @@ class MainWindow(QMainWindow):
     #: Emitted when the user asks for an immediate health refresh; ``__main__``
     #: owns the polling loop so only one gather is ever in flight.
     refresh_requested = Signal()
+    #: Emitted when the window is closed with no tray to fall back to; the
+    #: controller runs the same confirmed Quit flow (v2 plan D29) rather than
+    #: letting ``QuitOnLastWindowClosed`` bypass it.
+    quit_requested = Signal()
+    #: Emitted by the in-window "Retry start" button after a failed power-on (the
+    #: no-tray equivalent of the tray's Retry action).
+    retry_start_requested = Signal()
 
     def __init__(self, run_async: Callable[..., None]) -> None:
         super().__init__()
         self._run_async = run_async
         #: When a system tray exists, closing the window only hides it.
         self.hide_on_close = False
+        #: While paused (VM starting, or a power-off transition running) the
+        #: window dispatches no new bridge I/O — a sick or absent mount must not
+        #: be touched before startup succeeds, and unmount must not race an
+        #: in-flight read/write (v2 plan D29).
+        self._io_paused = False
+        #: True only while an Apply write is actually in flight, so the shutdown
+        #: gate never begins an unmount mid-write.
+        self._apply_writing = False
         self.setWindowTitle("iCloud bridge")
         self.resize(880, 620)
 
@@ -82,10 +97,23 @@ class MainWindow(QMainWindow):
         self._suppress_item_signals = False
         self._tree_generated_at: str | None = None
 
-        tabs = QTabWidget()
-        tabs.addTab(self._build_status_tab(), "Status")
-        tabs.addTab(self._build_sync_tab(), "Selective Sync")
-        self.setCentralWidget(tabs)
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Transitional banner (starting / shutting down / start failed). Hidden in
+        # the steady state; the health rows carry ordinary status.
+        self._banner = QLabel("")
+        self._banner.setWordWrap(True)
+        self._banner.setContentsMargins(10, 8, 10, 8)
+        self._banner.hide()
+        central_layout.addWidget(self._banner)
+
+        self._tabs = QTabWidget()
+        self._tabs.addTab(self._build_status_tab(), "Status")
+        self._tabs.addTab(self._build_sync_tab(), "Selective Sync")
+        central_layout.addWidget(self._tabs, 1)
+        self.setCentralWidget(central)
 
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(1000)
@@ -125,12 +153,18 @@ class MainWindow(QMainWindow):
         buttons = QHBoxLayout()
         open_files = QPushButton("Open iCloud folder")
         open_files.clicked.connect(lambda: open_externally(bridge.mount_dir()))
+        self._open_files_button = open_files
         open_vm = QPushButton("Open VM screen")
         open_vm.clicked.connect(lambda: open_externally(VM_VIEWER_URL))
         refresh = QPushButton("Refresh now")
         refresh.clicked.connect(self.request_refresh)
         for button in (open_files, open_vm, refresh):
             buttons.addWidget(button)
+        # Shown only after a failed power-on; the controller wires it to Retry.
+        self._retry_button = QPushButton("Retry start")
+        self._retry_button.clicked.connect(self.retry_start_requested.emit)
+        self._retry_button.hide()
+        buttons.addWidget(self._retry_button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
         return page
@@ -209,7 +243,63 @@ class MainWindow(QMainWindow):
             event.ignore()
             self.hide()
         else:
-            event.accept()
+            # No tray: closing the only window is the Quit action, but it must go
+            # through the controller's confirmation/transition, not exit under us.
+            event.ignore()
+            self.quit_requested.emit()
+
+    # ------------------------------------------------------- lifecycle gating --
+
+    BANNER_STYLES = {
+        "starting": f"background: #e7f0fb; color: #1a3a63;",
+        "shutdown": f"background: #e7f0fb; color: #1a3a63;",
+        "error": f"background: #fbecea; color: {DOT_COLORS[health.RED]};",
+    }
+
+    def show_banner(self, text: str, kind: str = "starting") -> None:
+        """Show a transitional banner above the tabs."""
+        self._banner.setText(text)
+        self._banner.setStyleSheet(self.BANNER_STYLES.get(kind, self.BANNER_STYLES["starting"]))
+        self._banner.show()
+
+    def hide_banner(self) -> None:
+        self._banner.hide()
+
+    def show_retry_start(self, visible: bool) -> None:
+        self._retry_button.setVisible(visible)
+
+    def set_bridge_controls_enabled(self, enabled: bool) -> None:
+        """Enable/disable everything that reads or writes the bridge/mount.
+
+        The Selective Sync tab and the "Open iCloud folder" button touch CIFS;
+        the "Open VM screen" button does not and stays available for diagnosis.
+        """
+        self._tabs.setTabEnabled(1, enabled)
+        if hasattr(self, "_open_files_button"):
+            self._open_files_button.setEnabled(enabled)
+
+    def set_io_paused(self, paused: bool) -> None:
+        """Gate new bridge I/O; also reflect it in the controls."""
+        self._io_paused = paused
+        self.set_bridge_controls_enabled(not paused)
+
+    def apply_in_flight(self) -> bool:
+        return self._apply_writing
+
+    def quiesce(self) -> None:
+        """Stop scheduling bridge I/O and drop any queued list requests.
+
+        In-flight worker tasks still finish; the controller waits for them to
+        drain before it lets the helper unmount (v2 plan D29).
+        """
+        self.set_io_paused(True)
+        self._poll_timer.stop()
+        self._pending_requests.clear()
+
+    def resume(self) -> None:
+        """Undo :meth:`quiesce` after an aborted shutdown."""
+        self.set_io_paused(False)
+        self._poll_timer.start()
 
     def last_write_info(self) -> tuple[int | None, datetime | None]:
         """The revision this GUI last wrote, for the D23 revision-lag check."""
@@ -259,6 +349,8 @@ class MainWindow(QMainWindow):
 
     def reload_selective_sync(self) -> None:
         """Re-read exclusions.json and rebuild the tree from the last tree.json."""
+        if self._io_paused:
+            return
         def work():
             return bridge.read_exclusions()
 
@@ -518,6 +610,8 @@ class MainWindow(QMainWindow):
         self._request_files(extra.get("path", ""), int(extra.get("offset", 0)))
 
     def _request_files(self, path: str, offset: int) -> None:
+        if self._io_paused:
+            return
         def work():
             return bridge.request_listing(path, offset=offset, limit=LIST_PAGE)
 
@@ -535,6 +629,8 @@ class MainWindow(QMainWindow):
         self._run_async(work, done, failed)
 
     def _poll_pending(self) -> None:
+        if self._io_paused:
+            return
         now = datetime.now(timezone.utc).timestamp()
         for request_id, info in list(self._pending_requests.items()):
             if request_id in self._polls_in_flight:
@@ -638,6 +734,8 @@ class MainWindow(QMainWindow):
         self._update_buttons()
 
     def _apply(self) -> None:
+        if self._io_paused:
+            return
         try:
             wanted = bridge.canonicalize(self._wanted)
         except ValueError as exc:
@@ -670,6 +768,7 @@ class MainWindow(QMainWindow):
                                            applied_revision=applied, last_written=last_written)
 
         def done(revision: int):
+            self._apply_writing = False
             self._last_written_revision = revision
             self._last_write_at = datetime.now(timezone.utc)
             self._loaded_wanted = list(wanted)
@@ -680,10 +779,12 @@ class MainWindow(QMainWindow):
             self._update_buttons()
 
         def failed(message: str):
+            self._apply_writing = False
             QMessageBox.warning(
                 self, "Could not apply",
                 f"{message}\n\nNothing was changed. Reloading the current configuration.")
             self.reload_selective_sync()
 
         self._apply_button.setEnabled(False)
+        self._apply_writing = True
         self._run_async(work, done, failed)

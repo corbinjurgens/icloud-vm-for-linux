@@ -167,14 +167,17 @@ On the guest desktop (via the web viewer, or RDP to `127.0.0.1:3389`), open
 ### 4. Mount on the host and verify
 
 ```bash
-sudo ./host/setup-host.sh    # credentials from .env, both CIFS mounts + health timer
+sudo ./host/setup-host.sh    # credentials from .env, both CIFS mounts + health timer,
+                             #   and the GUI power helper + sudoers grant (D29)
 ./host/acceptance-tests.sh   # host-side acceptance checks
 ls /mnt/icloud               # your iCloud files
 ```
 
 Files written under `/mnt/icloud` land in the guest's sync root and upload to
-iCloud automatically. If the mount owner should be someone other than uid/gid
-1000, pass `MOUNT_UID`/`MOUNT_GID` to `setup-host.sh`.
+iCloud automatically. Run `setup-host.sh` with `sudo` from your desktop account
+so it can grant *that* account the power-helper permission; if you run it from a
+root shell instead, pass `TARGET_USER=<name>`. The mount owner defaults to that
+account's uid/gid; override with `MOUNT_UID`/`MOUNT_GID`.
 
 **Before trusting the mount with real work, run the E0 gate** — a cold read of a
 large online-only file through the kernel CIFS client, plus a write/edit/delete
@@ -193,6 +196,27 @@ hosts the selective-sync UI.
 
 **GNOME users:** install the *AppIndicator and KStatusNotifierItem Support*
 extension, or the tray icon will not be visible.
+
+**Starting and quitting (the GUI is the on/off switch).** Launching the GUI is
+how you turn the bridge on: if the Windows VM is stopped, it powers it on, waits
+for the shares to mount (a blue *Starting* icon), and only then reads iCloud.
+The tray's **Quit** offers three choices:
+
+- **Quit and power off VM** — like quitting Google Drive: it stops syncing,
+  cleanly disconnects `/mnt/icloud` and `/mnt/icloud_bridge`, and powers the VM
+  off so it stops using RAM and CPU. Starting the GUI again brings it back.
+  Unuploaded changes resume on the next start (this cannot prove Apple's upload
+  queue is empty). If a file on the mount is still open, the shutdown aborts and
+  leaves the VM running rather than force-unmounting.
+- **Quit GUI only** — leaves the bridge running; use it when you just want to
+  restart or upgrade the GUI.
+- **Cancel.**
+
+Closing the window with its **X** only hides it when a tray is present; the
+bridge keeps running. A checkable **Start when the computer starts** item
+controls whether the GUI (and therefore the bridge) comes up automatically at
+login. This needs a one-time `sudo ./host/setup-host.sh` so the GUI may run the
+privileged power helper without a password.
 
 ## Files On-Demand and disk space
 

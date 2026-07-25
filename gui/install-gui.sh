@@ -90,9 +90,25 @@ chmod 755 "$LAUNCHER"
 echo "==> Writing desktop entries"
 sed -e "s|__LAUNCHER__|$LAUNCHER|" -e "s|__ICON__|$ICON|" \
   "$here/icloud-bridge-gui.desktop" > "$DESKTOP_DIR/icloud-bridge-gui.desktop"
+
+# Preserve a deliberately-disabled autostart choice across upgrades (v2 plan
+# D29): if the operator unticked "Start when the computer starts", the installed
+# entry carries Hidden=true / X-GNOME-Autostart-enabled=false. Re-running the
+# installer rewrites the absolute Exec path but must not silently re-enable it.
+AUTOSTART_DST="$AUTOSTART_DIR/icloud-bridge-tray.desktop"
+keep_disabled=false
+if [ -f "$AUTOSTART_DST" ] \
+   && grep -qiE '^(Hidden=true|X-GNOME-Autostart-enabled=false)' "$AUTOSTART_DST"; then
+  keep_disabled=true
+fi
 sed -e "s|__LAUNCHER__|$LAUNCHER|" -e "s|__ICON__|$ICON|" \
-  "$here/autostart/icloud-bridge-tray.desktop" > "$AUTOSTART_DIR/icloud-bridge-tray.desktop"
-chmod 644 "$DESKTOP_DIR/icloud-bridge-gui.desktop" "$AUTOSTART_DIR/icloud-bridge-tray.desktop"
+  "$here/autostart/icloud-bridge-tray.desktop" > "$AUTOSTART_DST"
+if [ "$keep_disabled" = true ]; then
+  echo "==> Preserving your disabled autostart choice"
+  sed -i 's/^X-GNOME-Autostart-enabled=true/X-GNOME-Autostart-enabled=false/' "$AUTOSTART_DST"
+  grep -q '^Hidden=' "$AUTOSTART_DST" || echo 'Hidden=true' >> "$AUTOSTART_DST"
+fi
+chmod 644 "$DESKTOP_DIR/icloud-bridge-gui.desktop" "$AUTOSTART_DST"
 
 echo
 echo "Installed. Start it now with:  $LAUNCHER"
