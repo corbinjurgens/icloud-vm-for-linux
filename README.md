@@ -60,9 +60,14 @@ cached until the guest needs the space back.
 
 ```
 .
+├── Makefile               # every entry point; run `make` to list them
 ├── docker-compose.yml     # the dockur/windows service definition
 ├── .env.example           # operator-specific values (copy to .env, gitignored)
 ├── SETUP.md               # annotated real-machine runbook + troubleshooting
+├── packaging/             # .deb build
+│   ├── build-deb.sh       # stages a tree, dpkg-deb (no debhelper/fakeroot/root)
+│   ├── lint-ps1.ps1       # PowerShell parse + analyzer pass
+│   └── deb/               # control.in, maintainer scripts, launcher, overrides
 ├── provision/             # scripts run INSIDE the Windows guest
 │   ├── install.bat        # dockur OEM bootstrap (auto-runs 01, writes desktop note)
 │   ├── 01-debloat.ps1
@@ -88,7 +93,8 @@ cached until the guest needs the space back.
 │   └── test-smb-*.{ps1,sh}# the 2026-07-22/23 hydration evidence
 ├── host/                  # host-side setup, systemd units + health check
 │   ├── setup-prereqs.sh   # install docker + cifs-utils, verify KVM
-│   ├── setup-host.sh      # build credentials from .env, install both mounts + timer
+│   ├── setup-host.sh      # place units, helper and marker dir, then configure
+│   ├── icloud-bridge-configure # credentials, mount uid/gid, sudoers grant
 │   ├── acceptance-tests.sh# host-side subset of the acceptance tests
 │   ├── mnt-icloud.mount / .automount
 │   ├── mnt-icloud_bridge.mount / .automount
@@ -218,6 +224,48 @@ controls whether the GUI (and therefore the bridge) comes up automatically at
 login. This needs a one-time `sudo ./host/setup-host.sh` so the GUI may run the
 privileged power helper without a password.
 
+## Installing as a package instead
+
+The steps above install from the checkout. `make` builds a `.deb` that places the
+same files at the same paths, so the two are interchangeable:
+
+```bash
+make deb          # -> dist/icloud-bridge_<version>_all.deb
+make install      # apt install ./dist/icloud-bridge_*.deb
+make configure    # sudo icloud-bridge-configure --env-file ./.env
+```
+
+`make configure` is not optional and cannot be folded into the package: the share
+password lives in the gitignored `.env`, and the mount ownership and the sudo
+grant for the power helper both key off whichever desktop account will run the
+GUI. None of that is knowable when the package is built. It is idempotent — re-run
+it after changing the desktop user or the share password.
+
+The package includes the tray GUI, so `./gui/install-gui.sh` is not needed
+alongside it. Both may be installed: a per-user install shadows the system one by
+`PATH` and XDG precedence, so the tray cannot end up launched twice. The per-user
+installer remains the right choice on a release whose archives lack the
+`python3-pyside6` packages, since it can fall back to a dedicated venv.
+
+`make uninstall` removes the package but keeps your credentials and sudoers grant;
+`make purge` removes those too.
+
+## Development
+
+```bash
+make            # list every target
+make check      # lint + tests -- everything provable without a VM
+make test-all   # run the suite both with and without PySide6
+make lint-ps    # fetch PowerShell 7 and parse the .ps1 files
+```
+
+`make test` creates `.venv` on first use; there is no system pytest and PEP 668
+blocks `pip install --user`, so a venv is the supported route. Targets that need
+real hardware — `deps`, `install`, `configure`, `acceptance` — are labelled
+`HOST:` in `make` output and cannot be validated from a checkout alone. See
+[plan §14](docs/implementation-plan.md) for how the packaging is put together and
+why it ships where it does.
+
 ## Files On-Demand and disk space
 
 Files On-Demand stays **on** and this project pins nothing. v1 planned the
@@ -269,8 +317,8 @@ verified against a running Windows guest yet.
 The authoritative design documents are
 [`docs/implementation-plan.md`](docs/implementation-plan.md) (v1: components,
 provisioning, mount, health, runbook) and
-[`plan-gui-selective-sync.md`](plan-gui-selective-sync.md) (v2: the GUI, the
-bridge protocol, and selective sync; where the two disagree, v2 wins).
+[`docs/plan-gui-selective-sync.md`](docs/plan-gui-selective-sync.md) (v2: the
+GUI, the bridge protocol, and selective sync; where the two disagree, v2 wins).
 
 ## Security posture
 

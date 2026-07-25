@@ -9,3 +9,12 @@
 
 # Python bytecode (gui/ and tools/ scripts)
 __pycache__/
+.pytest_cache/
+
+# Developer virtualenvs (make venv / make venv-qt)
+/.venv/
+/.venv-qt/
+
+# Package staging and output (make deb)
+/build/
+/dist/

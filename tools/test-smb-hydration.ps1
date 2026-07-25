@@ -8,7 +8,7 @@
 # It ran on 2026-07-22/23 and the answer was YES: placeholders hydrate on
 # demand, with correct content and checksums. D5 is therefore disproven and
 # superseded by v2 D14/D25 — Files On-Demand stays on and nothing is pinned.
-# The results are recorded in plan-gui-selective-sync.md section 0.5.
+# The results are recorded in docs/plan-gui-selective-sync.md section 0.5.
 #
 # Note the scope limit that E0 exists to close: this test drives userland
 # `smbclient`, not the kernel cifs client the real mount uses, and the largest

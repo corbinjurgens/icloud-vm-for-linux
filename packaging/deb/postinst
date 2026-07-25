@@ -1,0 +1,62 @@
+#!/bin/sh
+# Package postinst. Deliberately does NOT configure the bridge: the share
+# password, mount ownership and the D29 sudoers grant cannot be known at unpack
+# time, so they stay in icloud-bridge-configure (which the operator runs, and
+# which this script replays across upgrades).
+set -e
+
+case "$1" in
+  configure)
+    # The marker directory only — never the marker itself; a marker here would
+    # leave the bridge disarmed. The power helper owns the marker's lifecycle.
+    install -d -o root -g root -m 0755 /var/lib/icloud-bridge
+
+    if [ -d /run/systemd/system ]; then
+      systemctl daemon-reload || true
+    fi
+
+    # Replay the recorded mount ownership. An upgrade unpacks pristine units
+    # carrying uid=1000,gid=1000, which would silently re-own the mounts away
+    # from the desktop user; icloud-bridge-configure records its choices in
+    # /etc/icloud-bridge/config precisely so this can put them back.
+    if [ -r /etc/icloud-bridge/config ]; then
+      # shellcheck disable=SC1091
+      . /etc/icloud-bridge/config
+      if [ -n "${MOUNT_UID:-}" ] && [ -n "${MOUNT_GID:-}" ]; then
+        for unit in mnt-icloud.mount mnt-icloud_bridge.mount; do
+          [ -f "/etc/systemd/system/$unit" ] || continue
+          sed -i -E "s/\buid=[0-9]+/uid=$MOUNT_UID/; s/\bgid=[0-9]+/gid=$MOUNT_GID/" \
+            "/etc/systemd/system/$unit"
+        done
+        echo "Restored mount ownership uid=$MOUNT_UID gid=$MOUNT_GID from /etc/icloud-bridge/config."
+      fi
+      if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+        # Enabling is safe while powered off: the units' ConditionPathExists on
+        # the desired-off marker keeps them inactive (v2 plan D29).
+        systemctl enable --now mnt-icloud.automount || true
+        systemctl enable --now mnt-icloud_bridge.automount || true
+        systemctl enable --now icloud-health.timer || true
+      fi
+    else
+      echo ""
+      echo "iCloud bridge installed, but NOT yet configured. Next:"
+      echo "  sudo icloud-bridge-configure --env-file /path/to/.env"
+      echo ""
+      echo "The guest provisioning scripts and a compose file are in"
+      echo "/usr/share/icloud-bridge; see /usr/share/doc/icloud-bridge/SETUP.md."
+      echo ""
+    fi
+
+    if command -v update-desktop-database >/dev/null 2>&1; then
+      update-desktop-database -q /usr/share/applications || true
+    fi
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+      gtk-update-icon-cache -q -f /usr/share/icons/hicolor || true
+    fi
+    ;;
+  abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+esac
+
+exit 0

@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# icloud-bridge-configure — apply the machine-specific half of the host setup.
+#
+# Runs on the Linux host as root, AFTER the bridge files are in place (either
+# `sudo ./host/setup-host.sh` from the repo, or `apt install ./icloud-bridge_*.deb`).
+# Idempotent — re-run it after changing the desktop user, the share password, or
+# after a package upgrade.
+#
+#   sudo icloud-bridge-configure [--user NAME] [--env-file PATH] [--uid N] [--gid N]
+#
+# Nothing here can be decided at package build time, which is why it is a
+# separate step rather than a postinst: the share password lives in the operator's
+# gitignored .env, and the mount ownership plus the D29 sudoers grant key off
+# whichever desktop account will actually run the GUI.
+#
+# What it does:
+#   1. /etc/credentials-icloud       from SHARE_PASS
+#   2. uid=/gid= in the two installed .mount units  -> the desktop user
+#   3. /etc/sudoers.d/icloud-bridge  argument-exact power-helper grant (v2 plan D29)
+#   4. /etc/icloud-bridge/config     records 1-3 so a package upgrade can re-apply
+#                                    the unit patch instead of clobbering it
+#   5. systemctl daemon-reload + enable the automounts and the health timer
+set -euo pipefail
+
+SUDOERS_DST=/etc/sudoers.d/icloud-bridge
+STATE_DIR=/etc/icloud-bridge
+STATE_FILE="$STATE_DIR/config"
+CREDENTIALS=/etc/credentials-icloud
+UNIT_DIR=/etc/systemd/system
+MOUNT_UNITS=(mnt-icloud.mount mnt-icloud_bridge.mount)
+
+# Print the header comment block as the help text: everything from line 2 up to
+# the first non-comment line, so editing the header cannot desynchronize --help.
+usage() {
+  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+}
+
+env_file=""
+cli_user=""
+cli_uid=""
+cli_gid=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --user)     cli_user="${2:-}"; shift 2 ;;
+    --env-file) env_file="${2:-}"; shift 2 ;;
+    --uid)      cli_uid="${2:-}"; shift 2 ;;
+    --gid)      cli_gid="${2:-}"; shift 2 ;;
+    -h|--help)  usage; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "Please run as root (sudo)." >&2
+  exit 1
+fi
+
+# --- resolve the desktop operator (v2 plan D29) -------------------------------
+# The sudoers grant and the mount ownership both key off this account. `sudo
+# icloud-bridge-configure` fills SUDO_USER; a bare root shell must pass --user (or
+# TARGET_USER=) so we never grant the rule to root or guess wrong.
+TARGET_USER="${cli_user:-${SUDO_USER:-${TARGET_USER:-}}}"
+if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "root" ]; then
+  echo "Cannot determine the desktop user. Re-run with --user <name>, or with sudo as that user." >&2
+  exit 1
+fi
+if ! id "$TARGET_USER" >/dev/null 2>&1; then
+  echo "'$TARGET_USER' is not a valid account." >&2
+  exit 1
+fi
+MOUNT_UID="${cli_uid:-${MOUNT_UID:-$(id -u "$TARGET_USER")}}"
+MOUNT_GID="${cli_gid:-${MOUNT_GID:-$(id -g "$TARGET_USER")}}"
+case "$MOUNT_UID$MOUNT_GID" in
+  *[!0-9]*) echo "--uid/--gid must be numeric (got uid=$MOUNT_UID gid=$MOUNT_GID)." >&2; exit 1 ;;
+esac
+
+# --- 1. credentials -----------------------------------------------------------
+# Search order: an exported SHARE_PASS, then --env-file, then the repo/etc copies.
+# If none is found but credentials already exist, keep them: re-running this to
+# change only the desktop user must not demand the password again.
+if [ -z "${SHARE_PASS:-}" ]; then
+  for candidate in "$env_file" "${ICLOUD_ENV_FILE:-}" ./.env "$STATE_DIR/.env"; do
+    [ -n "$candidate" ] && [ -f "$candidate" ] || continue
+    # `|| true` is load-bearing: under `set -o pipefail` a grep that matches
+    # nothing fails the whole pipeline, and `set -e` would then kill the script
+    # with no message at all for a .env that simply has no SHARE_PASS line.
+    SHARE_PASS="$(grep -E '^SHARE_PASS=' "$candidate" | cut -d= -f2- || true)"
+    [ -n "${SHARE_PASS:-}" ] && { echo "==> Reading SHARE_PASS from $candidate"; break; }
+  done
+fi
+if [ -n "${SHARE_PASS:-}" ] && [ "$SHARE_PASS" != "CHANGE_ME_STRONG_PASSWORD" ]; then
+  echo "==> Writing $CREDENTIALS"
+  umask 077
+  cat > "$CREDENTIALS" <<EOF
+username=syncshare
+password=$SHARE_PASS
+EOF
+  chmod 600 "$CREDENTIALS"
+elif [ -s "$CREDENTIALS" ]; then
+  echo "==> No SHARE_PASS supplied; keeping the existing $CREDENTIALS"
+else
+  if [ "${SHARE_PASS:-}" = "CHANGE_ME_STRONG_PASSWORD" ]; then
+    echo "SHARE_PASS is still the placeholder from .env.example." >&2
+  else
+    echo "No SHARE_PASS found, and there is no existing $CREDENTIALS." >&2
+  fi
+  echo "Set a strong password (20+ random chars) in your .env, then re-run with" >&2
+  echo "  sudo icloud-bridge-configure --env-file /path/to/.env" >&2
+  exit 1
+fi
+
+mkdir -p /mnt/icloud /mnt/icloud_bridge
+
+# --- 2. mount ownership -------------------------------------------------------
+# Patch the installed units in place so this works identically whether they were
+# placed by setup-host.sh or unpacked from the .deb. The shipped units carry
+# uid=1000,gid=1000; the substitution is on the numeric value, so re-running with
+# a different user is idempotent rather than cumulative.
+for unit in "${MOUNT_UNITS[@]}"; do
+  if [ ! -f "$UNIT_DIR/$unit" ]; then
+    echo "$UNIT_DIR/$unit is missing — run setup-host.sh or install the package first." >&2
+    exit 1
+  fi
+  sed -i -E "s/\buid=[0-9]+/uid=$MOUNT_UID/; s/\bgid=[0-9]+/gid=$MOUNT_GID/" "$UNIT_DIR/$unit"
+done
+echo "==> Mounts owned by $TARGET_USER (uid=$MOUNT_UID gid=$MOUNT_GID)"
+
+# --- 3. the sudoers grant (v2 plan D29) ---------------------------------------
+# Grant the operator only the exact `on`/`off` argument forms. A bare command path
+# would permit arbitrary arguments, so the arguments are part of the spec (sudoers
+# matches command arguments exactly). Render, validate the render, and only then
+# swap it in atomically; never replace a valid policy with a bad one.
+sudoers_tmp="$(mktemp "${SUDOERS_DST}.tmp.XXXXXX")"
+cat > "$sudoers_tmp" <<EOF
+# Installed by icloud-bridge-configure (v2 plan D29). Passwordless, argument-exact
+# use of the bridge power helper by the desktop operator; nothing else.
+$TARGET_USER ALL=(root) NOPASSWD: /usr/local/bin/icloud-bridge-power on, /usr/local/bin/icloud-bridge-power off
+EOF
+chown root:root "$sudoers_tmp"
+chmod 0440 "$sudoers_tmp"
+if ! visudo -cf "$sudoers_tmp" >/dev/null; then
+  rm -f "$sudoers_tmp"
+  echo "Generated sudoers policy failed validation; left the existing policy untouched." >&2
+  exit 1
+fi
+# A temp name in /etc/sudoers.d contains dots, so sudo/visudo ignore it during the
+# scan; the mv into the final dotless name is the atomic swap.
+mv -f "$sudoers_tmp" "$SUDOERS_DST"
+if ! visudo -c >/dev/null; then
+  rm -f "$SUDOERS_DST"
+  echo "Overall sudoers policy became invalid; removed $SUDOERS_DST." >&2
+  exit 1
+fi
+echo "==> Power-helper sudoers grant installed for $TARGET_USER"
+
+# --- 4. record the choices ----------------------------------------------------
+# The package's postinst replays the unit patch from this file after an upgrade
+# unpacks pristine units; without it every upgrade would silently reset the mounts
+# to uid/gid 1000.
+install -d -o root -g root -m 0755 "$STATE_DIR"
+cat > "$STATE_FILE" <<EOF
+# Written by icloud-bridge-configure. Replayed by the package postinst on upgrade.
+TARGET_USER=$TARGET_USER
+MOUNT_UID=$MOUNT_UID
+MOUNT_GID=$MOUNT_GID
+EOF
+chmod 0644 "$STATE_FILE"
+
+# --- 5. arm the units ---------------------------------------------------------
+install -d -o root -g root -m 0755 /var/lib/icloud-bridge
+systemctl daemon-reload
+# If the desired-off marker is present (an intentional GUI power-off), enabling
+# these units keeps them enabled but their ConditionPathExists leaves them
+# inactive, so this rerun does not silently re-arm the bridge.
+systemctl enable --now mnt-icloud.automount
+systemctl enable --now mnt-icloud_bridge.automount
+systemctl enable --now icloud-health.timer
+
+echo "Done. Verify with:  ls /mnt/icloud  &&  ls /mnt/icloud_bridge"

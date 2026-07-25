@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# /usr/bin/icloud-bridge-gui — system-wide launcher installed by the .deb.
+#
+# The per-user installer (gui/install-gui.sh) writes its own launcher into
+# ~/.local/bin. That one shadows this by PATH order, which is intended: a user who
+# installed for themselves keeps their copy, and the .desktop entries follow the
+# same XDG precedence (~/.local/share/applications wins over /usr/share).
+set -euo pipefail
+
+APP_DIR=/usr/lib/icloud-bridge-gui
+
+# PySide6 is a Recommends, not a Depends (see debian/control), so it can genuinely
+# be absent. Fail with the fix rather than a bare ImportError traceback.
+if ! python3 -c 'import PySide6.QtWidgets, PySide6.QtSvg' >/dev/null 2>&1; then
+  echo "icloud-bridge-gui: PySide6 is not available for $(command -v python3)." >&2
+  echo "Install it with:" >&2
+  echo "  sudo apt install python3-pyside6.qtwidgets python3-pyside6.qtgui \\" >&2
+  echo "                   python3-pyside6.qtcore python3-pyside6.qtsvg" >&2
+  echo "If your release does not ship those packages, use the per-user installer" >&2
+  echo "instead (gui/install-gui.sh), which falls back to a dedicated venv." >&2
+  exit 1
+fi
+
+cd "$APP_DIR"
+exec python3 -m icloud_bridge_gui "$@"

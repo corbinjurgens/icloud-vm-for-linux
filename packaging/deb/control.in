@@ -1,0 +1,27 @@
+Package: icloud-bridge
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: all
+Maintainer: Corbin Jurgens <corbinjurgens@gmail.com>
+Depends: python3 (>= 3.10), cifs-utils, sudo, systemd
+Recommends: python3-pyside6.qtwidgets, python3-pyside6.qtgui, python3-pyside6.qtcore, python3-pyside6.qtsvg
+Suggests: docker-ce | docker.io
+Homepage: https://github.com/corbinjurgens/icloud-vm-for-linux
+Description: iCloud Drive on Linux via a minimal Windows VM
+ Bridges iCloud Drive to a Linux host by running Apple's official iCloud for
+ Windows client inside a dockur/windows guest and re-exporting the sync root
+ over SMB to /mnt/icloud.
+ .
+ This package installs the host side: the CIFS mount and automount units, the
+ health-check timer, the privileged power helper that turns the whole bridge on
+ and off as one transaction, the PySide6 tray application and status window, and
+ the guest provisioning scripts under /usr/share/icloud-bridge.
+ .
+ Installing is not sufficient on its own. Everything machine-specific -- the
+ share password, the mount ownership, and the sudo grant for the power helper --
+ is applied by running "sudo icloud-bridge-configure --env-file /path/to/.env".
+ .
+ PySide6 is a Recommends rather than a Depends so the host half remains
+ installable on systems whose archives lack the python3-pyside6 packages; the
+ launcher reports the exact missing pieces if the GUI is started without them.

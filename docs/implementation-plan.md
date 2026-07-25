@@ -3,7 +3,7 @@
 **Version:** 1.1 · **Status:** Ready to execute · **Audience:** an executor (human or model) who follows instructions literally. All decisions are already made. Do not substitute components unless a step explicitly offers a fallback.
 
 **v1.1 change note (2026-07-23).** This document is amended by
-[`../plan-gui-selective-sync.md`](../plan-gui-selective-sync.md) ("the v2 plan"),
+[`plan-gui-selective-sync.md`](plan-gui-selective-sync.md) ("the v2 plan"),
 which adds a host GUI, a guest bridge agent, and selective sync. Where the two
 disagree, **v2 wins**. The changes folded in here are:
 
@@ -93,13 +93,18 @@ This is the actual repository, including the v2 additions (v2 plan D24):
 
 ```
 icloud-vm-for-linux/
+├── Makefile                      # dev/operator entry points; `make` lists them (§14)
 ├── docker-compose.yml
 ├── .env                          # operator-specific values (gitignored)
 ├── .env.example
 ├── AGENTS.md  (== CLAUDE.md)     # working rules for coding agents
 ├── README.md                     # overview, usage, selective-sync summary
 ├── SETUP.md                      # annotated real-machine runbook
-├── plan-gui-selective-sync.md    # the v2 plan (amends this document)
+├── packaging/                    # .deb build (§14); no debhelper needed
+│   ├── build-deb.sh              # stages the tree, dpkg-deb --root-owner-group
+│   ├── lint-ps1.ps1              # PS7 parse + analyzer pass, run by `make lint-ps`
+│   └── deb/                      # control.in, postinst, prerm, postrm,
+│                                 #   the /usr/bin launcher, lintian-overrides
 ├── provision/                    # run INSIDE the Windows guest
 │   ├── install.bat               # dockur OEM bootstrap (auto-runs 01)
 │   ├── 01-debloat.ps1            # auto-run; no network, no secrets
@@ -118,8 +123,10 @@ icloud-vm-for-linux/
 │   └── autostart/icloud-bridge-tray.desktop
 ├── host/                         # Linux host
 │   ├── setup-prereqs.sh          # docker + cifs-utils + KVM check (§1)
-│   ├── setup-host.sh             # credentials from .env, install units (§8–§9),
-│   │                            #   power helper + marker + sudoers (v2 plan D29)
+│   ├── setup-host.sh             # places units (§8–§9), power helper + marker,
+│   │                            #   then delegates to icloud-bridge-configure
+│   ├── icloud-bridge-configure   # the machine-specific half, shared by the
+│   │                            #   from-source and .deb install paths (§14)
 │   ├── acceptance-tests.sh       # host-checkable subset of §11
 │   ├── icloud-bridge-power       # root helper: on/off the whole bridge (D29)
 │   ├── mnt-icloud.mount
@@ -136,6 +143,7 @@ icloud-vm-for-linux/
 │   └── test-smb-hydration.ps1, test-smb-read.sh   # the D5 evidence
 └── docs/
     ├── implementation-plan.md    # this document
+    ├── plan-gui-selective-sync.md # the v2 plan (amends this document; v2 wins)
     ├── selective-sync.md         # user page + deployment checklist
     └── automation-notes.md       # first-run record: what was manual and why
 ```
@@ -483,8 +491,10 @@ WantedBy=multi-user.target
 
 Both shares use the same `syncshare` credentials file.
 
-Enable (`host/setup-host.sh` does all of this, patching `uid`/`gid` from
-`MOUNT_UID`/`MOUNT_GID`):
+Enable (`host/setup-host.sh` does all of this; it places the files and then hands
+off to `icloud-bridge-configure`, which patches `uid`/`gid` from
+`MOUNT_UID`/`MOUNT_GID`. `make deb && make install && make configure` places the
+same files and runs the same configure step — see §14):
 
 ```bash
 sudo systemctl daemon-reload
@@ -564,8 +574,8 @@ All six units also carry `ConditionPathExists=!/var/lib/icloud-bridge/powered-of
 (v2 plan D29): the GUI's **Quit and power off VM** writes that marker so the
 mounts and health checks stay disarmed across a reboot without disabling the
 units. `host/setup-host.sh` additionally installs the `icloud-bridge-power`
-helper, creates the marker directory, and installs the `sudoers` grant that lets
-the desktop operator run it; see v2 plan §5.1.
+helper and creates the marker directory, and `icloud-bridge-configure` installs
+the `sudoers` grant that lets the desktop operator run it; see v2 plan §5.1.
 
 **Limitation to note:** the canary proves the share and guest are alive; it cannot prove Apple-side upload succeeded (the client exposes no API for that). The Apple-session check is manual: if sync stops while health checks pass, open `:8006` and check the iCloud tray icon for a re-login prompt.
 
@@ -681,7 +691,7 @@ real work.
 
 ## 13. v2 artifacts (GUI, bridge agent, selective sync)
 
-Specified in [`../plan-gui-selective-sync.md`](../plan-gui-selective-sync.md).
+Specified in [`plan-gui-selective-sync.md`](plan-gui-selective-sync.md).
 Summary of what exists and where:
 
 | Artifact | Runs on | Purpose |
@@ -702,3 +712,96 @@ diverge, which is the exact failure the rule exists to prevent. For those two
 files, **the file is the source of truth**; their *specification* is v2 plan §3
 and §4 respectively, and that is what must be kept in step with them. The
 smaller v2 artifacts (the two systemd units) are embedded above as usual.
+
+---
+
+## 14. Build, packaging and developer entry points
+
+`make` with no arguments lists every target. Nothing here is compiled — "build"
+means staging files into a package tree — so the Makefile is a thin, discoverable
+front end over the scripts that already existed rather than a new build system.
+
+| Target | What it does | Needs a real host? |
+|---|---|---|
+| `make venv` | Creates `.venv` with pytest. PEP 668 forbids `pip install --user` on this class of system and `install-gui.sh` already refuses `--break-system-packages` (v2 plan D18), so a venv is the only correct route | no |
+| `make venv-qt` | Same plus PySide6, for the with-Qt half of the suite | no |
+| `make test` / `test-qt` / `test-all` | Runs `pytest gui/tests` without Qt, with Qt, or both — `AGENTS.md` requires the suite to pass either way, and `test-all` is what actually proves it | no |
+| `make lint` | `bash -n` over every shell script, `sh -n` over the maintainer scripts, `compileall` over the Python, `cmp` of the two `agent.ps1` copies, and `docker compose config`. Prints `SKIP:` for absent optional linters rather than passing silently | no |
+| `make lint-ps` | Fetches PowerShell 7 into `build/pwsh` and runs `packaging/lint-ps1.ps1`: parse check plus a PSScriptAnalyzer pass | no |
+| `make check` | `lint` + `test`; the whole of what a checkout can prove | no |
+| `make deb` | Builds `dist/icloud-bridge_<version>_all.deb` | no |
+| `make install` / `uninstall` / `purge` | `apt` the built package in or out | yes |
+| `make configure` | `sudo icloud-bridge-configure --env-file ./.env` | yes |
+| `make install-gui` | The per-user `$HOME` install, unchanged | no |
+| `make acceptance` | `host/acceptance-tests.sh` | yes |
+
+The version is read from `gui/icloud_bridge_gui/__init__.py`; it is the one place
+it is written down.
+
+### 14.1 Two install paths, one configured result
+
+`sudo ./host/setup-host.sh` and `make deb && make install` place the **same files
+at the same paths**, and both then run **`icloud-bridge-configure`**. Keeping them
+interchangeable is the whole point: an operator can move between them without
+producing a half-configured hybrid, and `host/acceptance-tests.sh` passes against
+either.
+
+`icloud-bridge-configure` owns everything that cannot be known before the machine
+is in front of you, which is exactly why it is a separate command and not a
+`postinst`:
+
+- `/etc/credentials-icloud`, built from `SHARE_PASS` in the gitignored `.env`;
+- the `uid=`/`gid=` in the two `.mount` units, which must match the desktop user;
+- `/etc/sudoers.d/icloud-bridge`, the argument-exact D29 grant, which names the
+  operator account.
+
+It also writes `/etc/icloud-bridge/config` recording those choices. A package
+upgrade unpacks pristine units carrying `uid=1000,gid=1000`, so the `postinst`
+replays the recorded ownership from that file; without it, every upgrade would
+silently re-own the mounts away from the operator.
+
+### 14.2 Why the package ships to `/usr/local` and `/etc/systemd/system`
+
+Debian policy reserves `/usr/local` for the local administrator and prefers
+`/lib/systemd/system` for packaged units. This package deliberately does neither,
+because three things pin the paths harder than packaging convention does:
+
+- `gui/icloud_bridge_gui/power.py` hardcodes
+  `HELPER_PATH = "/usr/local/bin/icloud-bridge-power"`;
+- the sudoers grant matches that absolute path **with its arguments**, so a
+  different location silently revokes the operator's ability to power the bridge
+  off (D29); and
+- `host/acceptance-tests.sh` asserts both that path and `/etc/systemd/system/<unit>`.
+
+Relocating would mean editing a locked D29 contract detail to satisfy a lint
+category, for a package that is built and installed locally and never uploaded to
+an archive. The tags are suppressed in `packaging/deb/lintian-overrides`, with
+that reasoning recorded next to them.
+
+### 14.3 Packaging mechanics
+
+`packaging/build-deb.sh` stages a tree and calls `dpkg-deb --root-owner-group
+--build`. It deliberately avoids `debhelper`/`dpkg-buildpackage`: those pull a
+build-dependency chain and, without `--root-owner-group`, `fakeroot`. The staged
+approach needs neither, so `make deb` works on a bare host and never runs as root.
+
+PySide6 is a `Recommends`, not a `Depends`. The package carries the host half as
+well as the GUI, and a hard dependency would make it uninstallable on a release
+whose archive lacks the `python3-pyside6` packages; `/usr/bin/icloud-bridge-gui`
+checks for the import at startup and prints the exact `apt` line if it is missing.
+Docker is only a `Suggests`, because §1 installs Docker Engine from
+`get.docker.com` and a stronger relationship would invite `apt` to pull the
+conflicting `docker.io`.
+
+The GUI package lands in `/usr/lib/icloud-bridge-gui/` and needs no code change to
+run from there: `tray.py` resolves its icons relative to `__file__`. The system
+autostart entry goes to `/etc/xdg/autostart/`, whose basename a per-user
+`~/.config/autostart/` entry overrides, so a package install and a
+`gui/install-gui.sh` install cannot double-launch the tray.
+
+### 14.4 What none of this proves
+
+`make check` runs in a checkout with no VM. It does not exercise the guest agent,
+the CIFS mounts, the power transaction, or the package's `postinst`/`prerm` on a
+live system — the package has to be installed on the real host for that, and
+`make acceptance` is what reports the result.

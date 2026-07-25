@@ -1,0 +1,25 @@
+# This package is built and installed locally, never uploaded to an archive, and
+# it deliberately mirrors the paths that host/setup-host.sh has always used. Both
+# install paths must produce a byte-identical system, and three things pin those
+# paths hard:
+#
+#   * gui/icloud_bridge_gui/power.py hardcodes
+#     HELPER_PATH = "/usr/local/bin/icloud-bridge-power",
+#   * the sudoers grant is argument-exact on that same absolute path, so a
+#     different location silently revokes the operator's power-off ability, and
+#   * host/acceptance-tests.sh asserts both /usr/local/bin/icloud-bridge-power
+#     and /etc/systemd/system/<unit>.
+#
+# Moving to /usr/bin + /lib/systemd/system would mean editing a locked D29
+# contract detail rather than a packaging preference.
+icloud-bridge: dir-or-file-in-usr-local
+icloud-bridge: systemd-service-file-outside-lib
+icloud-bridge: package-installs-into-etc-systemd-system
+
+# The guest-side provisioning scripts are data shipped for the operator to copy
+# into the Windows VM; they are not host executables and are not meant to run here.
+icloud-bridge: script-not-executable usr/share/icloud-bridge/*
+
+# No upstream changelog: the git history is the changelog for a repo that is
+# never released as a source tarball.
+icloud-bridge: no-upstream-changelog

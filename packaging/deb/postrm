@@ -1,0 +1,30 @@
+#!/bin/sh
+# On purge, remove the machine-specific state icloud-bridge-configure created.
+# These are NOT shipped files, so dpkg does not know about them.
+set -e
+
+case "$1" in
+  purge)
+    rm -f /etc/sudoers.d/icloud-bridge
+    rm -f /etc/credentials-icloud
+    rm -f /etc/icloud-bridge/config
+    rmdir /etc/icloud-bridge 2>/dev/null || true
+    # The desired-off marker is lifecycle state, not configuration; leaving it
+    # behind after purge would disarm a later reinstall.
+    rm -f /var/lib/icloud-bridge/powered-off
+    rmdir /var/lib/icloud-bridge 2>/dev/null || true
+    ;;
+  remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+    ;;
+esac
+
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+  if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+  fi
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || true
+  fi
+fi
+
+exit 0

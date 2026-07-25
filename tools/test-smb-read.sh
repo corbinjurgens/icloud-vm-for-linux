@@ -5,7 +5,7 @@
 # of the D5 hydration test (see tools/test-smb-hydration.ps1). It asked whether
 # an SMB client read of a DATALESS Cloud Files placeholder succeeds, and on
 # 2026-07-22/23 the answer was yes: Windows hydrates on demand, so plan D5 is
-# disproven and superseded by v2 D14/D25. See plan-gui-selective-sync.md §0.5.
+# disproven and superseded by v2 D14/D25. See docs/plan-gui-selective-sync.md §0.5.
 #
 # Scope limit that E0 exists to close: this uses userland smbclient with a
 # generous timeout, not the kernel cifs client the real /mnt/icloud mount uses.

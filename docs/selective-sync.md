@@ -4,7 +4,7 @@ Open the tray icon → **Open status window** → **Selective Sync**. Uncheck a
 folder or file, press **Apply**, confirm.
 
 This page is the user-facing explanation. The design and its rationale live in
-[`../plan-gui-selective-sync.md`](../plan-gui-selective-sync.md); the v1 system
+[`plan-gui-selective-sync.md`](plan-gui-selective-sync.md); the v1 system
 it builds on is in [`implementation-plan.md`](implementation-plan.md).
 
 ---

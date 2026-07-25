@@ -1,0 +1,23 @@
+#!/bin/sh
+# Stop and disable the bridge units before their files are removed, so systemd is
+# never left with enabled symlinks pointing at deleted units.
+set -e
+
+case "$1" in
+  remove|deconfigure)
+    if [ -d /run/systemd/system ]; then
+      for unit in icloud-health.timer mnt-icloud.automount mnt-icloud_bridge.automount; do
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+      done
+      # The mounts themselves are stopped last and never lazily/forcibly — the
+      # D29 rule that a busy mount is reported, not ripped away, holds here too.
+      for unit in mnt-icloud.mount mnt-icloud_bridge.mount; do
+        systemctl stop "$unit" >/dev/null 2>&1 || true
+      done
+    fi
+    ;;
+  upgrade|failed-upgrade)
+    ;;
+esac
+
+exit 0
