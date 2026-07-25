@@ -18,3 +18,7 @@ __pycache__/
 # Package staging and output (make deb)
 /build/
 /dist/
+
+
+.mcp.json
+.idea
