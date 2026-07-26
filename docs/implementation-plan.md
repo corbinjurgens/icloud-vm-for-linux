@@ -14,8 +14,15 @@ disagree, **v2 wins**. The changes folded in here are:
 - §7's share script grants at the root only, not `/T`.
 - §8 gains the bridge control mount.
 - §11's pinned-file check is replaced by the E0 gate.
-- §13 is new: it lists the v2 artifacts and records which of them are
-  deliberately not embedded verbatim here.
+- §13 is new: it lists the v2 artifacts and where each one's truth lives.
+
+**v1.2 change note (2026-07-26).** §3–§9 no longer embed copies of
+`docker-compose.yml`, the provisioning scripts, the systemd units or
+`icloud-health.sh`. Each file is now the single source of truth and this
+document keeps only the reasoning and the operator sequence around it. Seven of
+the eleven embedded copies had already drifted from their files, and every edit
+had to be made twice — which also made the plan the worst merge-conflict point
+in the repository when more than one agent is working. No decision changed.
 
 ---
 
@@ -105,6 +112,10 @@ icloud-vm-for-linux/
 ├── AGENTS.md  (== CLAUDE.md)     # working rules for coding agents
 ├── README.md                     # overview, usage, selective-sync summary
 ├── SETUP.md                      # annotated real-machine runbook
+├── CHANGELOG.md                  # improvement + investigation log
+├── .githooks/                    # installed by `make hooks` (core.hooksPath)
+│   ├── pre-commit                # hygiene + pytest over the staged tree
+│   └── commit-msg                # subject shape, no attribution footer
 ├── packaging/                    # .deb build (§14); no debhelper needed
 │   ├── build-deb.sh              # stages the tree, dpkg-deb --root-owner-group
 │   ├── lint-ps1.ps1              # PS7 parse + analyzer pass, run by `make lint-ps`
@@ -143,6 +154,8 @@ icloud-vm-for-linux/
 │   └── icloud-health.timer
 │   #  all six units carry ConditionPathExists=!/var/lib/icloud-bridge/powered-off
 ├── tools/                        # host-side helpers for driving/verifying the guest
+│   ├── hygiene-checks.sh         # the mechanical AGENTS rules; `make lint` + hook
+│   ├── install-hooks.sh          # `make hooks` — sets core.hooksPath
 │   ├── guest-ctl.sh, qemu-monitor.py, rdp-ready.py, keep-iso.sh
 │   ├── watch-sync.sh, icloud-status.ps1, icloud-folders.ps1
 │   └── test-smb-hydration.ps1, test-smb-read.sh   # the D5 evidence
@@ -168,54 +181,29 @@ SHARE_PASS=CHANGE_ME_STRONG_PASSWORD
 
 ---
 
-## 3. docker-compose.yml (verbatim)
+## 3. docker-compose.yml
 
-```yaml
-# iCloud-on-Linux Windows guest, built on dockur/windows.
-# See docs/implementation-plan.md sections 3 and 12 for the rationale behind
-# every setting here. Operator values come from .env (copy .env.example).
-services:
-  windows:
-    image: dockurr/windows
-    container_name: icloud-windows
-    environment:
-      VERSION: "11"            # Windows 11 Pro, auto-downloaded from Microsoft
-      RAM_SIZE: "${RAM_SIZE}"
-      CPU_CORES: "${CPU_CORES}"
-      DISK_SIZE: "${DISK_SIZE}"
-      USERNAME: "icloud"       # auto-logon desktop user (blank password by design, plan D8)
-      LANGUAGE: "English"
-      REGION: "en-US"          # adjust if the Apple ID region requires it
-      KEYBOARD: "en-US"
-    devices:
-      - /dev/kvm
-      - /dev/net/tun
-      # dockur enables vhost=on for the virtio NIC only if it can *open*
-      # /dev/vhost-net. It mknods the node itself, but the default device cgroup
-      # then denies the open and it silently falls back to userspace virtio, so
-      # QEMU copies every SMB byte through its main loop. Passing the device moves
-      # virtio packet processing into a host kernel thread (v2 plan D33).
-      # Needs the host's vhost_net module — host/setup-prereqs.sh loads it and
-      # host/acceptance-tests.sh checks for it; without it the container will not
-      # start and this line can simply be removed.
-      - /dev/vhost-net
-    cap_add:
-      - NET_ADMIN
-    ports:
-      - "127.0.0.1:8006:8006"          # web viewer (noVNC) — install & login only
-      - "127.0.0.1:3389:3389/tcp"      # RDP — admin access
-      - "127.0.0.1:3389:3389/udp"
-      - "127.0.0.1:10445:445"          # guest SMB share -> host mount
-    volumes:
-      - /srv/icloud-vm/storage:/storage
-      # Enhancement over the plan's manual paste (plan sections 4-5): dockur copies
-      # this folder to C:\OEM and runs install.bat at the end of installation, so
-      # the debloat step is applied unattended. Store-dependent iCloud install and
-      # the secret-bearing SMB share stay operator-run — see provision/install.bat.
-      - ./provision:/oem
-    stop_grace_period: 2m
-    restart: unless-stopped
-```
+**Source of truth: [`docker-compose.yml`](../docker-compose.yml).** It carries a
+comment for every non-obvious setting; what follows is the part that belongs to
+the plan rather than to the file.
+
+- `dockur/windows` rather than a hand-written QEMU command line or a
+  purpose-built image (D2): unattended install, VirtIO drivers injected, one
+  file to reproduce the whole guest.
+- **Every published port is bound to `127.0.0.1`** (D9). The guest holds an
+  authenticated Apple session, so nothing here may be reachable off the host.
+  `tools/hygiene-checks.sh` rejects a commit that changes this and
+  `host/acceptance-tests.sh` §3 re-checks the running container.
+- `/dev/vhost-net` moves virtio packet processing into a host kernel thread
+  instead of QEMU's main loop, which is what makes SMB throughput acceptable
+  (v2 plan D33). Without the host module the container will not start and the
+  line can be removed.
+- `./provision:/oem` is how the guest gets `C:\OEM`: dockur copies the folder in
+  and runs `install.bat` as Administrator at the end of installation, so §4 runs
+  unattended. §5 and §7 stay operator-run — one needs the Store, the other needs
+  a secret (D10).
+- Operator values (`DISK_SIZE`, `RAM_SIZE`, `CPU_CORES`, and `SHARE_PASS` for
+  §7) come from `.env`. The compose file never contains a credential.
 
 Notes for the executor:
 - dockur forwards published container ports to the guest VM, which is how host `127.0.0.1:10445` reaches the guest's SMB service on 445.
@@ -226,254 +214,24 @@ Notes for the executor:
 
 ## 4. Guest provisioning — script 01: debloat
 
-This script runs unattended: dockur copies `./provision` to `C:\OEM` and `install.bat` invokes it as Administrator at the end of installation (see §3's `/oem` volume). Nothing to do by hand on a normal install; to re-run it after a Windows feature update (§10), open the web viewer (or RDP as user `icloud`, blank password), start **PowerShell as Administrator** (right-click Start → Terminal (Admin)) and run `C:\OEM\01-debloat.ps1`. The script is `provision/01-debloat.ps1`:
+This script runs unattended: dockur copies `./provision` to `C:\OEM` and `install.bat` invokes it as Administrator at the end of installation (see §3's `/oem` volume). Nothing to do by hand on a normal install; to re-run it after a Windows feature update (§10), open the web viewer (or RDP as user `icloud`, blank password), start **PowerShell as Administrator** (right-click Start → Terminal (Admin)) and run `C:\OEM\01-debloat.ps1`, then `Restart-Computer` and wait for the
+desktop to return (auto-logon).
 
-```powershell
-# ============ 01-debloat.ps1 — run as Administrator ============
-# Idempotent. Auto-run by provision/install.bat at first boot, and safe to re-run
-# after a Windows feature update reset something (plan section 10).
-#
-# Everything here targets the same two costs: resident RAM in a 3 GB guest whose
-# desktop session is logged on forever, and background disk churn that inflates
-# the thin-provisioned qcow2 image on the host (v2 plan section 8.1).
-$ErrorActionPreference = "Continue"
+**Source of truth: [`provision/01-debloat.ps1`](../provision/01-debloat.ps1).**
+It is commented item by item, including a "deliberately left alone" list that
+records what must *not* be trimmed later. The decisions behind it:
 
-# --- Services not needed on a sync appliance ---
-# NEVER extend this list with: AppXSvc, ClipSVC, InstallService, LicenseManager,
-# StorSvc, DoSvc, wuauserv, cryptsvc (Store/servicing stack — hard rule 5, D3/D12),
-# TermService (the RDP maintenance path), LanmanServer (the whole bridge),
-# Schedule (the agent's logon task, D17), W32Time (Kerberos/TLS and the Apple
-# session need sane time), CldFlt/FltMgr (Files On-Demand, D14), or
-# TabletInputService/TextInputManagementService (on Windows 11 that breaks
-# keyboard entry into Start, Settings and UWP apps — and iCloud is a Store app
-# whose sign-in the operator types into).
-$services = @(
-  "WSearch",        # Search indexer: the classic CPU/RAM hog over big sync folders
-  "SysMain",        # Superfetch
-  "DiagTrack",      # Telemetry
-  "WMPNetworkSvc",  # Media sharing
-  "MapsBroker",
-  "Fax",
-  "RemoteRegistry",
-  # printing: no printer is reachable from this guest
-  "Spooler", "PrintNotify",
-  # error reporting and diagnostics
-  "WerSvc", "wercplsupport", "DPS", "WdiServiceHost", "WdiSystemHost", "PcaSvc",
-  "dmwappushservice",
-  # hardware this QEMU guest does not have
-  "lfsvc", "WbioSrvc", "bthserv", "BTAGService", "stisvc", "WiaRpc",
-  "SCardSvr", "ScDeviceEnum", "SEMgrSvc",
-  # consumer/entertainment surfaces
-  "XblAuthManager", "XblGameSave", "XboxNetApiSvc", "XboxGipSvc",
-  "PhoneSvc", "WalletService", "RetailDemo", "WpcMonSvc",
-  # networking features unused behind dockur's NAT
-  "icssvc", "SSDPSRV", "upnphost", "DusmSvc"
-)
-foreach ($s in $services) {
-  Stop-Service $s -Force -ErrorAction SilentlyContinue
-  Set-Service  $s -StartupType Disabled -ErrorAction SilentlyContinue
-}
-
-# --- Maintenance tasks that scan or rewrite the whole volume ---
-# ScheduledDefrag is deliberately NOT here: on an SSD-presented volume it performs
-# retrim, which is exactly what hands blocks freed by the D26 reclamation sweep
-# back to the sparse qcow2 image. UpdateOrchestrator\* (protected, and D12 keeps
-# Update alive) and MicrosoftEdgeUpdate* (services WebView2, which iCloud sign-in
-# uses) are left alone for the same reason.
-$tasks = @(
-  '\Microsoft\Windows\Application Experience\ProgramDataUpdater',
-  '\Microsoft\Windows\Application Experience\StartupAppTask',
-  '\Microsoft\Windows\Application Experience\MareBackup',
-  '\Microsoft\Windows\Application Experience\PcaPatchDbTask',
-  '\Microsoft\Windows\Customer Experience Improvement Program\Consolidator',
-  '\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip',
-  '\Microsoft\Windows\Windows Error Reporting\QueueReporting',
-  '\Microsoft\Windows\Maintenance\WinSAT',
-  '\Microsoft\Windows\Maps\MapsUpdateTask',
-  '\Microsoft\Windows\Maps\MapsToastTask',
-  '\Microsoft\XblGameSave\XblGameSaveTask',
-  '\Microsoft\Windows\Power Efficiency Diagnostics\AnalyzeSystem',
-  '\Microsoft\Windows\Speech\SpeechModelDownloadTask',
-  '\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector'
-)
-foreach ($t in $tasks) {
-  Disable-ScheduledTask -TaskName (Split-Path $t -Leaf) `
-    -TaskPath ((Split-Path $t) + '\') -ErrorAction SilentlyContinue | Out-Null
-}
-
-# --- Defender: exclude the sync root; kill scheduled scans (D11) ---
-# Real-time protection stays ON: the guest holds a live Apple session, and a full
-# disable fights Tamper Protection anyway. Only paths this project itself churns
-# are excluded — never powershell.exe as a process.
-$icloudPath = "$env:USERPROFILE\iCloudDrive"
-Add-MpPreference -ExclusionPath $icloudPath
-# The bridge control directory: the agent rewrites status.json every 15 s and the
-# host writes requests into it over SMB, so every one of those writes would
-# otherwise be scanned. It is JSON-only by construction and the executable agent
-# and its private state live outside it (D27). Created later by 04-bridge-agent.ps1;
-# excluding a not-yet-existing path is fine and keeps the Defender policy in one file.
-Add-MpPreference -ExclusionPath "C:\ProgramData\icloud-bridge\io"
-Add-MpPreference -ExclusionProcess "iCloudServices.exe","iCloudDrive.exe","secd.exe"
-Set-MpPreference -ScanScheduleDay 8            # 8 = never
-Set-MpPreference -DisableCatchupFullScan  $true
-Set-MpPreference -DisableCatchupQuickScan $true
-
-# --- Windows Update: notify-only, never auto-reboot (D12) ---
-$au = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
-New-Item -Path $au -Force | Out-Null
-Set-ItemProperty $au -Name AUOptions -Value 2 -Type DWord                       # notify before download
-Set-ItemProperty $au -Name NoAutoRebootWithLoggedOnUsers -Value 1 -Type DWord
-
-# Delivery Optimization: HTTP only (mode 0). This kills peer caching and its
-# cache-scan I/O while leaving the DoSvc *service* running — disabling the service
-# would break Store/winget downloads and therefore iCloud updates (hard rule 5).
-$do = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization"
-New-Item -Path $do -Force | Out-Null
-Set-ItemProperty $do -Name DODownloadMode -Value 0 -Type DWord
-
-# Telemetry: 1 = Required/Basic, the lowest value Pro honours. DiagTrack is
-# already disabled above; this stops the queueing side from doing work at all.
-$dc = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection"
-New-Item -Path $dc -Force | Out-Null
-Set-ItemProperty $dc -Name AllowTelemetry -Value 1 -Type DWord
-
-# --- Disable VBS/HVCI (RAM + perf win under KVM) ---
-# If any VBS scenario re-arms, Windows runs its own hypervisor nested under KVM:
-# every syscall and page-table operation pays nested-virtualization cost and the
-# Secure Kernel pins a few hundred MB. Close all the re-enable paths, not just the
-# top-level switch. Verify after a reboot with msinfo32 or Get-CimInstance
-# Win32_DeviceGuard. iCloud has no dependency on VBS or Credential Guard.
-# These are live system keys, so create only what is missing rather than using
-# New-Item -Force, which would take the whole key with it.
-$dg = "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard"
-if (-not (Test-Path $dg)) { New-Item -Path $dg -Force | Out-Null }
-Set-ItemProperty $dg -Name EnableVirtualizationBasedSecurity -Value 0 -Type DWord -ErrorAction SilentlyContinue
-foreach ($scenario in @("HypervisorEnforcedCodeIntegrity", "CredentialGuard")) {
-  $key = Join-Path $dg "Scenarios\$scenario"
-  if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
-  Set-ItemProperty $key -Name Enabled -Value 0 -Type DWord -ErrorAction SilentlyContinue
-}
-Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name LsaCfgFlags -Value 0 -Type DWord -ErrorAction SilentlyContinue
-bcdedit /set hypervisorlaunchtype off | Out-Null
-
-# --- Power: never sleep, never hibernate, display off is fine ---
-# The monitor timeout matters here: the `icloud` user is logged on forever, so
-# without it DWM composites for a screen nobody is watching and QEMU keeps an
-# active display device. Sync services are session services, not UI-bound.
-powercfg /change standby-timeout-ac 0
-powercfg /change hibernate-timeout-ac 0
-powercfg /change monitor-timeout-ac 5
-powercfg /hibernate off
-
-# --- Storage: stop the guest inflating the sparse qcow2 image ---
-# Fixed pagefile. System-managed sizing grows and shrinks pagefile.sys, and blocks
-# the qcow2 has once allocated never come back without host-side compaction. Do
-# NOT remove the pagefile: 3 GB of RAM plus Defender plus iCloud's initial metadata
-# sync genuinely needs commit headroom (the D10 floor is 2.5 GB for a reason), and
-# memory compression stays on (default) so the guest mostly stays off it anyway.
-$PagefileMB = 4096
-try {
-  $cs = Get-CimInstance Win32_ComputerSystem
-  if ($cs.AutomaticManagedPagefile) {
-    $cs | Set-CimInstance -Property @{ AutomaticManagedPagefile = $false }
-  }
-  $pf = Get-CimInstance Win32_PageFileSetting -ErrorAction SilentlyContinue
-  if ($null -eq $pf) {
-    # Set-WmiInstance rather than New-CimInstance: creating a Win32_PageFileSetting
-    # instance is one of the cases the CIM cmdlet does not support on 5.1.
-    Set-WmiInstance -Class Win32_PageFileSetting `
-      -Arguments @{ Name = "C:\pagefile.sys"; InitialSize = $PagefileMB; MaximumSize = $PagefileMB } | Out-Null
-  } elseif ($pf.InitialSize -ne $PagefileMB -or $pf.MaximumSize -ne $PagefileMB) {
-    $pf | Set-CimInstance -Property @{ InitialSize = $PagefileMB; MaximumSize = $PagefileMB }
-  }
-} catch {
-  Write-Warning "pagefile sizing skipped: $($_.Exception.Message)"
-}
-
-# Reserved Storage: Windows 11 holds back ~7 GB for update staging. The D26 sweep
-# already guarantees a 20 GB free floor on this volume, so updates have scratch
-# space without the reservation, and the reclaimed space raises the distance to
-# that floor — directly fewer sweep episodes. This is Microsoft's supported knob
-# and does not touch the servicing stack. It fails while servicing is in flight;
-# re-running the script later applies it.
-try {
-  if ((DISM /Online /Get-ReservedStorageState) -match "Enabled") {
-    DISM /Online /Set-ReservedStorageState /State:Disabled | Out-Null
-  }
-} catch {
-  Write-Warning "reserved storage state unchanged: $($_.Exception.Message)"
-}
-
-# --- Misc quieting ---
-# Edge preload
-$edge = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
-New-Item -Path $edge -Force | Out-Null
-Set-ItemProperty $edge -Name "StartupBoostEnabled" -Value 0 -Type DWord
-# Widgets board (its WebView2 hosts are the largest reclaimable RAM block in the
-# always-logged-on session). This is the Widgets *app* and its policy — the
-# Evergreen WebView2 runtime that iCloud sign-in uses is a separate component and
-# stays installed (hard rule 5).
-$dsh = "HKLM:\SOFTWARE\Policies\Microsoft\Dsh"
-New-Item -Path $dsh -Force | Out-Null
-Set-ItemProperty $dsh -Name "AllowNewsAndInterests" -Value 0 -Type DWord
-# Copilot: policy plus the AppX removals below, because which one applies depends
-# on the build.
-$copilot = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot"
-New-Item -Path $copilot -Force | Out-Null
-Set-ItemProperty $copilot -Name "TurnOffWindowsCopilot" -Value 1 -Type DWord
-# Content delivery / suggested apps, and best-performance visual effects for a
-# desktop nobody looks at. These are HKCU writes: dockur runs install.bat from the
-# unattend first-logon command in the auto-logon `icloud` session, so they land in
-# that profile. Re-running the script as `icloud` restores them if a feature update
-# resets the profile.
-$cdm = "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
-Set-ItemProperty $cdm -Name "SilentInstalledAppsEnabled" -Value 0 -Type DWord -ErrorAction SilentlyContinue
-$vfx = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"
-if (-not (Test-Path $vfx)) { New-Item -Path $vfx -Force | Out-Null }
-Set-ItemProperty $vfx -Name "VisualFXSetting" -Value 2 -Type DWord -ErrorAction SilentlyContinue
-
-# --- Remove obvious inbox bloat (safe list only; do NOT touch Store/AppX infra, D3) ---
-$bloat = @("Microsoft.XboxApp","Microsoft.XboxGamingOverlay","Microsoft.ZuneMusic",
-           "Microsoft.ZuneVideo","Microsoft.BingNews","Microsoft.BingWeather",
-           "Microsoft.GamingApp","Microsoft.People","Microsoft.Todos",
-           "MicrosoftTeams","MSTeams",                      # old and current package names
-           "Microsoft.Copilot","Microsoft.Windows.Ai.Copilot.Provider",
-           "MicrosoftWindows.Client.WebExperience",         # Widgets
-           "Microsoft.549981C3F5F10")   # last = Cortana
-foreach ($b in $bloat) {
-  Get-AppxPackage -AllUsers $b | Remove-AppxPackage -ErrorAction SilentlyContinue
-}
-
-# --- OneDrive: a second Files On-Demand engine competing with iCloud ---
-# Removing the OneDrive *app* does not remove cldflt.sys; the Cloud Files filter is
-# an inbox driver that iCloud's placeholders keep using. Never disable CldFlt itself.
-$onedrive = "$env:SystemRoot\SysWOW64\OneDriveSetup.exe"
-if (-not (Test-Path $onedrive)) { $onedrive = "$env:SystemRoot\System32\OneDriveSetup.exe" }
-if (Get-Process OneDrive -ErrorAction SilentlyContinue) {
-  Stop-Process -Name OneDrive -Force -ErrorAction SilentlyContinue
-}
-if (Test-Path $onedrive) {
-  Start-Process $onedrive -ArgumentList "/uninstall" -Wait -ErrorAction SilentlyContinue
-}
-
-# --- Deliberately left alone (do not "optimise" these later) ---
-#   * WpnService / WpnUserService: iCloud is a Store/MSIX app and WNS is the
-#     platform notification path. ~20 MB is not worth risking Store plumbing.
-#   * NTFS last-access updates: the agent's D26 reclamation sweep sorts LRU by
-#     LastAccessTime and checks NtfsDisableLastAccessUpdate. Setting
-#     `fsutil behavior set disablelastaccess 1` would silently degrade eviction
-#     ordering to LastWriteTime.
-#   * Memory compression (Disable-MMAgent -MemoryCompression): in a 3 GB guest it
-#     trades cheap CPU for avoided pagefile I/O — the right trade on qcow2.
-#   * Defender real-time protection: stays on (D11).
-
-Write-Host "`nDebloat complete. Reboot now with: Restart-Computer" -ForegroundColor Green
-# ================================================================
-```
-
-Then run `Restart-Computer` and wait for the desktop to return (auto-logon).
-
-**Hard rule:** never remove the Microsoft Store, the AppX/MSIX stack, WebView2, or Windows servicing components. iCloud installation and updates depend on them (D3).
+- Everything it removes targets one of two costs: resident RAM in a small guest
+  whose desktop session stays logged on forever, and background disk churn that
+  inflates the thin-provisioned qcow2 on the host (v2 plan §8.1).
+- **Never remove the Microsoft Store, the AppX/MSIX stack, WebView2, or Windows
+  servicing components** (D3). iCloud is a Store app; its installation and its
+  updates depend on all of them. Additions to the script's `$bloat` list must be
+  inbox apps only.
+- OneDrive is removed as an *app* only. `cldflt.sys`, the Cloud Files filter
+  driver, is inbox and is what iCloud's own placeholders run on — never disable
+  `CldFlt`.
+- Defender real-time protection stays on (D11).
 
 ---
 
@@ -489,17 +247,13 @@ powershell -ExecutionPolicy Bypass -NoProfile -File C:\OEM\02-install-icloud.ps1
 ```
 
 (Or set it for the current window only: `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force`.
-This step is a single command, so you can also just paste the `winget` line below.)
+This step is a single command, so you can also just paste the `winget` line from
+the script.)
 
-Script body:
-
-```powershell
-# ============ 02-install-icloud.ps1 ============
-# With --source msstore the --id is the Store PRODUCT ID, not the AppX package
-# name. "AppleInc.iCloud" fails with "No package found matching input criteria".
-winget install --id 9PKTQ5699M62 --source msstore `
-  --accept-package-agreements --accept-source-agreements
-```
+**Source of truth: [`provision/02-install-icloud.ps1`](../provision/02-install-icloud.ps1)** —
+one `winget` line plus a verification. With `--source msstore` the `--id` is the
+Store *product* ID, not the AppX package name: `AppleInc.iCloud` there fails with
+"No package found matching input criteria".
 
 Confirmed on the first real run (2026-07-22): `winget search iCloud` lists
 `iCloud → 9PKTQ5699M62 → msstore`, and the install reports
@@ -551,180 +305,75 @@ notepad C:\OEM\03-create-share.ps1     # set $pass to SHARE_PASS from .env
 powershell -ExecutionPolicy Bypass -NoProfile -File C:\OEM\03-create-share.ps1
 ```
 
-Script body:
+**Source of truth: [`provision/03-create-share.ps1`](../provision/03-create-share.ps1).**
+The file ships with `STRONG_PASSWORD_HERE` as a deliberate placeholder — it is
+never replaced in the repository, which is the whole reason this step is not
+automated (D10). What it does and why:
 
-```powershell
-# ============ 03-create-share.ps1 — run as Administrator ============
-# Run this AFTER Apple ID sign-in and the initial iCloud Drive sync, so that the
-# sync root C:\Users\icloud\iCloudDrive already exists.
-#
-# Set $pass below to the SHARE_PASS value from your host .env — must match the
-# host credentials file exactly. This script is idempotent; safe to re-run after
-# a Windows feature update (plan section 10).
-
-# --- SET THIS: must equal SHARE_PASS in the host .env ---
-$pass = ConvertTo-SecureString "STRONG_PASSWORD_HERE" -AsPlainText -Force
-
-# D8: dedicated password-protected account, SMB use only, hidden from logon
-if (-not (Get-LocalUser -Name "syncshare" -ErrorAction SilentlyContinue)) {
-  New-LocalUser -Name "syncshare" -Password $pass -PasswordNeverExpires `
-    -AccountNeverExpires -Description "SMB access for Linux host"
-} else {
-  Set-LocalUser -Name "syncshare" -Password $pass
-}
-# Hide from the Windows login screen
-$wl = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList"
-New-Item -Path $wl -Force | Out-Null
-New-ItemProperty -Path $wl -Name "syncshare" -Value 0 -PropertyType DWord -Force | Out-Null
-
-# Filesystem permission for syncshare on the sync root.
-# One inheritable grant at the root only -- deliberately NOT /T. A recursive
-# grant stamps explicit allow ACEs on every descendant, and an explicit allow
-# outranks an inherited folder deny, which would let a known child path stay
-# readable through a v2 exclusion (v2 plan D15). Script 04 cleans up the
-# explicit descendant grants left by earlier runs of this script.
-$root = "C:\Users\icloud\iCloudDrive"
-icacls $root /grant "syncshare:(OI)(CI)M" /Q
-
-# The SMB share itself
-if (-not (Get-SmbShare -Name "icloud" -ErrorAction SilentlyContinue)) {
-  New-SmbShare -Name "icloud" -Path $root -FullAccess "syncshare"
-}
-
-# SMB service + firewall (guest firewall only sees the container network; keep scope tight anyway)
-Set-Service -Name LanmanServer -StartupType Automatic
-Start-Service LanmanServer
-Enable-NetFirewallRule -DisplayGroup "File and Printer Sharing"
-
-# Wire protection off on this transport (v2 plan D32). The whole path is
-# host loopback -> docker-proxy -> container NAT -> QEMU tap: anyone positioned on
-# it already has root on the host, so signing and sealing buy nothing and cost a
-# per-byte HMAC/GMAC (and AES-GCM) pass on both ends of every hydration read.
-# Since 24H2 a stock Windows 11 Pro *requires* signing by default, so this must be
-# turned off explicitly; cifs.ko then negotiates an unsigned session on its own and
-# the host mount needs no `sign`/`seal` option. Authentication (D8) and the
-# exclusion model (D15, ACLs + ABE) are untouched, and SMB 3.1.1 pre-auth integrity
-# still protects negotiation. The encryption line is an assertion, not a change:
-# it is already the default, and re-running this script after a feature update
-# (plan section 10) is what corrects a future Microsoft default-flip.
-Set-SmbServerConfiguration -RequireSecuritySignature $false -Force
-Set-SmbServerConfiguration -EncryptData $false -RejectUnencryptedAccess $false -Force
-
-Write-Host "Share ready: \\<guest>\icloud as user syncshare" -ForegroundColor Green
-# ===============================================
-```
+- Creates a dedicated local `syncshare` account for SMB only, hidden from the
+  logon screen (D8). The auto-logon desktop user has a blank password by
+  necessity, so it cannot be the share account.
+- Grants `syncshare` **one inheritable ACE at the sync root only, never `/T`**
+  (v2 plan D15). A recursive grant stamps explicit allow ACEs on every
+  descendant, and an explicit allow outranks an inherited folder deny — which
+  would let a known child path stay readable straight through a v2 exclusion.
+  Script 04 cleans up explicit descendant grants left by earlier runs.
+- Turns SMB signing and encryption **off** on this transport (v2 plan D32). The
+  whole path is host loopback → docker-proxy → container NAT → QEMU tap; anyone
+  positioned on it already has root on the host, so signing and sealing buy
+  nothing and cost a per-byte pass on both ends of every hydration read. Since
+  24H2 a stock Windows 11 Pro requires signing by default, so this must be
+  turned off explicitly. Authentication (D8) and the exclusion model (D15) are
+  untouched, and SMB 3.1.1 pre-auth integrity still protects negotiation.
+- Is idempotent, so re-running it is the documented recovery after a Windows
+  feature update (§10).
 
 ---
 
 ## 8. Host-side mount (systemd)
 
-Create `/etc/credentials-icloud` (root-owned, mode 600):
+**Source of truth: the unit files in [`host/`](../host).** They are installed
+verbatim, so the plan lists them rather than copying them:
+
+| File | Installed as | Purpose |
+|---|---|---|
+| `host/mnt-icloud.mount` | `/etc/systemd/system/mnt-icloud.mount` | the iCloud Drive data share |
+| `host/mnt-icloud.automount` | `/etc/systemd/system/mnt-icloud.automount` | mounts it on first access |
+| `host/mnt-icloud_bridge.mount` | `/etc/systemd/system/mnt-icloud_bridge.mount` | the GUI/agent control channel (v2 plan D16) |
+| `host/mnt-icloud_bridge.automount` | `/etc/systemd/system/mnt-icloud_bridge.automount` | mounts it on first access |
+
+Credentials come from `/etc/credentials-icloud` (root-owned, mode 600), which
+`icloud-bridge-configure` writes from `.env`:
 
 ```
 username=syncshare
-password=STRONG_PASSWORD_HERE
+password=<SHARE_PASS from .env>
 ```
 
-```bash
-sudo chmod 600 /etc/credentials-icloud
-sudo mkdir -p /mnt/icloud
-```
+**The CIFS option list is load-bearing, not incidental** (v2 plan D33).
+`mnt-icloud.mount` carries the full reasoning per option; the short version is
+that `actimeo=1` keeps metadata fresh enough that remote-side changes and
+hydration progress appear promptly, the default `cache=strict` is what makes a
+read of a dataless placeholder always reach the guest and hydrate, and
+`rasize=16777216` pipelines the one long sequential read that a cold hydration
+is. There is no `sign`/`seal` (the guest turns both off, D32), no `mfsymlinks`
+(it would create files iCloud syncs as junk) and no `max_channels` (one NATed
+virtio NIC). `rasize` needs a kernel whose cifs module knows it (5.15+ assumed);
+on an older one the mount fails with *bad option* and the option can be dropped.
+The bridge share uses the same options minus `rasize`: it only ever carries
+small JSON documents.
 
-`host/mnt-icloud.mount` → copy to `/etc/systemd/system/mnt-icloud.mount`:
+`uid`/`gid` are the primary desktop user's. The files ship with `1000`;
+`icloud-bridge-configure` patches them from `MOUNT_UID`/`MOUNT_GID`, so do not
+hand-edit them on an installed host.
 
-```ini
-[Unit]
-Description=iCloud Drive via Windows VM (CIFS)
-Requires=docker.service
-After=docker.service
-ConditionPathExists=!/var/lib/icloud-bridge/powered-off
-
-[Mount]
-What=//127.0.0.1/icloud
-Where=/mnt/icloud
-Type=cifs
-Options=credentials=/etc/credentials-icloud,port=10445,vers=3.1.1,uid=1000,gid=1000,file_mode=0664,dir_mode=0775,actimeo=1,rasize=16777216,echo_interval=15,_netdev
-TimeoutSec=30
-
-[Install]
-WantedBy=multi-user.target
-```
-
-(`uid`/`gid` 1000 = the primary desktop user; adjust to the operator's `id -u`/`id -g`.)
-
-**The option list is load-bearing** (v2 plan D33 — the unit file carries the full
-comment; keep the two in step): `actimeo=1` keeps metadata fresh so remote-side
-changes appear within ~1 s of listing; the default `cache=strict` is what makes a
-read of a dataless placeholder always reach the guest and hydrate, so neither
-`cache=loose` nor `cache=none` may be substituted; `rasize=16777216` pipelines the
-long sequential read that a cold hydration is (needs a kernel whose cifs module
-knows `rasize` — 5.15+ assumed; on an older one the mount fails with *bad option*
-and it can simply be dropped); `rsize`/`wsize` stay unset because the negotiated
-maximum is already the ceiling; there is no `sign`/`seal` (the guest turns both
-off for this loopback transport, D32), no `mfsymlinks` (it would create files
-iCloud syncs as junk), and no `max_channels` (one NATed virtio NIC).
-
-`host/mnt-icloud.automount` → `/etc/systemd/system/mnt-icloud.automount`:
-
-```ini
-[Unit]
-Description=Automount for iCloud Drive
-ConditionPathExists=!/var/lib/icloud-bridge/powered-off
-
-[Automount]
-Where=/mnt/icloud
-TimeoutIdleSec=0
-
-[Install]
-WantedBy=multi-user.target
-```
-
-`host/mnt-icloud_bridge.mount` → `/etc/systemd/system/mnt-icloud_bridge.mount`
-(v2 plan D16 — the control channel between the host GUI and the guest agent).
 The mount-path component is `icloud_bridge` with an underscore, so the only
-hyphen in the unit name is systemd's encoding of the `/mnt/…` slash and no
-literal-hyphen escaping is needed:
+hyphen in that unit name is systemd's encoding of the `/mnt/…` slash — no
+literal-hyphen escaping is needed.
 
-```ini
-[Unit]
-Description=iCloud bridge control share (CIFS)
-Requires=docker.service
-After=docker.service
-ConditionPathExists=!/var/lib/icloud-bridge/powered-off
-
-[Mount]
-What=//127.0.0.1/bridge
-Where=/mnt/icloud_bridge
-Type=cifs
-Options=credentials=/etc/credentials-icloud,port=10445,vers=3.1.1,uid=1000,gid=1000,file_mode=0664,dir_mode=0775,actimeo=1,echo_interval=15,_netdev
-TimeoutSec=30
-
-[Install]
-WantedBy=multi-user.target
-```
-
-`host/mnt-icloud_bridge.automount` → `/etc/systemd/system/mnt-icloud_bridge.automount`:
-
-```ini
-[Unit]
-Description=Automount for the iCloud bridge control share
-ConditionPathExists=!/var/lib/icloud-bridge/powered-off
-
-[Automount]
-Where=/mnt/icloud_bridge
-TimeoutIdleSec=0
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Both shares use the same `syncshare` credentials file. The bridge share keeps the
-data share's options minus `rasize`: it only ever carries small JSON documents.
-
-Enable (`host/setup-host.sh` does all of this; it places the files and then hands
-off to `icloud-bridge-configure`, which patches `uid`/`gid` from
-`MOUNT_UID`/`MOUNT_GID`. `make deb && make install && make configure` places the
-same files and runs the same configure step — see §14):
+Enable (`host/setup-host.sh` does all of this, then hands off to
+`icloud-bridge-configure`; `make deb && make install && make configure` places
+the same files and runs the same configure step — see §14):
 
 ```bash
 sudo systemctl daemon-reload
@@ -740,59 +389,12 @@ ls /mnt/icloud_bridge     # status.json, tree.json, exclusions.json
 
 ## 9. Health monitoring
 
-`host/icloud-health.sh` → `/usr/local/bin/icloud-health.sh`, `chmod +x`:
-
-```bash
-#!/usr/bin/env bash
-# Exit non-zero on any failure; systemd records it. Wire alerts later if desired.
-set -u
-FAIL=0
-
-# 1. Container running?
-docker inspect -f '{{.State.Running}}' icloud-windows 2>/dev/null | grep -q true \
-  || { echo "FAIL: container not running"; FAIL=1; }
-
-# 2. Mount alive?
-mountpoint -q /mnt/icloud \
-  || { echo "FAIL: /mnt/icloud not mounted"; FAIL=1; }
-
-# 3. Write canary: proves host→guest→NTFS path works end to end.
-CANARY=/mnt/icloud/.linux-canary
-date -Is > "$CANARY" 2>/dev/null \
-  || { echo "FAIL: cannot write canary (share read-only or session dead?)"; FAIL=1; }
-
-# 4. Freshness: canary mtime must be recent (also catches a hung guest).
-if [ -f "$CANARY" ]; then
-  AGE=$(( $(date +%s) - $(stat -c %Y "$CANARY") ))
-  [ "$AGE" -lt 300 ] || { echo "FAIL: canary stale (${AGE}s)"; FAIL=1; }
-fi
-
-exit $FAIL
-```
-
-`icloud-health.service` and `icloud-health.timer` → `/etc/systemd/system/`:
-
-```ini
-# icloud-health.service
-[Unit]
-Description=iCloud VM health check
-ConditionPathExists=!/var/lib/icloud-bridge/powered-off
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/icloud-health.sh
-```
-
-```ini
-# icloud-health.timer
-[Unit]
-Description=Run iCloud VM health check every 10 minutes
-ConditionPathExists=!/var/lib/icloud-bridge/powered-off
-[Timer]
-OnBootSec=5min
-OnUnitActiveSec=10min
-[Install]
-WantedBy=timers.target
-```
+**Source of truth: [`host/icloud-health.sh`](../host/icloud-health.sh)** plus
+`host/icloud-health.service` and `host/icloud-health.timer`. The script makes
+four checks and exits non-zero if any fails, so systemd records the failure:
+the container is running, `/mnt/icloud` is a mount point, a write canary lands,
+and that canary's mtime is recent (which also catches a hung guest). The timer
+runs it every 10 minutes, 5 minutes after boot.
 
 ```bash
 sudo systemctl daemon-reload
@@ -800,7 +402,7 @@ sudo systemctl enable --now icloud-health.timer
 systemctl status icloud-health.service   # after first run
 ```
 
-All six units also carry `ConditionPathExists=!/var/lib/icloud-bridge/powered-off`
+All six units carry `ConditionPathExists=!/var/lib/icloud-bridge/powered-off`
 (v2 plan D29): the GUI's **Quit and power off VM** writes that marker so the
 mounts and health checks stay disarmed across a reboot without disabling the
 units. `host/setup-host.sh` additionally installs the `icloud-bridge-power`
@@ -938,19 +540,18 @@ Summary of what exists and where:
 | `guest-agent/agent.ps1` | Windows guest, as `icloud`, unelevated | Enforces the exclusion list (deny ACE on each excluded item + `DELETE_CHILD` guard on its parent, then an online-only request), reclaims disk below the 20 GB floor, publishes `status.json` / `tree.json`, answers per-folder list requests |
 | `provision/agent.ps1` | — | Byte-identical copy so dockur places it in `C:\OEM`; guarded by `host/acceptance-tests.sh` §8 |
 | `provision/04-bridge-agent.ps1` | Windows guest, elevated | Creates the `bridge` share over `C:\ProgramData\icloud-bridge\io`, normalises the `syncshare` ACL, grants the agent `RC,WDAC`, sets the D27 privilege boundary, turns on Access-Based Enumeration for the `icloud` share, registers the scheduled task |
-| `host/mnt-icloud_bridge.{mount,automount}` | Linux host | §8 above, verbatim |
+| `host/mnt-icloud_bridge.{mount,automount}` | Linux host | §8 above |
 | `host/icloud-bridge-power` | Linux host, root (via the GUI's `sudo -n`) | Serialized `on`/`off` of the whole bridge as one transaction: durable off marker, ordered CIFS teardown (never lazy), graceful `docker stop --timeout 130`, and a real CIFS-readiness retry on startup (v2 plan D29) |
 | `gui/` | Linux host, desktop user | Tray icon + status window + selective-sync UI; Qt-free `power.py`/`autostart.py` drive the D29 lifecycle (power-on before any CIFS I/O, three-way Quit, autostart toggle); `pytest gui/tests` covers health precedence, the bridge protocol, the power model, and the autostart entry |
 
-**Deliberate exception to the verbatim-embedding rule.** §3, §4, §7, §8 and §9 of
-this document embed their files verbatim, and `AGENTS.md` requires those copies
-to be updated in the same commit as the file. That rule is **not** extended to
-`guest-agent/agent.ps1` (~1,100 lines) or `provision/04-bridge-agent.ps1`
-(~250 lines): duplicating them here would create two copies that silently
-diverge, which is the exact failure the rule exists to prevent. For those two
-files, **the file is the source of truth**; their *specification* is v2 plan §3
-and §4 respectively, and that is what must be kept in step with them. The
-smaller v2 artifacts (the two systemd units) are embedded above as usual.
+**Where the truth lives.** For every artifact in this table, and for every file
+§3–§9 point at, **the file itself is the source of truth**. This document holds
+the reasoning, the decisions and the operator sequence; it does not hold copies
+of the code. Until 2026-07-26 §3–§9 embedded their files verbatim and `AGENTS.md`
+required the copies to move together — by then seven of the eleven had drifted
+anyway, so the rule was removed rather than made stricter (see the change note at
+the top). What still has to be kept in step is *specification*, not text: v2 plan
+§3 for `guest-agent/agent.ps1` and §4 for `provision/04-bridge-agent.ps1`.
 
 ---
 
@@ -972,6 +573,7 @@ front end over the scripts that already existed rather than a new build system.
 | `make install` / `uninstall` / `purge` | `apt` the built package in or out | yes |
 | `make configure` | `sudo icloud-bridge-configure --env-file ./.env` | yes |
 | `make install-gui` | The per-user `$HOME` install, unchanged | no |
+| `make run` | Launches the GUI straight from the checkout, preferring `.venv-qt`. The developer inner loop: no install, no root, and the first-run Setup tab resolves its bundle from the source tree (v2 plan §6.2), so the operator's first screen is reachable without a guest. Health and selective sync read unavailable with nothing mounted, and the power buttons need the host-installed `icloud-bridge-power` | no |
 | `make acceptance` | `host/acceptance-tests.sh` | yes |
 
 The version is read from `gui/icloud_bridge_gui/__init__.py`; it is the one place
@@ -1036,7 +638,10 @@ The GUI package lands in `/usr/lib/icloud-bridge-gui/` and needs no code change 
 run from there: `tray.py` resolves its icons relative to `__file__`. The system
 autostart entry goes to `/etc/xdg/autostart/`, whose basename a per-user
 `~/.config/autostart/` entry overrides, so a package install and a
-`gui/install-gui.sh` install cannot double-launch the tray.
+`gui/install-gui.sh` install cannot double-launch the tray. The package also
+ships `README.md`, `SETUP.md`, and `CHANGELOG.md` under
+`/usr/share/doc/icloud-bridge/`, so the operator retains the runbook and the
+improvement/decision history without a source checkout.
 
 ### 14.4 What none of this proves
 
