@@ -60,6 +60,21 @@ look odd — it is intended.
 Ordinary items in the same folder are unaffected: you can still create, rename
 and delete included siblings normally.
 
+### What an *included* item costs when something reads it
+
+Excluding is also the only way to guarantee a folder is never downloaded.
+Included items are online-only placeholders until something opens them, and
+"something" is not always you: thumbnailers, preview panes, media metadata
+probes, checksum and backup tools, antivirus scanners and desktop content
+indexers all read real content, so any of them pointed at `/mnt/icloud` hydrates
+the library file by file. Listing a folder and reading names, sizes and
+timestamps is metadata and costs nothing.
+
+So there are two tools here, and they are not the same. Turning previews and
+indexing off for network locations stops the accidental reads — a desktop-wide
+preference this project never changes for you. Excluding an item makes the
+content unreachable from this host at all, whatever asks for it.
+
 ---
 
 ## States you may see in the *State* column

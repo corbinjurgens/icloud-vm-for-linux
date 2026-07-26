@@ -754,7 +754,8 @@ class Application(QObject):
         self._window.set_io_paused(True)
 
     def _fx_resume_io(self) -> None:
-        # resume() also restarts the request/response poller quiesce stopped.
+        # resume() also lets the request/response poller run again; it restarts
+        # only if a list request survived, which after a quiesce it has not.
         self._window.resume()
 
     def _fx_reload_selective_sync(self) -> None:

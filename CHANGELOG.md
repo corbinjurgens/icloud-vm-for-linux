@@ -73,6 +73,20 @@ Results are recorded in
 environment baseline those results are read against. Rows are filled in only from
 the real host.
 
+**Start by provisioning the guest, and do not record a performance number until
+it is provisioned.** I-008 discovered that `03-create-share.ps1` and
+`04-bridge-agent.ps1` have never run on the author's guest, and the 2026-07-27
+review confirmed it: no agent build 3, no real scan duration, no exclusion costs,
+no representative tree, and the only share that exists is the historical D5
+`icloudtest` one. Run the `SETUP.md` §8 sequence, then treat all four of these as
+the precondition for every later measurement — `status.json` advancing every 15 s
+with `agentBuild: 3`; `scan.lastCompletedAt` non-null with a plausible
+`scan.entries` and no `tree`, `scan` or ACL failure in `lastError`; a *second*
+ten-minute scan completing, so the first was not startup luck; and the mounted
+data share being the production `icloud` share rather than `icloudtest`.
+Optimizing against an unprovisioned guest is how this project would waste the
+most effort.
+
 **Completion gate:** E0 and every applicable Phase E case in
 [`docs/plan-gui-selective-sync.md`](docs/plan-gui-selective-sync.md#phase-e--v2-live-acceptance-tests-require-the-real-vm)
 has a dated result in
@@ -167,8 +181,15 @@ exists, though, and is already checked in: `tools/guest-ctl.sh` +
 [`docs/automation-notes.md`](docs/automation-notes.md) documents delivering a
 script through the container's `\\host.lan\Data` share. The safe shape is
 therefore: `docker cp` a read-only sampler into that share, type one short
-command to launch it, and have it write a two-sample `Get-Process` CPU **delta**
-back as text — not blind keystrokes, and not lifetime CPU.
+command to launch it, and have it write a two-sample CPU **delta** back as text
+— not blind keystrokes, and not lifetime CPU.
+
+**The sampler now exists.** `tools/profile-windows-idle.ps1` shipped on
+2026-07-27 (entry below) and implements exactly that shape. What is still
+missing is a *run*: three of it after the desktop has settled, against three
+matching `tools/vcpu-profile.py --seconds 300` host samples. The 2026-07-27
+review also narrowed the target — 73.7% of the sampled QEMU CPU was guest mode,
+so 4.7% of one core is all that host-side tuning can reach.
 
 **Expect a documented cost, not a saving.** R-012 and hard rule 5 close the
 Store/AppX/WebView2/servicing stack; R-022 closes Defender real-time protection,
@@ -223,6 +244,88 @@ Bumping the minor digit is a one-line change; `Makefile` and
 happens after that, never before.
 
 ## Shipped improvements
+
+### 2026-07-27 — A second read-only review, and the three things a checkout could act on
+
+A follow-up performance and resource review of the live host, recorded in
+[`todo/performance-resource-review-2026-07-27.md`](todo/performance-resource-review-2026-07-27.md).
+It changed no VM, guest, host or application setting: the container was powered
+off through the bridge lifecycle while the read-only measurements were running,
+so it was left off and no later live test was attempted. Its main conclusion is
+that **this guest is still unprovisioned**, so most of what it found cannot be
+acted on until I-001 supplies a real scan, a real library and a real E0 result.
+Three findings did not depend on that, and they are what shipped here.
+
+**What was measured.** Idle CPU 11.47 core-seconds per 60 s — 19.1% of one core,
+consistent with the earlier 16-18% samples — split guest 73.7% / host kernel
+24.7% / QEMU userspace 1.7%. That tightens I-010's ceiling: every host-side knob
+*combined* is capped at 2.83 core-seconds per minute, **4.7% of one core**, and
+the rest is inside Windows. Idle container I/O was 0.4 KiB/s read and 18.5 KiB/s
+written, comfortably inside I-011's ceiling and well below the earlier 66 KiB/s.
+cgroup `memory.current` was 4.37 GB against the 4 GB guest, with 43 GiB
+available on the host and no OOM, throttle or swap event. `data.img` had 14.8
+GiB allocated of 120 GiB logical on local ext4/NVMe, already running
+`cache=none,aio=native,discard=unmap,detect-zeroes=on` behind a virtio-SCSI
+iothread. The image was dockur/windows v6.02 — the current upstream release that
+day — with `vhost=on` still applied from I-008, host THP at `madvise`, and KSM
+sharing zero pages. Every dockur helper (`docker-proxy`, nginx, websocketd,
+dnsmasq, Samba, wsddn) rounded to 0.00% CPU over a 10 s `pidstat` sample.
+
+- **Nothing warned the operator that a content previewer hydrates the library.**
+  `rasize=16777216` does not over-hydrate a small read — that was cleared during
+  the 2026-07-26 review — but a thumbnailer, preview pane, media metadata probe,
+  checksum or backup tool, antivirus scanner or desktop content indexer reading
+  under `/mnt/icloud` performs *real* reads and downloads real content. Only a
+  loose remark at the end of this file recorded it. `README.md`, `SETUP.md` §9
+  and [`docs/selective-sync.md`](docs/selective-sync.md) now state the
+  distinction where it is needed: directory enumeration and metadata are free,
+  opening content is not, turn previews and indexing off for network locations,
+  and exclude a folder to make the question moot. None of them claims metadata
+  alone hydrates anything, and no script touches a desktop-wide preference —
+  those belong to the user, not to this project.
+- **The GUI's list-response poll no longer ticks when there is nothing to poll
+  for.** `MainWindow` started a 1 s `QTimer` at construction and kept it running
+  for the whole tray session, so a window that never expanded a folder still woke
+  86 400 times a day to iterate an empty list. It is now armed by a dispatched
+  request and stopped once no request and no response poll remain, with the I/O
+  pause as a third input; `_sync_poll_timer` is the single place that decides.
+  The one-second cadence *while a listing is in flight* is unchanged, D17's guest
+  tick is untouched, and the D29/D30 teardown still stops it outright. Qt wiring
+  tests cover an idle window recording zero callbacks, arming on dispatch,
+  disarming on the answer, re-arming for a continuation page, and staying stopped
+  through a guest error, a timeout with its cancel, a dispatch failure, a reload
+  and a quiesce/resume pair. Honestly measured, this is a small saving; it is
+  here because it is certain and cheap, not because it moves the 19.1%.
+- **`tools/profile-windows-idle.ps1` gives I-010 the sampler it described.**
+  Read-only, guest-side, unelevated where WMI permits: two
+  `Win32_PerfRawData_PerfProc_Process` samples around an idle interval (300 s by
+  default, matching `tools/vcpu-profile.py --seconds 300`), reported as **deltas**
+  — CPU core-seconds, working set, private bytes, disk read and write — with the
+  `_Total` minus `Idle` aggregate as a cross-check so exited processes and
+  counter resets show up as an explicit unattributed remainder instead of
+  vanishing. Service Host rows carry their hosted service names. It records
+  process names, PIDs, service names and numbers, and nothing else: no command
+  lines, environment, file paths, window titles, user names or file contents,
+  matching D37's boundary. Its header says plainly that R-012 and R-019 to R-022
+  already accept most of what it will name, so a row is a measurement rather than
+  a licence to disable anything.
+
+**Reconfirmed, not reopened.** The review re-derived and left closed: more
+dockur/QEMU flags (R-013), every disk-model change (R-014/R-015/R-026), a smaller
+guest (R-036), balloon/KSM/hugetlbfs (R-017), disabling dockur's helper daemons
+or the Docker proxy (R-025), more Windows debloat without a numerator (R-027),
+and fewer vCPUs (R-039). Two new ideas were examined and *not* implemented:
+defragmenting the 12 887-extent sparse image, which is not a performance result
+and adds data-safety risk to a path already measured at 0.23% of lifetime CPU,
+and deleting the cached 7.9 GiB ISO automatically, which is an operator
+trade-off `SETUP.md` §7 already documents rather than recurring waste.
+
+**Not verified here, and not claimed:** Windows process attribution, any Windows
+PowerShell 5.1 execution, agent build 3 against a real library, the production
+CIFS mounts, E0 throughput, exclusion costs, GUI tree/list behaviour at scale,
+`halt_poll_ns=0`, and CPU-affinity variants. The new sampler has been parsed by
+PowerShell 7 and exercised end to end against a stubbed counter provider on
+Linux; it has never run on Windows.
 
 ### 2026-07-27 — I-008 executed live: D33 applied, D32 disproven, and an honest null result
 
@@ -648,8 +751,10 @@ otherwise written down nowhere. `rasize=16777216` does **not** over-hydrate: the
 kernel's readahead ramps from a small initial window and only reaches `ra_pages`
 on sustained sequential reads, so a thumbnailer reading 64 KB of a dataless
 placeholder does not pull 16 MiB — which is D33's stated intent. But **a desktop
-file manager thumbnailing `/mnt/icloud` will hydrate real content**, and no entry
-here or in the docs warns about it. Separately, `restart: unless-stopped` is
+file manager thumbnailing `/mnt/icloud` will hydrate real content**, and at the
+time this was written no entry here or in the docs warned about it. The
+2026-07-27 entry above closes that gap in `README.md`, `SETUP.md` and
+`docs/selective-sync.md`. Separately, `restart: unless-stopped` is
 consistent with D29: an explicit `docker stop` from the power helper is not
 restarted, including across a host reboot, so it cannot fight the marker.
 
@@ -664,6 +769,9 @@ These are not rejected, but they are not implementation-ready.
 | DFR-003 | Install host-wide KVM/Docker/THP tuning | Benchmark first. `halt_poll_ns=0` and Docker `userland-proxy=false` are host-global and version-sensitive; THP is usually already suitable. Keep these operator choices, not installer mutations. |
 | DFR-004 | Pattern exclusions, rename-following, per-item pinning/pre-warming, or hydration progress | These are explicitly outside v2. Each needs a separate design and live data-safety/performance evidence; none should be treated as an incidental GUI enhancement. |
 | DFR-005 | Pause only iCloud sync while leaving the VM and mounts up | D30 controls the whole bridge, not the Apple client's private sync engine. Revisit only if Apple exposes a reliable supported control and observable queue state. |
+| DFR-006 | Pin the container's vCPU threads to a CPU tier on a hybrid host | Measured on the author's i7-13700H (P-cores 0-11, E-cores 12-19, no cpuset): about 1 100 `se.nr_migrations` across four vCPU threads in 10 s. That is a numerator, not proof of waste — Linux's scheduler is capacity-aware and pinning can crowd helpers, hurt latency or force work onto power-hungry P-cores. Needs a controlled host-only override and a graceful lifecycle recreate, then unpinned vs P-tier vs E-tier compared on three ≥300 s idle profiles each, migration counts, cold boot to green, E0 cold hydration plus a warm transfer, and host responsiveness under another workload. A win becomes an optional operator benchmark in `SETUP.md`, never a compose default: this machine's CPU numbers are not portable. |
+| DFR-007 | Build only the requested page of a folder listing in the guest agent | Every §2.4 page request enumerates the folder, creates a PowerShell object per file, sorts the whole list through a scriptblock comparator, then returns at most 1 000 of them; the next page repeats all four steps. Reusing `IcloudBridgeNative.SortByName()` on the `NativeEntry[]` and materializing only the requested slice would keep the OrdinalIgnoreCase-then-Ordinal order and the offset semantics while removing the comparator and most allocations. Needs the operator's real folder sizes first (I-001): with a few hundred files per folder there is nothing to win. Verify byte-for-byte name/order/`nextOffset` equivalence against the current comparator, plus the 999/1000/1001 page boundaries, before believing any speed number. |
+| DFR-008 | Replace `Test-IsUnderAny`'s linear containment scan with a segment-aware matcher | The protocol admits up to 10 000 exclusion paths and the predicate runs per visited entry in the full scan, ACL reconciliation, sweep walk and list response, so the worst supported shape is ~10^9 prefix comparisons per pass; the GUI's `bridge.is_under()` and both antichain builders have the same shape. A per-configuration OrdinalIgnoreCase trie would fix it — a trie rather than a sorted-string predecessor search, because sibling punctuation can sort between an ancestor and its descendant and segment boundaries are security-significant. Measure realistic exclusion counts first: at ten roots this is invisible. Any implementation must be property-tested against the current predicate and must not touch D19 canonicalization or D22 containment safety. |
 
 **Where the 2026-07-26 live-host review left these rows.** Both DFR-002 and
 DFR-003 survived a deliberate attempt to close them, and the attempts are worth
@@ -686,7 +794,12 @@ recording so they are not repeated:
   in kernel mode, so `halt_poll_ns=0` can only ever recover part of the host-kernel
   share, measured at ~5% of one core. `userland-proxy` is untouched and
   `tools/vcpu-profile.py` cannot see it, because `docker-proxy` is a separate host
-  process outside the sampled QEMU process.
+  process outside the sampled QEMU process. The 2026-07-27 review re-derived that
+  ceiling at **4.7% of one core** from an independent sample and left the
+  benchmark itself still unrun; when it is run, compare at least three 300 s idle
+  windows each way and check an interactive SMB latency and an E0 throughput
+  figure alongside, so a CPU win is not quietly bought with a latency
+  regression.
 - **DFR-001, DFR-004 and DFR-005** were untouched by anything measured.
 
 Photos, Passwords, Mail/Contacts/Calendar, Apple-session automation, and custom

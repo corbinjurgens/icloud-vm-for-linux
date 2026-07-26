@@ -348,6 +348,16 @@ SMB reads, exactly like OneDrive. What that means day to day:
 - A **cold read blocks for the whole download**. Small files take seconds; a
   multi-GB file can take much longer, and there is no progress indication on the
   host side. `cp` a large file rather than opening it from an editor.
+- **Anything that opens file *content* downloads that file.** Listing a folder
+  and reading names, sizes and timestamps is metadata and stays cheap, but
+  thumbnailers, preview panes, media metadata probes, checksum and backup tools,
+  antivirus scanners and desktop content indexers all perform real reads. Point
+  one of them at `/mnt/icloud` and it will hydrate the library a file at a time,
+  which is easily gigabytes of transfer and guest disk nobody asked for. If your
+  file manager or desktop can disable thumbnails, previews and indexing for
+  network locations, do that for this mount — this project deliberately changes
+  no desktop-wide preference for you. To make a folder permanently unreadable
+  instead, exclude it in the GUI.
 - Read files stay cached in the VM. When guest free space drops below 20 GB the
   agent asks Windows to make the coldest in-sync files online-only again until
   30 GB is free. Dehydration is asynchronous, and files that are open, modified,

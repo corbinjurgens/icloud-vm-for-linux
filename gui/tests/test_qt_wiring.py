@@ -501,6 +501,100 @@ def test_a_stale_listing_response_after_reload_is_discarded(controller, fakes):
     pump(0.2)
     assert requests.take("req-stale") is None
     assert "req-stale" not in window._polls_in_flight
+    assert not window._poll_timer.isActive()
+
+
+# --------------------------------------- the response poll is armed on demand --
+
+def _arm_a_request(window, fakes, path="Docs", offset=0, kind=listing.FIRST_PAGE):
+    """Dispatch one list request and wait for the response poll to arm."""
+    window._request_files(path, offset, kind)
+    assert pump(2.0, until=lambda: window._poll_timer.isActive())
+    return window
+
+
+def test_an_idle_window_never_wakes_for_the_response_poll(controller, fakes):
+    """Nothing to poll for means no 1 Hz tick at all, for the whole session."""
+    app, window = running_controller(controller, fakes)
+    ticks: list[int] = []
+    window._poll_timer.timeout.connect(lambda: ticks.append(1))
+
+    assert not window._poll_timer.isActive()
+    pump(1.5)
+    assert ticks == []
+
+
+def test_a_dispatched_request_arms_the_poll_and_its_answer_stops_it(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    _arm_a_request(window, fakes)
+
+    fakes.poll_response.result = {"files": []}
+    assert pump(3.0, until=lambda: not window._poll_timer.isActive())
+    assert not window._requests.pending_ids()
+    assert not window._polls_in_flight
+
+
+def test_a_continuation_page_arms_the_poll_again(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    _arm_a_request(window, fakes)
+    fakes.poll_response.result = {"files": []}
+    assert pump(3.0, until=lambda: not window._poll_timer.isActive())
+
+    fakes.poll_response.result = None
+    _arm_a_request(window, fakes, offset=1000, kind=listing.MORE)
+
+
+def test_a_guest_error_stops_the_poll(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    _arm_a_request(window, fakes)
+
+    fakes.poll_response.result = {"error": "listing failed"}
+    assert pump(3.0, until=lambda: not window._poll_timer.isActive())
+    assert not window._requests.pending_ids()
+
+
+def test_a_timed_out_request_stops_the_poll_after_cancelling(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    # Deadline in the past: the first tick expires it.
+    window._requests.dispatched("req-old", "Docs", 0, listing.FIRST_PAGE, 0.0)
+    window._sync_poll_timer()
+    assert window._poll_timer.isActive()
+
+    assert pump(3.0, until=lambda: not window._poll_timer.isActive())
+    assert not window._requests.pending_ids()
+    # The cancel runs on a worker, so it lands just after the timer stops.
+    assert pump(2.0, until=lambda: bool(fakes.cancel_request.calls))
+
+
+def test_a_dispatch_failure_never_arms_the_poll(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    fakes.request_listing.error = RuntimeError("bridge share unwritable")
+
+    window._request_files("Docs", 0, listing.FIRST_PAGE)
+    pump(1.0, until=lambda: bool(fakes.request_listing.calls))
+    pump(0.3)
+    assert not window._poll_timer.isActive()
+    assert not window._requests.pending_ids()
+
+
+def test_quiesce_stops_the_poll_and_resume_leaves_it_stopped(controller, fakes):
+    """D29: nothing outstanding survives a quiesce, so nothing restarts."""
+    app, window = running_controller(controller, fakes)
+    _arm_a_request(window, fakes)
+
+    window.quiesce()
+    assert not window._poll_timer.isActive()
+    window.resume()
+    assert not window._poll_timer.isActive()
+
+
+def test_a_reload_stops_the_poll(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    _arm_a_request(window, fakes)
+
+    window.reload_selective_sync()
+    assert pump(2.0, until=lambda: not window._poll_timer.isActive())
+    assert not window._requests.pending_ids()
 
 
 def test_window_close_hides_when_a_tray_exists(controller, fakes):

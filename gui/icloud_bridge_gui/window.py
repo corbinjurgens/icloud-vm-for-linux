@@ -248,10 +248,13 @@ class MainWindow(QMainWindow):
         central_layout.addWidget(self._tabs, 1)
         self.setCentralWidget(central)
 
+        # The one-second response poll. It is armed by a dispatched list request
+        # and stopped again when none is outstanding, so a tray session that
+        # never expands a folder does not wake 86 400 times a day to iterate an
+        # empty list. See `_sync_poll_timer`.
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(1000)
         self._poll_timer.timeout.connect(self._poll_pending)
-        self._poll_timer.start()
 
     # ------------------------------------------------------------- setup tab --
 
@@ -799,6 +802,7 @@ class MainWindow(QMainWindow):
         """Gate new bridge I/O; also reflect it in the controls."""
         self._io_paused = paused
         self.set_bridge_controls_enabled(not paused)
+        self._sync_poll_timer()
 
     def apply_in_flight(self) -> bool:
         return self._apply_writing
@@ -809,14 +813,16 @@ class MainWindow(QMainWindow):
         In-flight worker tasks still finish; the controller waits for them to
         drain before it lets the helper unmount (v2 plan D29).
         """
-        self.set_io_paused(True)
-        self._poll_timer.stop()
+        self.set_io_paused(True)     # this also stops the response poll
         self._requests.reset()
 
     def resume(self) -> None:
-        """Undo :meth:`quiesce` after an aborted shutdown."""
+        """Undo :meth:`quiesce` after an aborted shutdown.
+
+        The response poll restarts only if something is still outstanding, which
+        after a :meth:`quiesce` normally means nothing at all.
+        """
         self.set_io_paused(False)
-        self._poll_timer.start()
 
     def selection_facts(self) -> tuple[int | None, tuple[str, ...]]:
         """The loaded exclusion revision and paths, for a D37 report.
@@ -916,6 +922,7 @@ class MainWindow(QMainWindow):
         self._row_epoch += 1
         self._requests.reset()
         self._polls_in_flight.clear()
+        self._sync_poll_timer()
         self._items_by_path.clear()
         self._file_sizes.clear()
         self._folder_sizes.clear()
@@ -1353,6 +1360,7 @@ class MainWindow(QMainWindow):
             self._requests.dispatched(
                 request_id, path, offset, kind,
                 datetime.now(timezone.utc).timestamp() + LIST_TIMEOUT_SECONDS)
+            self._sync_poll_timer()
 
         def failed(message: str):
             self._on_request_dropped(path, offset, kind)
@@ -1372,6 +1380,21 @@ class MainWindow(QMainWindow):
                 listing.PendingRequest("", path, offset, kind,
                                        self._requests.generation, 0.0))
 
+    def _sync_poll_timer(self) -> None:
+        """Run the response poll exactly while there is something to poll for.
+
+        Its inputs are the outstanding list requests, the response polls already
+        dispatched for them, and the D29 I/O pause. Every path that changes one
+        of those calls this, so the timer has no lifecycle of its own and no
+        steady-state tick: an idle window polls nothing and wakes for nothing.
+        """
+        wanted = not self._io_paused and bool(
+            self._requests.pending_ids() or self._polls_in_flight)
+        if wanted and not self._poll_timer.isActive():
+            self._poll_timer.start()
+        elif not wanted and self._poll_timer.isActive():
+            self._poll_timer.stop()
+
     def _poll_pending(self) -> None:
         if self._io_paused:
             return
@@ -1390,6 +1413,7 @@ class MainWindow(QMainWindow):
                 self._on_response,
                 lambda message, rid=request_id: self._on_response_failed(rid, message),
             )
+        self._sync_poll_timer()
 
     def _fail_request(self, request_id: str, message: str) -> None:
         """Common failure path: back to idle, or restore the continuation row."""
@@ -1398,12 +1422,21 @@ class MainWindow(QMainWindow):
         self._sync_error.show()
         if request is not None and not request.is_first_page:
             self._restore_more_row(request)
+        self._sync_poll_timer()
 
     def _on_response_failed(self, request_id: str, message: str) -> None:
         self._polls_in_flight.discard(request_id)
         self._fail_request(request_id, f"Bad reply from the guest agent: {message}")
 
     def _on_response(self, payload) -> None:
+        # Every exit below either consumed a request or left one outstanding, so
+        # the timer decision belongs to all of them rather than to each return.
+        try:
+            self._apply_response(payload)
+        finally:
+            self._sync_poll_timer()
+
+    def _apply_response(self, payload) -> None:
         request_id, response = payload
         self._polls_in_flight.discard(request_id)
         if response is None:

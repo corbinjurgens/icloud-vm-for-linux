@@ -1,10 +1,26 @@
 # Todo: Performance and resource review, 2026-07-27
 
-> **Status: investigation only.** No VM, guest, host, or application setting was
-> changed by this review. The live VM was intentionally powered off through the
-> bridge lifecycle while the read-only measurements were in progress, so it was
-> left off and no later live test was attempted. `CHANGELOG.md` remains the
-> durable ledger; move a finding there before implementation or closure.
+> **Status: the checkout-executable findings have shipped; the rest need the
+> operator and a provisioned guest.** The review itself changed no VM, guest,
+> host, or application setting. The live VM was intentionally powered off through
+> the bridge lifecycle while the read-only measurements were in progress, so it
+> was left off and no later live test was attempted. `CHANGELOG.md` is the
+> durable ledger and now carries every item below.
+>
+> - **Shipped** (see "A second read-only review" under 2026-07-27 in
+>   `CHANGELOG.md`): **P1**, the
+>   content-preview hydration warning in `README.md`, `SETUP.md` §9 and
+>   `docs/selective-sync.md`; **P2**, the GUI response poll armed on demand
+>   instead of ticking for the whole session; and the read-only sampler **F2**
+>   asked for, `tools/profile-windows-idle.ps1`, which is written and parsed but
+>   has never run on Windows.
+> - **Recorded, not implemented:** P5 became `DFR-006`, P3 became `DFR-007`, and
+>   P4 became `DFR-008`; P6 remains the tail of `I-009`. Each needs a numerator
+>   this workspace cannot produce.
+> - **Still entirely the operator's:** F1 (provision the guest — folded into
+>   `I-001`, which now carries its four acceptance conditions), F2's actual runs
+>   and F3's PowerShell 5.1 proof (`I-010`, `I-009`), and F4's `halt_poll_ns`
+>   A/B (`DFR-003`).
 
 ## Goal
 

@@ -1082,7 +1082,10 @@ asking the binary for its version never disturbs a running tray instance.
   request; when the response arrives (poll `responses/` on a 1 s `QTimer`, 15 s
   timeout → show "guest agent not responding"), files are inserted as child rows
   with the same columns. If `nextOffset` is non-null, add a **Load more…** row;
-  do not materialize an unbounded single-folder listing at once.
+  do not materialize an unbounded single-folder listing at once. That `QTimer`
+  is armed by a dispatched request and stopped again once none is outstanding —
+  the cadence while a listing is in flight is unchanged, and a window that is
+  merely open polls nothing.
 - **Listing state (`listing.py`, Qt-free).** Each folder carries an explicit
   `idle` / `loading` / `loaded` state rather than a "requested" marker, because
   a marker set before dispatch leaves a failed folder permanently empty with no
@@ -1341,10 +1344,12 @@ useful when the tray instance already exists.
   `icloud-off.svg` tray icon (grey, because an intentional off state is not a
   fault), keeps every mount-touching control disabled, and stops health polling
   entirely. Start pauses all new I/O, then reuses the D29 `power_on` path in
-  full: on success it restarts both the controller's health timer and the
-  window's request/response poller, reloads selective sync and gathers a fresh
-  snapshot; on failure it stays paused on the existing Retry/Open VM screen
-  surface. The idle state lasts until **Start bridge** or process exit. Plain
+  full: on success it restarts the controller's health timer and lets the
+  window's request/response poller run again — it re-arms on the next list
+  request, since the quiesce dropped the ones it had — reloads selective sync
+  and gathers a fresh snapshot; on failure it stays paused on the existing
+  Retry/Open VM screen surface.
+  The idle state lasts until **Start bridge** or process exit. Plain
   Quit while off leaves the durable marker and the stopped VM alone and never
   calls the helper again; a later process start still power-ons automatically
   per D29.
@@ -1670,7 +1675,8 @@ still applies. This v2 document is not permission to let
   health rows, disables every mount-touching control, and stops polling. Confirm
   no health FAIL spam and no CIFS access while off. **Start bridge** brings
   everything back: VM boots, both mounts activate, the marker disappears, health
-  polling and the request/response poller both resume, selective sync reloads,
+  polling resumes, expanding a folder still returns its listing (which is what
+  proves the request/response poller runs again), selective sync reloads,
   and health reaches green. Repeat the E9 busy matrix against **Power off
   bridge**: it must abort identically, leave the VM running, and restore polling.
   Then **Quit** while powered off — it must not invoke the helper again, and the

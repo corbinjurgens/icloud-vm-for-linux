@@ -423,6 +423,18 @@ Record the outcome of E0 — and of every other live check — in
 [`docs/acceptance-results.md`](docs/acceptance-results.md), which is the durable
 result table. Only a run on this real host may fill in a row there.
 
+**Before you browse `/mnt/icloud` in a desktop file manager**, decide what may
+read file *content* there. Enumerating directories and reading names, sizes and
+timestamps is metadata and does not download anything. Opening content does, and
+plenty of software opens content without being asked to: thumbnailers and
+preview panes, media metadata probes, checksum and backup tools, antivirus
+scanners, and desktop content indexers (`tracker-miner-fs`, `baloo`, and the
+like). Any of those walking the mount hydrates the library file by file, over
+the network, into the guest disk. Turn thumbnails, previews and indexing off for
+network locations if your desktop offers that, and exclude folders you never
+want fetched. These are desktop-wide user preferences, so nothing in this
+project changes them for you.
+
 ---
 
 ## 10. Install the host GUI and tray icon
