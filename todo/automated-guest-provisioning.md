@@ -17,6 +17,10 @@ sign in, creates the SMB share, installs the bridge agent, and hands over to
 **Check setup and connect** — with the manual script sequence remaining as a
 documented fallback. The same machinery must also re-provision an existing VM
 (the post-feature-update recovery step, and the current stale-`C:\OEM` VM).
+Every run first inventories a fixed set of guest invariants, renders that
+checklist in the app, repairs only missing or drifted components, and verifies
+the complete desired state again. A strange or ambiguous state fails closed
+with a specific recovery action; it is never guessed past.
 
 Apple ID + 2FA and the iCloud Drive toggle stay manual. That is locked
 (`CONTRIBUTING.md` Scope; `docs/automation-notes.md` "Not worth automating") and
@@ -81,10 +85,11 @@ One sentence: the host creates a dedicated **read-only-to-the-guest** Samba
 share named `Provision`, stages current scripts there, and writes a trigger
 last; an elevated watcher task inside the guest (registered at OEM install
 time, or once by hand on an existing VM) copies the payload into an
-administrator-only directory and runs an orchestrator that installs iCloud,
-waits for sign-in, asks the host for the password only when it is ready to run
-03, runs 03 and 04, and reports progress through the existing writable `Data`
-share.
+administrator-only directory and runs an orchestrator that inventories the
+VM, installs or repairs only the components whose fixed invariants are not
+satisfied, waits for sign-in or a share password only when the selected work
+actually requires them, verifies the resulting desired state, and reports the
+checklist and progress through the existing writable `Data` share.
 
 Why this shape and not keystroke injection: every step is verified by effect
 (files and JSON, not screenshots), no secret is ever typed or displayed, the
@@ -106,7 +111,7 @@ remain enforced by 03/04).
 
 ## Decision rows to move into the v2 plan register
 
-Claim the next free numbers when editing (D40-D43 if still free; re-check at
+Claim the next free numbers when editing (D40-D44 if still free; re-check at
 commit time per `CONTRIBUTING.md`). Draft text:
 
 - **D40 — Guest provisioning channel.** Before staging, the host idempotently
@@ -162,7 +167,7 @@ commit time per `CONTRIBUTING.md`). Draft text:
   guest across an unbounded Apple sign-in wait.
 - **D42 — Provisioning script currency.** Every trigger re-stages the
   installed bundle's current `03-create-share.ps1`, `04-bridge-agent.ps1`,
-  `agent.ps1`, `guest-setup.ps1`, and `watcher.ps1` into
+  `agent.ps1`, `guest-state.ps1`, `guest-setup.ps1`, and `watcher.ps1` into
   the read-only inbox before the trigger. The watcher copies that allowlist to
   a protected per-run directory before execution; `04-bridge-agent.ps1`
   resolves its sibling `agent.ps1` from `$PSScriptRoot` rather than trusting
@@ -181,8 +186,9 @@ commit time per `CONTRIBUTING.md`). Draft text:
 - **D43 — Durable guest-provisioning transactions (amends D39).** The private
   provisioning record covers both `first-run` and `reprovision` and additionally
   stores the container ID and Docker `State.StartedAt` token, guest run ID, last
-  guest phase, and mode — never the env path or password. It is written before
-  the trigger and updated only after a matching status is parsed. A restart
+  guest phase, mode, and `resetShareCredential` intent — never the env path or
+  password. It is written before the trigger and updated only after a matching
+  status is parsed. A restart
   with a matching live container/start token and active run re-enters the
   existing no-CIFS `Phase.PROVISIONING` and polls the recorded run ID; if the
   guest is waiting for a secret, the operator reselects the env file. A changed
@@ -197,12 +203,32 @@ commit time per `CONTRIBUTING.md`). Draft text:
   success verifies the current bridge protocol/agent build, clears the record,
   invalidates caches, and returns to monitoring. No status is trusted merely
   because it is the newest file.
+- **D44 — Inspect, reconcile, verify.** A provisioning run is a desired-state
+  reconciliation, not an unconditional replay of scripts 03 and 04. Before
+  changing guest configuration, the protected orchestrator evaluates the
+  fixed checklist and publishes its observations plus a fixed-enum work plan.
+  `ok` components are skipped. Safely repairable `missing` or `drifted`
+  components invoke only their owning repair scope; `blocked` or `unknown`
+  observations stop before mutation rather than being treated as absence.
+  After the selected repairs, the orchestrator evaluates the full checklist
+  again and reports `done` only when every required invariant is `ok` (the
+  password is the one explicitly labelled `unverifiable` exception below).
+  First-run requests reset/create the share credential; ordinary
+  reprovisioning preserves an existing credential unless the account is
+  missing or the operator explicitly selects **Reset share password**. The
+  app renders the checklist and proposed/completed work, but the elevated
+  scripts independently re-probe every precondition and never authorize a
+  mutation from guest-writable status JSON. Rationale: an agent update must not
+  reset a working SMB password or rewrite unrelated ACLs, while a partial
+  or manually altered VM still converges safely and reports exactly what
+  prevented convergence.
 
 Also amend, in the same commit:
 
 - the D31 register row (its "password never passes through the GUI" sentence
   gains "except as provided by D41");
 - the D39 register row, per D43;
+- a new desired-state reconciliation subsection and D44 register row;
 - the D35 register row and its E12 acceptance item (v2 plan section 8):
   recovery for skew and incompatibility becomes an unconditional entry into
   the confirmed **Re-run Windows provisioning…** action (see GUI wiring) —
@@ -238,8 +264,18 @@ unless the effective Samba configuration reports the exact share path and
 secret is deliberately absent at this point):
 
 ```json
-{"version":1,"runId":"<32 lowercase UUID4 hex characters>","action":"provision"}
+{"version":1,"runId":"<32 lowercase UUID4 hex characters>",
+ "action":"reconcile","resetShareCredential":false}
 ```
+
+`action` is exactly `reconcile`; no arbitrary command or repair-step list
+crosses the elevation boundary. `resetShareCredential` is a JSON boolean:
+`true` for first-run, or when the operator explicitly chooses **Reset share
+password**; otherwise it is `false`. The protected orchestrator, not the host,
+derives the work list from a fresh inspection. Adding an inspect-only action is
+not required for this feature: every confirmed setup/re-provision run exposes
+its inspection before and during repair, and ordinary bridge monitoring remains
+the cheap continuous health probe.
 
 `status.json`, written by the guest orchestrator with the same atomic
 temp-then-rename pattern as `Write-JsonAtomic` in 04:
@@ -247,14 +283,33 @@ temp-then-rename pattern as `Write-JsonAtomic` in 04:
 ```json
 {"version": 1, "runId": "<echoed>", "phase": "<see list>",
  "detail": "<one bounded human line>", "updatedAt": "<ISO-8601 UTC>",
- "error": null}
+ "error": null,
+ "checks": {
+   "icloudPackage": "<check state>", "syncRoot": "<check state>",
+   "shareAccount": "<check state>", "shareCredential": "<check state>",
+   "dataShare": "<check state>", "bridgeBoundary": "<check state>",
+   "agentInstall": "<check state>", "agentRuntime": "<check state>"
+ },
+ "work": ["<zero or more fixed work IDs>"]}
 ```
 
-Phases, in order: `staging` (payload copied to the protected run directory),
-`installing-icloud`, `launching-icloud`, `waiting-for-signin` (polling for the
-sync root every 15 s, unbounded — this is the manual step),
-`waiting-for-secret` (polling for the atomically delivered run-scoped secret,
-also unbounded), `creating-share`, `installing-bridge`, `done`. On failure:
+Check states are exactly `pending`, `ok`, `missing`, `drifted`, `blocked`,
+`unknown`, or `unverifiable`. Work IDs are exactly `install-icloud`,
+`wait-for-signin`, `create-share-account`, `reset-share-credential`,
+`repair-data-share`, `repair-bridge-boundary`, and `update-agent`. The GUI
+validates the complete key set, states, work IDs, types, and size before
+rendering locally owned labels. Missing/extra keys or impossible combinations
+make the status unreadable; guest-provided `detail` is never used to decide
+what code runs.
+
+Phases, in order when the corresponding work exists: `staging` (payload copied
+to the protected run directory), `inspecting`, `installing-icloud`,
+`launching-icloud`, `waiting-for-signin` (polling for the sync root every 15 s,
+unbounded — this is the manual step), `waiting-for-secret` (only when account
+creation or an explicit credential reset needs the atomically delivered
+run-scoped secret), `creating-share`, `installing-bridge-boundary`,
+`installing-agent`, `verifying`, `done`. A skipped component never gets a fake
+busy phase: its check remains `ok` and its work ID is absent. On failure,
 `phase` stays at the failing phase and `error` becomes a bounded message.
 Unknown trigger version/action, an invalid run ID, a missing payload file, or a
 copy failure makes the watcher write an error status for that run and mark it
@@ -268,8 +323,12 @@ Rules a weaker model must not improvise around:
 - `runId` is generated with `uuid.uuid4().hex`, validated as exactly 32
   lowercase hex characters on both sides, and stored in D43's private record.
   A timestamp is neither unique enough nor an acceptable path component.
-- The watcher executes only protected local copies of the five allowlisted
+- The watcher executes only protected local copies of the six allowlisted
   files. Nothing under `Data` or `C:\OEM` is an execution source.
+- `checks` and `work` are explanatory output from an untrusted status channel,
+  never capabilities or instructions. The elevated orchestrator derives and
+  revalidates its in-memory work plan; it accepts no host-supplied phase list,
+  path, command, script name, account name, or share name.
 - The secret file never has a mention in `status.json`, `detail`, or any log.
 - The secret is exact UTF-8 with no added newline. Its grammar is deliberately
   small: exactly one physical line beginning `SHARE_PASS=` in column 1; every
@@ -288,16 +347,84 @@ Rules a weaker model must not improvise around:
   each child PowerShell/winget process is running, so 120 s of silence is
   meaningful rather than guaranteed false-positive noise. The two waiting
   phases have no elapsed deadline, only the heartbeat check.
-- Re-triggering is always safe: 03/04 are idempotent, `installing-icloud`
-  skips when `Get-AppxPackage AppleInc.iCloud` already answers, and the
-  watcher consumes triggers one at a time. A new run is not staged over an
-  acknowledged active run; after a reboot, error, or explicit retry it gets a
-  new UUID and its own protected run directory.
+- Re-triggering is always safe: reconciliation re-probes instead of trusting
+  the prior phase; 03/04 repair scopes are idempotent; `installing-icloud`
+  skips when `Get-AppxPackage AppleInc.iCloud` already answers; and the watcher
+  consumes triggers one at a time. A new run is not staged over an acknowledged
+  active run; after a reboot, error, or explicit retry it gets a new UUID and
+  its own protected run directory.
 - `detail` and `error` are single-line strings capped at 500 characters after
   control-character removal. Status reads are capped at 64 KiB. The host keeps
   the matching terminal status until the D43 record has been cleared; cleanup
   removes executable inbox content and any secret, not the only evidence
   needed to resume safely after a GUI crash.
+
+## Desired-state inspection and reconciliation
+
+Inspection is implemented once in `guest-setup.ps1` and reused before and
+after repair. It is read-only: even creating a missing directory counts as
+repair and happens later. The checklist is deliberately fixed so the GUI can
+render stable local labels and tests can exhaust its state matrix:
+
+| Check | `ok` means | Repair owner |
+|---|---|---|
+| `icloudPackage` | The exact `AppleInc.iCloud` AppX package is registered for the `icloud` user. | Install through winget; never remove an unexpected package. |
+| `syncRoot` | The exact `C:\Users\icloud\iCloudDrive` path is an accessible directory. | Launch iCloud and wait for the operator's sign-in/toggle; a wrong-type or inaccessible object is `blocked`, not deleted. |
+| `shareAccount` | Local `syncshare` exists, is enabled, does not expire, has the required password/account flags, and has the hidden-logon registry value. | Script 03 account scope; account creation requires the secret, while non-secret property drift does not. |
+| `shareCredential` | Never inferred from Windows account metadata. | Always `unverifiable`; first-run, a missing account, or explicit **Reset share password** schedules a reset. Otherwise preserve it. A later authenticated host connection is separate corroboration, not a recovered password. |
+| `dataShare` | `icloud` points at the exact sync root with the expected `syncshare` share access; LanmanServer state/startup, firewall rules, signing/encryption settings, and the root `syncshare` ACE match the plan. | Script 03 share scope. A wrong share path is safely recreated after inspection without deleting its target or contents. |
+| `bridgeBoundary` | The exclusions safety preflight passes; bridge paths/share, ABE, D27/D28 ACL boundaries, and the full read-only traversal-link/protected-DACL/legacy-explicit-allow scan pass. | Script 04 boundary scope. This potentially long metadata scan writes heartbeats and runs only during provisioning, never in ordinary background status polling. |
+| `agentInstall` | Installed `agent.ps1` hashes to the staged source and the task's action, principal, run level, trigger, restart policy, and protected paths match exactly. | Script 04 agent scope; it does not walk or normalize the iCloud tree. |
+| `agentRuntime` | The exact task is running and a fresh bridge status reports the one supported protocol and staged `agentBuild`. | Start the already-correct task or run script 04 agent scope, then wait up to the existing 90 s verification window. |
+
+Rules for deriving work:
+
+- Compute the complete checklist before the first mutation. If any check is
+  `blocked` or `unknown`, publish the whole checklist and stop before changing
+  configuration. The only exceptions are expected absence (`missing`) and
+  enumerated drift with a named repair owner. `pending` is allowed only when an
+  unmet earlier dependency makes a downstream probe meaningless (for example,
+  bridge-boundary checks before the sync root exists); it is not healthy, is
+  re-probed after the dependency converges, and may not remain at `done`.
+- Work is dependency ordered, not blindly script ordered. Package/sign-in work
+  precedes share work; share-account/data-share work precedes the bridge
+  boundary; the agent is last. Re-inspect downstream dependencies after a wait
+  such as sign-in because the VM may have changed while the app was waiting.
+- `ok` means verified by current effect, not by a marker alone. Markers and
+  hashes may establish bundle identity, but share paths, task definitions,
+  service state, ACL boundaries, and runtime freshness are probed directly.
+- An agent-only mismatch produces only `update-agent`: it neither requests the
+  secret, resets `syncshare`, reruns data-share setup, nor performs the full
+  boundary repair. The inspection's boundary scan remains read-only. A
+  non-credential data-share drift with an existing account uses script 03's
+  preserve-credential mode.
+- Each component gets at most one repair pass in a run. The `verifying` pass
+  re-evaluates every check. Residual drift becomes a terminal, specifically
+  classified error with the protected manual fallback; it does not enter an
+  automatic repair loop.
+- The `shareCredential` check may remain `unverifiable` at `done`; the GUI must
+  say whether it was **reset this run** or **preserved**, never show a green
+  claim that Windows revealed or validated it. Setup still proceeds to the
+  existing authenticated **Check setup and connect** step, which is the
+  end-to-end proof.
+- Guest-writable status can make the GUI display a false warning, so the host
+  validates it defensively. It cannot cause elevated execution: the protected
+  orchestrator owns the probes, dependency graph, fixed paths, and repair
+  dispatch.
+
+Explicit strange-state policy:
+
+- Missing `exclusions.json` alongside any existing bridge marker, an
+  unexpected file at the sync-root path, a traversal link that could redirect
+  an elevated walk, protected child DACLs, an unparseable task/share/account
+  object, or failure to enumerate a security boundary is `blocked`. Preserve
+  data and show the exact diagnosis; do not reinterpret it as a fresh install.
+- A missing package, account, share, task, or agent file is ordinary
+  `missing`. A known object at the wrong fixed path or with wrong fixed
+  properties is `drifted` only where the table names a non-destructive repair.
+- Stale, malformed, mismatched-run, or unknown-version status never alters
+  this classification. It is a host/watcher communication condition handled by
+  D43, not evidence that a guest component is absent.
 
 ## Guest-side work
 
@@ -318,10 +445,11 @@ operator sequence step):
 - Default mode: infinite loop, 30 s sleep. Parse at most 64 KiB of
   `\\host.lan\Provision\trigger.json`; validate its complete schema and compare
   the run ID to the protected local accepted-run marker. For a new valid run,
-  copy the five fixed payload filenames to a new protected
+  copy the six fixed payload filenames to a new protected
   `runs\<runId>` directory, verify every copy exists, atomically record the run
   ID locally, refresh the protected installed watcher for the next task start,
-  and execute the protected `guest-setup.ps1` with the run ID. The remote
+  and execute the protected `guest-setup.ps1` with the run ID and strict
+  reset-credential boolean. It accepts no host-supplied work list. The remote
   trigger is read-only and remains until host cleanup. Wrap every trigger
   attempt so malformed JSON, unsupported versions/actions and copy/launch
   failures produce bounded error status instead of terminating the watcher. At
@@ -334,76 +462,112 @@ operator sequence step):
 New `provision/guest-setup.ps1` (the orchestrator; elevated; idempotent):
 
 1. Validate the run ID and that `$PSScriptRoot` is the matching protected run
-   directory. Write `status.json` (`staging`, echoing the run ID passed by the
-   watcher). Reuse the atomic-write pattern from 04, plus the protocol's bounds
-   and control-character stripping.
-2. Transactionally refresh the protected `current` directory used by the
+   directory, plus the strict `resetShareCredential` boolean passed by the
+   watcher. Write `status.json` (`staging`, echoing the run ID passed by the
+   watcher and a complete `pending` checklist). Reuse the atomic-write pattern
+   from 04, plus the protocol's bounds and control-character stripping.
+2. `inspecting`: run the fixed read-only checklist above, derive the complete
+   dependency-ordered work list, and publish both. Stop before mutation if any
+   component is `blocked`/`unknown`. The implementation uses typed probe
+   results and fixed repair dispatch, not `Invoke-Expression`, status text, or
+   strings supplied by the host.
+3. After a non-blocked inspection, transactionally refresh the protected
+   `current` directory used by the
    manual fallback: build and verify a sibling temporary directory, swap it
    with rollback so failure retains the prior complete bundle, then prune the
    old copy. Optionally refresh convenience
    copies of
-   `03-create-share.ps1`, `04-bridge-agent.ps1`, `agent.ps1`, `watcher.ps1` and
-   `guest-setup.ps1` under `C:\OEM` for inspection, but execute only the
+   `03-create-share.ps1`, `04-bridge-agent.ps1`, `agent.ps1`,
+   `guest-state.ps1`, `watcher.ps1` and `guest-setup.ps1` under `C:\OEM` for
+   inspection, but execute only the
    siblings under the protected run directory. `current` is the protected
    manual fallback for a diagnosed provisioning failure — something a failure
    report may tell the operator to elevate by hand — not something the GUI
    detects or references: D35 recovery routes through the app's re-provision
    action, and no active recovery text names `C:\OEM` or any unprotected
    copy.
-3. `installing-icloud`: skip if `Get-AppxPackage AppleInc.iCloud` returns a
-   package; else `winget install --id 9PKTQ5699M62 --source msstore
+4. `installing-icloud`, only for `install-icloud`: `winget install --id
+   9PKTQ5699M62 --source msstore
    --accept-package-agreements --accept-source-agreements`, retried up to 5
    times 120 s apart (Store readiness is flaky at first boot — plan section 5).
    Check the native exit code explicitly; a non-zero `$LASTEXITCODE` is not a
    PowerShell exception. Bound each attempt to 10 min. On exhaustion, error
    status naming the manual Store fallback from 02's header.
-4. `launching-icloud`: if the sync root `C:\Users\icloud\iCloudDrive` is
-   missing, launch the client non-elevated from this elevated context with
+5. `launching-icloud`/`waiting-for-signin`, only for `wait-for-signin`: if the
+   sync root is missing, launch the client non-elevated from this elevated
+   context with
    `explorer.exe shell:AppsFolder\AppleInc.iCloud_nzyj5cx40ttqa!iCloud`
-   (documented working method, automation-notes section 3).
-5. `waiting-for-signin`: poll `Test-Path` for the sync root every 15 s,
-   forever, writing a heartbeat each pass. (Sign-in plus the iCloud Drive
-   toggle is the operator's only guest interaction.)
-6. `waiting-for-secret`: poll
+   (documented working method, automation-notes section 3), then poll the exact
+   directory every 15 s forever, writing a heartbeat each pass. Sign-in plus
+   the iCloud Drive toggle is the operator's only guest interaction. Re-run the
+   downstream inspection after the directory appears.
+6. Enter `waiting-for-secret` only when the plan includes
+   `create-share-account` or `reset-share-credential`; otherwise do not request,
+   transmit, or touch the password. Poll
    `\\host.lan\Provision\secret` every 5 s, writing a heartbeat each pass. It is
-   not an error for the file to be absent after a GUI exit/restart.
-7. After the remote secret appears, copy it without text decoding to a
-   protected local temporary file, then write `creating-share` status (the
-   host's acknowledgement to remove the remote copy) and run the protected
-   sibling `03-create-share.ps1 -PasswordFile <protected-local-path>`. Script
-   03 reads and immediately deletes the local file. If host cleanup wins before
-   the copy, the guest stays in `waiting-for-secret`; if the phase advances,
-   the full atomically-renamed value is already protected locally. Wrap all
-   remaining work in an outer `finally` that deletes this local secret even
-   when 03 cannot be launched.
-8. `installing-bridge`: run the protected sibling
-   `04-bridge-agent.ps1`. Its own preflight and 90 s verification are the
-   success criteria.
+   not an error for the file to be absent after a GUI exit/restart. After it
+   appears, copy it without text decoding to a protected local temporary file,
+   then advance to `creating-share` (the host's acknowledgement to remove the
+   remote copy).
+7. For share-account/data-share work, run the protected sibling
+   `03-create-share.ps1` in one of two explicit modes: `-PasswordFile
+   <protected-local-path>` creates/resets the account and reconciles the share;
+   `-PreserveCredential` requires an existing account and reconciles only its
+   non-secret properties plus the data share. The switches are mutually
+   exclusive. Script 03 immediately deletes a supplied local secret. If host
+   cleanup wins before the copy, the guest stays in `waiting-for-secret`; if
+   the phase advances, the full atomically-renamed value is already protected
+   locally. Wrap all remaining work in an outer `finally` that deletes this
+   local secret even when 03 cannot be launched.
+8. For bridge work, run the protected sibling `04-bridge-agent.ps1 -Scope
+   Boundary` for `repair-bridge-boundary` and `-Scope Agent` for
+   `update-agent`; if both are needed, `-Scope All` performs their shared
+   preflight once. `Agent` must not traverse or normalize the iCloud data tree.
+   Each scope verifies its own result, and the orchestrator still performs the
+   complete postflight.
 9. Run winget and both child PowerShell scripts through one helper that starts
    the child with stdout/stderr redirected to protected per-run temporary
    files, rewrites heartbeat status while it is active, checks the exit code,
    reads only a bounded sanitized tail on failure, and deletes the temporary
    output. Do not use `&` and assume a native non-zero exit becomes a
    terminating PowerShell error.
-10. `done`.
+10. `verifying`: repeat the complete read-only inspection. Report `done` only
+    under D44's convergence rule; otherwise emit the exact residual check as a
+    terminal error without another automatic repair pass.
 
-Changed `provision/03-create-share.ps1`: add
-`param([string]$PasswordFile = "")` at the top and
+Changed `provision/03-create-share.ps1`: add a mutually exclusive parameter
+set for `-PasswordFile <path>` and `-PreserveCredential`, plus
 `$ErrorActionPreference = 'Stop'`. When provided, read the whole BOM-less UTF-8
 file without adding/removing a newline, reject NUL/CR/LF or an empty value,
 build the SecureString, and delete the file in `finally` immediately after the
-read; otherwise keep the existing embedded `STRONG_PASSWORD_HERE` placeholder
-path (the hygiene check requires the literal placeholder to survive). Add an
-elevation/sync-root preflight, check every native `icacls` exit code, and verify
-the resulting local account, share path/access, service state and SMB settings
-before returning zero. These checks are required: the current script contains
-non-terminating cmdlets/native calls, so merely launching it from an
-orchestrator cannot prove `creating-share` succeeded.
+read. `-PreserveCredential` refuses a missing account and never constructs or
+sets a password. With neither automation switch, keep the existing embedded
+`STRONG_PASSWORD_HERE` manual-fallback path (the hygiene check requires the
+literal placeholder to survive). Factor the script's account and share repairs
+so it changes only drifted properties within the selected mode; in particular,
+an already-correct share is not recreated. Add an elevation/sync-root
+preflight, check every native `icacls` exit code, and verify the resulting local
+account, share path/access, service state and SMB settings before returning
+zero. These checks are required: the current script contains non-terminating
+cmdlets/native calls, so merely launching it from an orchestrator cannot prove
+`creating-share` succeeded.
 
-Changed `provision/04-bridge-agent.ps1`: resolve the source `agent.ps1` beside
-the invoked script (`Join-Path $PSScriptRoot 'agent.ps1'`) rather than hard-code
-`C:\OEM\agent.ps1`. This behaves identically for the manual fallback and lets
-automation execute a protected, coherent payload.
+New `provision/guest-state.ps1`: a dot-sourced, side-effect-free library owning
+the fixed guest constants, check-state/work enums, typed probe helpers, and
+dependency/work-plan derivation used by `guest-setup.ps1`, 03, and 04. It
+performs no repair and emits no status itself. Keeping one definition prevents
+the orchestrator from deciding a component is healthy under weaker rules than
+the script that repairs and verifies it.
+
+Changed `provision/04-bridge-agent.ps1`: add the fixed `Agent`, `Boundary`, and
+`All` scopes described above and consume `guest-state.ps1` rather than
+duplicating its invariant definitions. `Agent`
+updates/verifies only the protected agent file, its ACL/task, and runtime;
+`Boundary` owns the sync-root/bridge ACL scan, bridge share, ABE, and exclusions
+safety; `All` preserves today's full manual fallback. Also resolve the source
+`agent.ps1` beside the invoked script (`Join-Path $PSScriptRoot 'agent.ps1'`)
+rather than hard-code `C:\OEM\agent.ps1`. This behaves identically for the
+manual fallback and lets automation execute a protected, coherent payload.
 
 Changed `provision/install.bat`: after the debloat step, run
 `powershell -ExecutionPolicy Bypass -NoProfile -File C:\OEM\watcher.ps1 -Install
@@ -441,9 +605,10 @@ Responsibilities:
   read-only setting after reload.
 - `new_run_id() -> str`: return `uuid.uuid4().hex`. The controller obtains the
   ID and durably records it **before** any trigger can exist.
-- `stage(bundle, run_id, runner, input_runner)`: validate the supplied ID and
+- `stage(bundle, run_id, reset_share_credential, runner, input_runner)`:
+  validate the supplied ID, require a real boolean (integers are rejected), and
   refuse to replace an acknowledged nonterminal run; empty and recreate the
-  fixed container inbox, `docker cp` the five allowlisted files from
+  fixed container inbox, `docker cp` the six allowlisted files from
   `bundle.provision_dir` to temporary names, atomically rename them, then stream
   the non-secret trigger JSON through the input runner to a temporary file and
   atomically rename it last. There is no env path and no secret in this
@@ -497,11 +662,16 @@ Docker/file I/O; `lifecycle.py` remains a pure reducer.
   On click (confirmed): verify container running, then `guest_os_ready`
   gating — if the probe fails, show "Windows is still installing" and retry
   on a timer. Then generate the run ID, write it in D43's record, run
-  `ensure_channel()` + `stage(..., run_id, ...)` in a worker, and start polling
-  `poll()` every 3 s, with at most one Docker poll worker in flight. There must
-  be no trigger-without-record crash window.
-  Render phase and detail as the busy line (D38 conventions: elapsed time, no
-  percentages, no cancel of the guest run). If no acknowledgement within
+  `ensure_channel()` + `stage(..., run_id,
+  reset_share_credential=True, ...)` in a worker, and start polling `poll()`
+  every 3 s, with at most one Docker poll worker in flight. There must be no
+  trigger-without-record crash window. First-run deliberately establishes the
+  selected credential even if a partly configured VM already has an account.
+  Render the fixed checklist plus planned/completed work, and render phase and
+  detail as the busy line (D38 conventions: elapsed time, no percentages, no
+  cancel of the guest run). Use locally owned labels/icons: `ok`, work needed,
+  waiting for operator, blocked, and password reset/preserved-but-unverifiable
+  must be visually distinct. If no acknowledgement within
   90 s, keep polling but show the one-line bootstrap command (copyable, Setup
   tab row style) with text explaining it is needed once on VMs created before
   this feature. `waiting-for-signin` renders as an instruction card: open the
@@ -515,7 +685,13 @@ Docker/file I/O; `lifecycle.py` remains a pure reducer.
   operator intentionally selects a changed password it gives the exact
   `sudo icloud-bridge-configure --env-file ...` follow-up rather than claiming
   the host credential was changed automatically.
-  `done` leads into the existing **Check setup and connect** flow unchanged.
+  `done` leads into the existing **Check setup and connect** success flow.
+  If that authenticated connection reports a credential-specific failure while
+  the guest checklist otherwise converged, explain that Windows cannot read
+  back the account password and offer **Retry and reset share password…**,
+  preselecting the reset option but still requiring the operator's env-file
+  choice and confirmation. Do not automatically reset on a generic timeout,
+  DNS, mount, or Windows-not-ready failure.
   The manual instructions the state shows today remain reachable (collapsed
   or behind "Show manual steps").
 - Monitoring state: add a confirmed menu/Status-tab action **Re-run Windows
@@ -530,17 +706,23 @@ Docker/file I/O; `lifecycle.py` remains a pure reducer.
   confirmation must accurately say that the systemd mounts remain mounted and
   the app cannot police another process using them; the operator must close
   files and shells under `/mnt/icloud*` before continuing. Do not call this
-  full host-I/O quiescence. On success, verify a compatible status and the
-  bundled agent build through a fresh bridge gather, then clear the record,
-  invalidate cached documents and refresh. This is the one-click path for the
-  post-feature-update recovery step and for the currently stale VM.
+  full host-I/O quiescence. Its confirmation includes an unchecked **Reset
+  share password from an env file** option. The normal D35/agent-repair path
+  stages `resetShareCredential=false`; it requests no secret when account/share
+  checks are healthy. Selecting the option stores only the boolean in D43 and
+  asks for the env file later at `waiting-for-secret`. On success, verify a
+  compatible status and the bundled agent build through a fresh bridge gather,
+  then clear the record, invalidate cached documents and refresh. This is the
+  one-click path for the post-feature-update recovery step and for the
+  currently stale VM.
 - `provisioning.json` (D39/D43): bump the schema and add `mode`,
-  `containerStartedAt`, `guestRunId`, and `guestPhase`; preserve its existing
-  private atomic-write rules. The run ID is required to reattach safely after
-  a GUI restart, while `containerStartedAt` distinguishes a container restart
-  from a merely quiet watcher. A `reprovision` record is subject to the same
-  startup-before-CIFS gate as a first-run record; otherwise a restarted app
-  could mount while 03/04 are changing guest state.
+  `containerStartedAt`, `guestRunId`, `guestPhase`, and the non-secret
+  `resetShareCredential` boolean; preserve its existing private atomic-write
+  rules. The run ID is required to reattach safely after a GUI restart, while
+  `containerStartedAt` distinguishes a container restart from a merely quiet
+  watcher. A `reprovision` record is subject to the same startup-before-CIFS
+  gate as a first-run record; otherwise a restarted app could mount while
+  03/04 are changing guest state.
 - D35 recovery flow: the skew/incompatible banner becomes an unconditional
   entry into the same re-provision flow, via a banner button that invokes the
   **same** controller action as the Status-tab/menu command — one
@@ -556,11 +738,17 @@ Docker/file I/O; `lifecycle.py` remains a pure reducer.
   pre-feature VM reaches the no-acknowledgement hint, and once the operator
   runs the bootstrap one-liner the watcher consumes the already-staged
   trigger — the operator does not click again. No active recovery UI may
-  contain a `C:\OEM` instruction.
+  contain a `C:\OEM` instruction. With a healthy share/boundary and only an
+  agent build mismatch, the visible plan is just **Update bridge agent** and
+  the run never enters `waiting-for-secret`.
 - Failure rendering: `error` statuses show the failing phase, the bounded
-  message, and the copyable manual fallback for that phase (03/04 command
-  lines from SETUP.md). A mismatched run ID never replaces the saved run or
-  clears the record.
+  message, the complete last trustworthy checklist, and the protected manual
+  fallback for that component. Offer **Try inspection and repair again** after
+  the operator fixes a blocked condition; that creates a new D43 run and
+  re-probes everything rather than resuming after the failed instruction.
+  Preserve **Show manual steps** and diagnostics access so an unusual VM never
+  becomes a dead-end app state. A mismatched run ID never replaces the saved
+  run or clears the record.
 
 ## Packaging and docs
 
@@ -573,7 +761,7 @@ Docker/file I/O; `lifecycle.py` remains a pure reducer.
   flow; keep the full manual sequence as the fallback subsection; add the
   existing-VM bootstrap one-liner.
 - `docs/automation-notes.md`: update the scoreboard rows for 02/03/04
-  ("Yes — done" pointing at D40-D43) and strike the now-implemented items
+  ("Yes — done" pointing at D40-D44) and strike the now-implemented items
   from "Worth doing next".
 - `README.md`: one-paragraph mention in the setup overview.
 - `CHANGELOG.md`: append per repo convention.
@@ -601,6 +789,18 @@ Docker/file I/O; `lifecycle.py` remains a pure reducer.
 - **Store/winget failure**: bounded retries, then an error status that names
   the manual Store install fallback; the run can be re-triggered afterwards
   and skips the already-installed client.
+- **Agent-only skew**: inspection schedules only `update-agent`; no secret is
+  requested, script 03 is not launched, and script 04's agent scope does not
+  traverse the iCloud tree. Postflight still verifies the complete checklist.
+- **Partly configured share**: if the account exists, deterministic
+  account/share/service drift is repaired while preserving the credential. If
+  the account is absent, the work plan explicitly requests the secret and
+  creates it. An operator-selected password reset uses the same latter path.
+- **Ambiguous or unsafe guest state**: publish `blocked` with the exact fixed
+  checklist item, preserve all data, keep normal D35 writes closed when
+  applicable, and expose manual steps plus a fresh retry. "Handled" means the
+  app diagnoses, contains, and gives a convergent route; it does not delete or
+  overwrite operator data merely to make the checklist green.
 - **`icloudtest` leftover share**: out of scope here; 03/04 neither depend on
   nor remove it. Removing it is a separate one-line operator action.
 - **Powered-off bridge**: provisioning actions require the container running;
@@ -648,11 +848,19 @@ sweep it into a commit — always name paths.
    `docs/plan-gui-selective-sync.md`; append to `CHANGELOG.md`. Verify:
    `make check`. Commit: plan + changelog (+ this note if updated).
 2. **M1 — Guest scripts.** `provision/watcher.ps1`,
-   `provision/guest-setup.ps1`, the 03 `-PasswordFile` parameter,
-   04 `$PSScriptRoot` source, protected watcher install, heartbeat child runner,
-   and `install.bat` registration + NEXT-STEPS rewrite. Verify: `make check`
-   and `make lint-ps` (parse-level only — state that 5.1 behaviour is unproven
-   locally). Commit `provision/*` together.
+   side-effect-free `provision/guest-state.ps1`,
+   `provision/guest-setup.ps1`, the 03 credential-preserving/password-file
+   parameter sets, 04 `Agent`/`Boundary`/`All` scopes and `$PSScriptRoot`
+   source, protected watcher install, heartbeat child runner, and `install.bat`
+   registration + NEXT-STEPS rewrite. Keep probe normalization and work-plan
+   derivation pure; add a dependency-free PowerShell fixture test under
+   `packaging/` that exhausts the fixed check-state/work-plan matrix and proves
+   an agent-only plan dispatches neither 03 nor the boundary scope. Wire it
+   into `make lint-ps`; it runs under local PowerShell 7, while M5 remains the
+   PowerShell 5.1/Windows proof. Verify: `make check` and `make lint-ps`
+   (state explicitly that Windows cmdlet and 5.1 behaviour remain unproven
+   locally). Commit the named guest scripts, test harness, Makefile target, and
+   packaging lint driver together.
 3. **M2 — `guestprov.py`, env parsing, and tests.** Add
    `gui/tests/test_guestprov.py`; update `firstrun` tests and
    `host/icloud-bridge-configure` together so password syntax stays identical.
@@ -660,11 +868,14 @@ sweep it into a commit — always name paths.
    order (trigger last), UUID validation, refusal to overwrite an active run,
    deferred atomic secret-over-stdin (assert the value is absent from every
    argv/result/log), run-ID matching, phase classification, heartbeat/deadline
-   behavior, malformed status and the X.224 probe against a fake socket. Verify:
+   behavior, malformed status, strict checklist/work validation, the
+   reset-credential boolean, and the X.224 probe against a fake socket. Verify:
    `make check`. Commit the module, parser/configurer and tests together.
 4. **M3 — GUI wiring.** Provisioning-state button and status rendering,
    re-run action with accurately scoped GUI-I/O quiesce, D43 record/resumption,
-   reducer events, tray/window text. D35 recovery rewiring:
+   reducer events, tray/window text, fixed reconciliation checklist rendering,
+   credential-reset/preserved wording, blocked-state retry/manual-step escape,
+   and no false green state for an unverifiable credential. D35 recovery rewiring:
    `UPDATE_AGENT_INSTRUCTION`/`SKEW_BANNER` and their comment in `bridge.py`,
    the banner button invoking the canonical re-provision controller action,
    and enablement during `skewed`/`incompatible`. Update
@@ -674,7 +885,11 @@ sweep it into a commit — always name paths.
    (`test_a_skewed_agent_still_dispatches_and_shows_the_banner`), and add
    wiring tests that (a) no active recovery UI contains a `C:\OEM`
    instruction and (b) an incompatible bridge keeps ordinary writes disabled
-   while the explicit re-provision action stays available. Extend lifecycle,
+   while the explicit re-provision action stays available. Add the agent-only
+   scenario asserting no env chooser appears, plus missing-account,
+   preserve-credential share repair, explicit password reset, postflight
+   residual drift, malformed checklist, blocked/retry, and
+   credential-specific-connect-failure routing scenarios. Extend lifecycle,
    first-run and Qt wiring tests with faked guestprov, including restart
    during first-run and reprovision plus env re-selection at
    `waiting-for-secret`. Verify: `make check`, ideally `make test-all`.
@@ -694,12 +909,19 @@ sweep it into a commit — always name paths.
    it reach the no-acknowledgement bootstrap hint, then paste the bootstrap
    one-liner into the VM's elevated PowerShell and confirm the watcher
    consumes the already-staged trigger with no further host-side click;
-   (c) watch the phases;
+   (c) watch the phases and checklist;
    interrupt the GUI once during `waiting-for-signin` and once immediately
    after secret delivery to prove D43/re-delivery; (d) confirm shares `icloud`
    and `bridge` exist, `status.json` shows
    `agentBuild` matching the bundle, no D35 banner; (e)
-   `./host/acceptance-tests.sh` passes; (f) later, prove the OEM path with a
+   `./host/acceptance-tests.sh` passes; (f) create a controlled agent-build/task
+   drift and prove the proposed work contains only `update-agent`, no env
+   chooser appears, the boundary **repair scope** does not run, and postflight
+   returns every other check unchanged; (g) create one safely repairable share
+   drift and prove it is repaired without a password reset, then exercise the
+   explicit reset option; (h) create one blocked fixture without risking user
+   data, prove no mutation occurs, correct it, and use the app's retry to
+   converge; (i) later, prove the OEM path with a
    full VM rebuild (preserve `custom.iso` per SETUP.md, expect the Apple
    sign-in wait as the only manual guest step). Record results in
    `CHANGELOG.md` and update the scoreboard.
