@@ -57,6 +57,8 @@ it regressed from.
 | dockur image repo digest | `docker --host unix:///var/run/docker.sock image inspect --format '{{json .RepoDigests}}' dockurr/windows` | | |
 | Host kernel | `uname -r` | | |
 | `cifs` module version | `modinfo -F version cifs`, or `in-tree <kernel>` when it reports nothing | | |
+| Idle CPU cost | `./tools/vcpu-profile.py --seconds 300` with no operator activity (plan §11.3: ≤ 0.30 core-s/s) | | |
+| Idle write churn | same run, the "container block I/O" line from cgroup `io.stat` (plan §11.3: ≤ 200 KiB/s writes) | | |
 | Cold boot to green | time from **Start bridge** to a green tray | | |
 | Cold 1 GiB hydration | `time sha256sum` of a dataless file of that size over the mount (E0 method) | | |
 | Clean power-off duration | time from confirming power-off to the container being stopped | | |

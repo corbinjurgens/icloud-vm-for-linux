@@ -198,20 +198,18 @@ desktop, and every command must be read-only.
 
 ### I-011 — Replace section 11.3's guest-idle acceptance criterion
 
-**Status:** Ready  
-**Evidence:** The criterion reads "guest idles < 5% host CPU (check
-`docker stats`)". Followed exactly as its own parenthetical instructs, `docker
-stats` reports percent-of-one-core on Linux, so the author's guest reads ~18% and
-this criterion **fails** — it does not pass either way. Nobody noticed because it
-sits in the un-run MANUAL block and every row of `docs/acceptance-results.md`
-still says `not yet run`. Make it absolute: core-seconds of container CPU per
-wall second from the cgroup's `cpu.stat` over a stated window, which is what
-`tools/vcpu-profile.py` now reports. Add the write-churn figure in the same pass.
-
-**Completion gate:** the criterion names a measurement that can pass, an idle-cost
-row exists in the environment baseline table, and `SETUP.md`'s performance
-section and plan section 8.1 agree with it (they currently both say
-`docker stats`, so they move together or they drift).
+**Status:** Shipped 2026-07-26 (see the shipped entry)  
+**Evidence:** The criterion read "guest idles < 5% host CPU (check
+`docker stats`)". Followed exactly as its own parenthetical instructed, `docker
+stats` reports percent-of-one-core on Linux, so the author's guest read ~18% and
+the criterion **failed** — it could not pass either way. Nobody noticed because
+it sits in the un-run MANUAL block and every row of `docs/acceptance-results.md`
+still says `not yet run`. It is now absolute — core-seconds of container CPU
+per wall second plus a block-write ceiling, both reported by
+`tools/vcpu-profile.py` — with idle-cost rows in the environment baseline table,
+and plan section 8.1's `halt_poll_ns` bullet no longer recommends `docker stats`
+for a benchmark that tool cannot resolve. Filling the baseline rows in still
+needs the real host at true idle (I-001).
 
 ### I-007 — Establish release boundaries
 
@@ -282,6 +280,30 @@ matter more than the speed.
 `make lint-ps`, `make test-ps` including the new fixture. **Not verified here:**
 Windows PowerShell 5.1 execution, `Join-Path` equivalence on a real `C:` path,
 and the crash fix against a real library — the checkout has no guest (I-001).
+
+### 2026-07-26 — An idle acceptance criterion that can actually pass
+
+I-011, shipped. Plan section 11.3's idle criterion said "guest idles < 5% host
+CPU (check `docker stats`)", and `docker stats` reports percent-of-one-core on
+Linux, where a healthy measured guest reads ~18-20%. A criterion that fails on a
+healthy system is worse than none — it either blocks acceptance or trains the
+operator to wave red through. It now reads: at most **0.30 core-seconds of
+container CPU per wall second** and at most **200 KiB/s of container block
+writes** over a ≥ 300 s window with no operator activity, both from one run of
+`tools/vcpu-profile.py`. The thresholds sit above the author's measured idle
+floor (0.18 core-s/s, ~66 KiB/s) with headroom for background maintenance.
+
+- `tools/vcpu-profile.py` now samples the container cgroup's `io.stat` across
+  its window and prints read/write KiB/s (or cumulative GiB with `--lifetime`),
+  so the write-churn half of the criterion comes from the same command as the
+  CPU half. `/proc/<pid>/io` was deliberately not used: it needs ptrace rights
+  over a root-owned QEMU; the cgroup file is world-readable.
+- `docs/acceptance-results.md` gained "Idle CPU cost" and "Idle write churn"
+  environment-baseline rows naming the command and the thresholds. They are
+  blank until measured at true idle on the real host (I-001).
+- Plan section 8.1's `halt_poll_ns` bullet pointed the operator at
+  `docker stats` for a benchmark that only the profiler's `kernel` column can
+  resolve; it now points at the profiler, agreeing with `SETUP.md`.
 
 ### 2026-07-26 — First measurements from a real guest, and what they changed
 

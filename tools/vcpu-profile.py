@@ -24,7 +24,14 @@ knob at roughly 5% of one core and pointed the investigation into Windows.
   ./tools/vcpu-profile.py --seconds 300
   ./tools/vcpu-profile.py --json
 
-Idempotent and side-effect free: it reads /proc and runs `docker inspect`.
+Alongside the CPU split it reports the container's block I/O rate from the
+cgroup's `io.stat` — plan section 11.3's idle criterion covers write churn,
+because an "idle" guest was measured writing 5-8 GB/day of host SSD. The
+cgroup covers the whole container (QEMU plus its supervisor), which is the
+right scope for a what-does-this-cost-the-host criterion.
+
+Idempotent and side-effect free: it reads /proc, /sys/fs/cgroup and runs
+`docker inspect`.
 
 Requires only that the container is running and that this user can read its
 /proc entries (the same user that can run `docker inspect`).
@@ -80,6 +87,33 @@ def find_qemu(root_pid: int) -> int:
     raise SystemExit(f"no qemu-system process found beneath pid {root_pid}")
 
 
+def read_io(pid: int):
+    """Return (read_bytes, write_bytes) from the pid's cgroup-v2 io.stat.
+
+    /proc/<pid>/io would need ptrace rights over a root-owned QEMU; the cgroup
+    file is world-readable. Returns None where the unified hierarchy is absent
+    or the file is missing (e.g. no io controller), rather than guessing.
+    """
+    try:
+        with open(f"/proc/{pid}/cgroup") as fh:
+            path = next((line.split("::", 1)[1].strip()
+                         for line in fh if line.startswith("0::")), None)
+        if not path:
+            return None
+        rbytes = wbytes = 0
+        with open(f"/sys/fs/cgroup{path}/io.stat") as fh:
+            for line in fh:
+                for field in line.split()[1:]:
+                    key, _, value = field.partition("=")
+                    if key == "rbytes":
+                        rbytes += int(value)
+                    elif key == "wbytes":
+                        wbytes += int(value)
+        return rbytes, wbytes
+    except (OSError, ValueError):
+        return None
+
+
 def read_thread(pid: int, tid: int):
     """Return (name, utime, stime, gtime) in seconds, plus context switches.
 
@@ -133,7 +167,8 @@ def main() -> int:
     args = ap.parse_args()
 
     try:
-        qemu = find_qemu(container_pid())
+        root_pid = container_pid()
+        qemu = find_qemu(root_pid)
     except subprocess.CalledProcessError:
         print(f"FAIL: container '{CONTAINER}' not running (or docker unreachable)",
               file=sys.stderr)
@@ -141,15 +176,21 @@ def main() -> int:
 
     if args.lifetime:
         end, start, elapsed = snapshot(qemu), None, None
+        io_delta = read_io(root_pid)
     else:
         if args.seconds < MIN_WINDOW:
             print(f"NOTE: a {args.seconds:g}s window is below the {MIN_WINDOW}s minimum; "
                   "the qemu-userspace figure will be noise.", file=sys.stderr)
         start = snapshot(qemu)
+        io0 = read_io(root_pid)
         t0 = time.monotonic()
         time.sleep(args.seconds)
         end = snapshot(qemu)
+        io1 = read_io(root_pid)
         elapsed = time.monotonic() - t0
+        io_delta = None
+        if io0 is not None and io1 is not None:
+            io_delta = (io1[0] - io0[0], io1[1] - io0[1])
 
     rows, totals = [], {"guest": 0.0, "qemu": 0.0, "kernel": 0.0, "vol": 0, "nonvol": 0}
     for tid, cur in sorted(end.items()):
@@ -179,6 +220,9 @@ def main() -> int:
               "total_cpu_seconds": total_cpu}
     if elapsed:
         report["cores_used"] = total_cpu / elapsed
+    if io_delta is not None:
+        report["io_read_bytes"] = io_delta[0]
+        report["io_write_bytes"] = io_delta[1]
 
     if args.json:
         print(json.dumps(report, indent=2))
@@ -204,6 +248,12 @@ def main() -> int:
               f"= {total_cpu / elapsed:.1%} of one core")
         print(f"host-side tuning can only ever address the kernel column: "
               f"{totals['kernel'] / elapsed:.1%} of one core.")
+        if io_delta is not None:
+            print(f"container block I/O: read {io_delta[0] / elapsed / 1024:.1f} KiB/s, "
+                  f"write {io_delta[1] / elapsed / 1024:.1f} KiB/s (cgroup io.stat)")
+    elif io_delta is not None:
+        print(f"container block I/O since start: read {io_delta[0] / 2**30:.2f} GiB, "
+              f"write {io_delta[1] / 2**30:.2f} GiB (cgroup io.stat)")
     return 0
 
 

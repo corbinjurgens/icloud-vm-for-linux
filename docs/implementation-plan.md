@@ -454,7 +454,17 @@ real work.
 
 1. `kvm-ok` reports acceleration usable.
 2. `docker compose up -d` from a clean state reaches a Windows desktop on `:8006` with no manual intervention before §4.
-3. After provisioning: guest idles < 5% host CPU and RSS of the container ≈ RAM_SIZE (check `docker stats`).
+3. After provisioning, over a ≥ 300 s window with no operator activity:
+   `./tools/vcpu-profile.py --seconds 300` reports **at most 0.30 core-seconds
+   of container CPU per wall second** and **at most 200 KiB/s of container
+   block writes**, with the exact figures recorded in the environment baseline
+   of `docs/acceptance-results.md`; and RSS of the container ≈ RAM_SIZE
+   (`docker stats` is fine for memory). The author's 2026-07-26 idle floor was
+   0.18 core-s/s and ~66 KiB/s of writes; the thresholds carry headroom for
+   background maintenance, not for regressions. The retired form of this
+   criterion — "idles < 5% host CPU (check `docker stats`)" — could not pass:
+   `docker stats` reports percent of one core on Linux, and the measured idle
+   guest reads ~18% there while being healthy.
 4. iCloud tray icon shows signed-in and syncing.
 5. `ls /mnt/icloud` on the host lists the operator's real iCloud files, at their
    real sizes, as online-only placeholders.

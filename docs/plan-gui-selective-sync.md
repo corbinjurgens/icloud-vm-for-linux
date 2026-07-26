@@ -1808,7 +1808,9 @@ done**; record any future proposal against this list before re-opening it.
 Documented in `SETUP.md`; none of them is a repository file.
 
 - `halt_poll_ns=0` stops KVM spinning on idle vCPU halts, but it is host-global,
-  adaptive by design, and unmeasured here. Benchmark with `docker stats` first.
+  adaptive by design, and unmeasured here. Benchmark with `tools/vcpu-profile.py`
+  first: halt polling can only appear in its `kernel` column, and an aggregate
+  `docker stats` percentage cannot show whether there is anything to recover.
 - `"userland-proxy": false` in `/etc/docker/daemon.json` removes the userspace
   copy on loopback-published ports, but it is daemon-wide, version-sensitive, and
   needs a daemon restart — do that only with the bridge powered off via the D29
