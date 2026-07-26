@@ -32,7 +32,7 @@ PWSH_VERSION := 7.4.6
 PWSH_DIR     := build/pwsh
 PWSH         := $(PWSH_DIR)/pwsh
 
-.PHONY: help version venv venv-qt test test-qt test-all lint lint-ps check \
+.PHONY: help version venv venv-qt hooks test test-qt test-all lint lint-ps check \
         deb install uninstall purge configure install-gui run deps acceptance \
         clean distclean
 
@@ -70,6 +70,11 @@ $(QT_STAMP):
 
 venv-qt: $(QT_STAMP) ## Create .venv-qt with pytest + PySide6 (large download)
 
+# The venv is a prerequisite because the pre-commit hook runs the suite and
+# refuses to skip it silently when there is no pytest to run.
+hooks: $(VENV_STAMP) ## Install the git hooks in .githooks (pre-commit, commit-msg)
+	./tools/install-hooks.sh
+
 deps: ## HOST: install runtime prerequisites (docker, cifs-utils, KVM check)
 	sudo ./host/setup-prereqs.sh
 
@@ -86,28 +91,12 @@ test-all: test test-qt ## Run the suite both with and without PySide6
 
 # ------------------------------------------------------------- linting -------
 
-lint: ## Syntax-check shell, compose and Python; verify the agent.ps1 copies
+# The mechanical checks live in tools/hygiene-checks.sh so that this target and
+# the pre-commit hook enforce exactly the same rules — the hook just points the
+# script at the staged tree instead of the working tree.
+lint: ## Hygiene and syntax over the working tree, plus compose validation
 	@fail=0; \
-	echo "==> bash -n"; \
-	for f in $(SHELL_SCRIPTS); do \
-	  bash -n "$$f" || { echo "FAIL: $$f"; fail=1; }; \
-	done; \
-	echo "PASS: $(words $(SHELL_SCRIPTS)) shell scripts parse"; \
-	echo "==> shell maintainer scripts (sh -n)"; \
-	for f in packaging/deb/postinst packaging/deb/prerm packaging/deb/postrm; do \
-	  sh -n "$$f" || { echo "FAIL: $$f"; fail=1; }; \
-	done; \
-	echo "PASS: maintainer scripts parse"; \
-	echo "==> python"; \
-	$(PYTHON) -m compileall -q gui/icloud_bridge_gui gui/tests >/dev/null \
-	  || { echo "FAIL: python syntax"; fail=1; }; \
-	echo "PASS: python compiles"; \
-	echo "==> agent.ps1 copies"; \
-	if cmp -s guest-agent/agent.ps1 provision/agent.ps1; then \
-	  echo "PASS: guest-agent/agent.ps1 == provision/agent.ps1"; \
-	else \
-	  echo "FAIL: agent.ps1 copies have diverged"; fail=1; \
-	fi; \
+	ICLOUD_HYGIENE_ENV=$(CURDIR)/.env ./tools/hygiene-checks.sh . || fail=1; \
 	echo "==> docker compose config"; \
 	if command -v docker >/dev/null 2>&1; then \
 	  docker compose config >/dev/null && echo "PASS: compose config valid" \

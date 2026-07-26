@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# .githooks/pre-commit — the gate every commit in this repo passes.
+#
+# What:    hygiene (tools/hygiene-checks.sh) plus the logic tests (pytest
+#          gui/tests), both run against a snapshot of the *index* rather than
+#          the working tree. That distinction is the point: several agents may
+#          be editing this checkout at once, and a commit must be judged on the
+#          content it actually contains, not on whatever half-finished edit
+#          somebody else has open. It also makes `git add -p` honest.
+# Where:   Linux host, installed by `make hooks` (which sets core.hooksPath).
+# Invoke:  git runs it. To run it by hand: .githooks/pre-commit
+# Idempotent: yes — read-only apart from its own temp directory.
+#
+# Escape hatches, in order of preference:
+#   git commit --no-verify          skip every hook for one commit
+#   ICLOUD_BRIDGE_SKIP_HOOKS=1 git commit …   the same, more explicit
+# Both are for the rare deliberate exception. A hook that is routinely bypassed
+# is a hook that should have been deleted instead.
+set -uo pipefail
+
+[ "${ICLOUD_BRIDGE_SKIP_HOOKS:-}" = "1" ] && exit 0
+
+repo=$(git rev-parse --show-toplevel) || exit 1
+cd "$repo" || exit 1
+
+# Nothing staged: let git produce its own "nothing to commit" message.
+git diff --cached --quiet && exit 0
+
+# An unmerged path in the index means the commit would record conflict markers
+# or a half-resolved tree; refuse before doing any work.
+if [ -n "$(git diff --cached --diff-filter=U --name-only)" ]; then
+  echo "FAIL: the index has unmerged paths — resolve them first"
+  exit 1
+fi
+
+echo "==> pre-commit: checking the staged tree"
+
+snap=$(mktemp -d) || exit 1
+trap 'rm -rf "$snap"' EXIT
+git checkout-index -a --prefix="$snap/" || exit 1
+
+fail=0
+
+# The snapshot's own copy of the checker runs, so a commit that breaks the gate
+# is caught by the version it is trying to install. Fall back to the working
+# tree's copy when the commit removes or has not yet added it.
+checker=$snap/tools/hygiene-checks.sh
+[ -x "$checker" ] || checker=$repo/tools/hygiene-checks.sh
+if [ -x "$checker" ]; then
+  ICLOUD_HYGIENE_ENV=${ICLOUD_HYGIENE_ENV:-$repo/.env} \
+    "$checker" "$snap" || fail=1
+else
+  echo "FAIL: tools/hygiene-checks.sh is missing"
+  fail=1
+fi
+
+# The logic tests. They need no display, no docker and no mounts, and finish in
+# well under a second, so there is no reason to run only a subset.
+echo "==> pytest gui/tests (staged tree)"
+pytest=""
+for candidate in "$repo/.venv/bin/pytest" "$repo/.venv-qt/bin/pytest"; do
+  [ -x "$candidate" ] && { pytest=$candidate; break; }
+done
+[ -n "$pytest" ] || pytest=$(command -v pytest || true)
+
+if [ -z "$pytest" ]; then
+  echo "FAIL: no pytest found — run 'make venv' (it is what 'make hooks' expects)"
+  fail=1
+elif [ ! -d "$snap/gui/tests" ]; then
+  echo "SKIP: gui/tests is not in this tree"
+elif (cd "$snap" && "$pytest" gui/tests -q); then
+  echo "PASS: logic tests"
+else
+  echo "FAIL: logic tests"
+  fail=1
+fi
+
+if [ $fail -ne 0 ]; then
+  echo
+  echo "Commit refused. Fix the failures above, or bypass deliberately with"
+  echo "  git commit --no-verify"
+fi
+exit $fail

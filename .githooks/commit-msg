@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# .githooks/commit-msg — enforce the commit conventions in AGENTS.md.
+#
+# What:    subject shape (imperative-length, capitalised, no trailing period),
+#          a blank line before any body, and no attribution footer of any kind.
+#          The no-attribution rule is the one people and agents forget most, and
+#          it is the only one that cannot be fixed later without rewriting
+#          history — which is forbidden here because another agent may already
+#          have committed on top.
+# Where:   Linux host, installed by `make hooks`.
+# Invoke:  git runs it with the path to the message file.
+# Idempotent: yes — read-only.
+set -uo pipefail
+
+[ "${ICLOUD_BRIDGE_SKIP_HOOKS:-}" = "1" ] && exit 0
+
+msgfile=${1:?usage: commit-msg <file>}
+fail=0
+bad() { echo "FAIL: $*"; fail=1; }
+
+# Strip git's comment lines and the diff a verbose commit appends.
+body=$(sed -e '/^#/d' -e '/^diff --git /,$d' "$msgfile")
+subject=$(printf '%s\n' "$body" | sed -n '1p')
+second=$(printf '%s\n' "$body" | sed -n '2p')
+
+if [ -z "${subject// /}" ]; then
+  bad "empty commit subject"
+else
+  [ ${#subject} -le 72 ] || bad "subject is ${#subject} chars, limit is 72: $subject"
+  case $subject in
+    [A-Z]*) ;;
+    *) bad "subject must start with a capital letter: $subject" ;;
+  esac
+  case $subject in
+    *.) bad "subject must not end with a period: $subject" ;;
+  esac
+fi
+
+if [ -n "${second:-}" ]; then
+  bad "line 2 must be blank — subject, blank line, then the body"
+fi
+
+# Hard rule: no co-author trailer, no tool attribution, no robot.
+if printf '%s\n' "$body" | grep -qiE '^[[:space:]]*co-authored-by:'; then
+  bad "no Co-Authored-By trailer in this repo"
+fi
+if printf '%s\n' "$body" | grep -qiE 'generated with|claude code'; then
+  bad "no tool-attribution line in this repo"
+fi
+# Covers the robot face the attribution line usually carries, among the rest.
+if printf '%s\n' "$body" | grep -qP '[\x{1F000}-\x{1FAFF}\x{FE0F}]' 2>/dev/null; then
+  bad "no emoji in commit messages"
+fi
+
+if [ $fail -ne 0 ]; then
+  echo
+  echo "See the commit conventions in AGENTS.md. Bypass with 'git commit --no-verify'."
+fi
+exit $fail
