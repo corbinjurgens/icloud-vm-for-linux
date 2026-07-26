@@ -15,12 +15,14 @@ import os
 import socket
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QRunnable, QSocketNotifier, QThreadPool, QTimer, Signal
 from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
-from . import cli, firstrun, health, lifecycle, notify, power
+from . import (autostart, bridge, cli, diagnostics, firstrun, health, lifecycle,
+               notify, power)
 from .tray import OFF, STARTING, TrayIcon, load_icon
 from .window import MainWindow
 
@@ -102,6 +104,16 @@ class Application(QObject):
         #: Bounded record of unexpected (phase, event) pairs, so a wiring mistake
         #: is diagnosable rather than silent.
         self._invalid_transitions: list[str] = []
+        #: D37 report inputs the controller must retain deliberately, because a
+        #: report has to work in the states where nothing can be re-read: the
+        #: last helper outcome, when bridge facts were last gathered, and the
+        #: marker. None of these is reconstructed from a journal.
+        self._last_helper_action = ""
+        self._last_helper_ok: bool | None = None
+        self._last_helper_detail = ""
+        self._last_gathered_at = ""
+        self._last_snapshot: health.Snapshot | None = None
+        self._marker_present: bool | None = None
         #: The last definitive `docker inspect` classification, or None.
         self._container_state: str | None = None
         #: Long-lived polling caches. The five-second loop exists for the cheap
@@ -146,6 +158,7 @@ class Application(QObject):
         self._window.create_vm_requested.connect(self._on_create_vm_requested)
         self._window.connect_requested.connect(self._on_connect_requested)
         self._window.env_file_selected.connect(self._on_env_file_selected)
+        self._window.diagnostics_facts = self._diagnostic_facts
 
         self._tray: TrayIcon | None = None
         if tray_available:
@@ -230,6 +243,57 @@ class Application(QObject):
             self._invalid_transitions.append(record)
         print(f"icloud-bridge-gui: {record}", file=sys.stderr)
 
+    # ------------------------------------------------ the D37 report inputs --
+
+    def _diagnostic_facts(self) -> diagnostics.Facts:
+        """Everything a report may know, copied in explicitly.
+
+        Built from state this controller already holds, so it works unchanged in
+        the no-CIFS states: nothing here re-reads the bridge, and `gathered_at`
+        is what tells the reader the bridge section is cached rather than
+        current. Anything not named here cannot reach the report.
+        """
+        snapshot = self._last_snapshot
+        status = (snapshot.status if snapshot is not None else None) or {}
+        tree = (snapshot.tree if snapshot is not None else None) or {}
+        compatibility = (snapshot.compatibility if snapshot is not None
+                         else bridge.Compatibility())
+        revision, paths = self._window.selection_facts()
+        try:
+            autostart_enabled = autostart.is_enabled()
+        except OSError:                     # pragma: no cover - defensive
+            autostart_enabled = None
+
+        return diagnostics.Facts(
+            lifecycle=self._model.phase.value,
+            container_state=self._container_state or "",
+            marker_present=self._marker_present,
+            install_origin=(self._bundle.origin if self._bundle is not None else ""),
+            autostart_enabled=autostart_enabled,
+            compatibility=compatibility.state,
+            compatibility_detail=compatibility.detail,
+            documents=diagnostics.DocumentFacts(
+                status_version=status.get("version"),
+                status_generated_at=str(status.get("generatedAt") or ""),
+                status_applied_revision=status.get("appliedRevision"),
+                agent_build=(compatibility.agent_build
+                             if compatibility.agent_build is not None
+                             else status.get("agentBuild")),
+                tree_version=tree.get("version"),
+                tree_generated_at=str(tree.get("generatedAt") or ""),
+                exclusions_revision=revision,
+                exclusions_count=len(paths),
+            ),
+            health=tuple(diagnostics.HealthRow(check.name, check.severity)
+                         for check in (snapshot.checks if snapshot is not None else ())),
+            overall=(snapshot.overall if snapshot is not None else ""),
+            gathered_at=self._last_gathered_at,
+            last_helper_action=self._last_helper_action,
+            last_helper_ok=self._last_helper_ok,
+            last_helper_detail=self._last_helper_detail,
+            exclusion_paths=paths,
+        )
+
     # --------------------------------------------------------- startup flow --
 
     def _inspect_and_start(self) -> None:
@@ -238,20 +302,26 @@ class Application(QObject):
 
         def work():
             status = power.inspect_container()
+            marker = power.marker_exists()
+            # The bundle is local filesystem work, not CIFS, and resolving it
+            # once here means a diagnostic report can name the install origin in
+            # every state rather than only during first-run setup (D37).
+            bundle = firstrun.resolve_bundle()
             # Keep the classification, not just the plan: it is what decides
             # which power action the controls offer (D30).
-            return status, power.plan_startup(power.marker_exists(), status)
+            return status, power.plan_startup(marker, status), marker, bundle
 
         self.run_async(work,
                        lambda result: self._on_plan(result, token),
                        lambda message: self._on_plan_error(message, token))
 
-    def _on_plan(self, result: tuple[power.DockerStatus, power.StartupPlan],
-                 token: int) -> None:
+    def _on_plan(self, result, token: int) -> None:
         if not lifecycle.accepts(self._model, token):
             return
-        status, plan = result
+        status, plan, marker, bundle = result
         self._container_state = status.state
+        self._marker_present = marker
+        self._bundle = bundle
         if plan.kind == power.POWER_ON:
             self._dispatch(lifecycle.Event.STARTUP_POWER_ON)
         elif plan.kind == power.PROVISION_NEEDED:
@@ -607,12 +677,23 @@ class Application(QObject):
                        lambda result: self._on_start_result(result, token),
                        lambda message: self._on_start_exception(message, token))
 
+    def _record_helper(self, action: str, ok: bool, detail: str) -> None:
+        """Retain the last helper outcome for D37; the marker follows from it."""
+        self._last_helper_action = action
+        self._last_helper_ok = ok
+        self._last_helper_detail = detail
+        if ok:
+            # The helper's own transaction sets or clears the marker, so a
+            # success tells us its state without another filesystem read.
+            self._marker_present = (action == "off")
+
     def _fx_exit_app(self) -> None:
         self._quit_gui_only()
 
     def _on_start_result(self, result: power.HelperResult, token: int) -> None:
         if not lifecycle.accepts(self._model, token):
             return
+        self._record_helper("on", result.success, result.message)
         if result.success:
             self._dispatch(lifecycle.Event.POWER_ON_SUCCEEDED)
             return
@@ -622,6 +703,7 @@ class Application(QObject):
     def _on_start_exception(self, message: str, token: int) -> None:
         if not lifecycle.accepts(self._model, token):
             return
+        self._record_helper("on", False, message)
         self._start_error = f"the power helper could not be run: {message}"
         self._dispatch(lifecycle.Event.POWER_ON_FAILED)
 
@@ -831,6 +913,7 @@ class Application(QObject):
     def _on_power_off_result(self, result: power.HelperResult, token: int) -> None:
         if not lifecycle.accepts(self._model, token):
             return
+        self._record_helper("off", result.success, result.message)
         if result.success:
             self._dispatch(lifecycle.Event.POWER_OFF_SUCCEEDED)
             return
@@ -840,6 +923,7 @@ class Application(QObject):
     def _on_power_off_exception(self, message: str, token: int) -> None:
         if not lifecycle.accepts(self._model, token):
             return
+        self._record_helper("off", False, message)
         self._abort_message = f"the power helper could not be run: {message}"
         self._dispatch(lifecycle.Event.POWER_OFF_FAILED)
 
@@ -874,6 +958,11 @@ class Application(QObject):
 
     def _on_snapshot(self, snapshot: health.Snapshot) -> None:
         self._refreshing = False
+        # Retained for D37: a report in a no-CIFS state renders these plus the
+        # timestamp that says how old they are.
+        self._last_snapshot = snapshot
+        self._last_gathered_at = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
         if lifecycle.is_no_cifs(self._model.phase):
             # A transition owns the state now; it does its own forced pass.
             self._force_pending = False

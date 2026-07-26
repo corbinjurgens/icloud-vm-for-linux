@@ -9,19 +9,21 @@ mount can block even a ``stat``.
 from __future__ import annotations
 
 import os
+import stat
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QPalette
 from PySide6.QtWidgets import (
-    QAbstractItemView, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QAbstractItemView, QApplication, QCheckBox, QFileDialog, QHBoxLayout, QLabel,
+    QLineEdit, QMainWindow,
     QMessageBox, QPushButton, QSizePolicy, QTabWidget, QTreeWidget,
     QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget,
 )
 
-from . import (__version__, backup, bridge, filtering, firstrun, health, listing,
-               power, sizes)
+from . import (__version__, backup, bridge, diagnostics, filtering, firstrun,
+               health, listing, power, sizes)
 from .tray import VM_VIEWER_URL, open_externally
 
 ROLE_PATH = Qt.ItemDataRole.UserRole
@@ -60,6 +62,33 @@ def _fmt_count(value: Any) -> str:
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return f"{value:,}"
     return "-"
+
+
+def _write_report(path: str, text: str) -> None:
+    """Write the report mode 0600, refusing anything but a plain file.
+
+    A report goes wherever the operator picked in a save dialog, so following a
+    symlink or opening a device or FIFO there could truncate — or block on —
+    something else entirely. `O_NOFOLLOW` covers the link; the `lstat` covers
+    the rest.
+    """
+    try:
+        existing = os.lstat(path)
+    except FileNotFoundError:
+        existing = None
+    if existing is not None and not stat.S_ISREG(existing.st_mode):
+        raise OSError(f"{path} is not a regular file; refusing to write to it")
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    handle = os.open(path, flags, 0o600)
+    try:
+        # Explicit, because O_CREAT's mode is ignored when the file exists.
+        os.fchmod(handle, 0o600)
+    except BaseException:
+        os.close(handle)
+        raise
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        stream.write(text)
 
 
 def _save_backup(exclusions, revision, source) -> str:
@@ -125,6 +154,10 @@ class MainWindow(QMainWindow):
         #: be dispatched until a status document has actually proved the guest
         #: agent speaks this protocol.
         self._compatibility = bridge.Compatibility()
+        #: Set by the controller: returns the allowlisted `diagnostics.Facts`
+        #: for a report. The controller owns the lifecycle/marker/install facts;
+        #: this window only presses the button (D37).
+        self.diagnostics_facts: Callable[[], diagnostics.Facts] | None = None
         self.setWindowTitle("iCloud bridge")
         self.resize(880, 620)
 
@@ -357,6 +390,53 @@ class MainWindow(QMainWindow):
             row_layout.addWidget(command)
         return row
 
+    # ------------------------------------------------- the D37 report export --
+
+    def _run_diagnostics(self, deliver) -> None:
+        """Collect off the GUI thread, then hand the text back to ``deliver``."""
+        provider = self.diagnostics_facts
+        if provider is None:
+            return
+        facts = provider()
+        include = self._diag_paths.isChecked()
+
+        def work():
+            # `collect` runs `systemctl is-active` and the two `sudo -n -l`
+            # probes; none touches a mount, but they are still subprocesses.
+            return diagnostics.report_text(facts, include_paths=include)
+
+        def failed(message: str):
+            QMessageBox.warning(self, "Could not build the report", message)
+
+        self._run_async(work, deliver, failed)
+
+    def _copy_diagnostics(self) -> None:
+        def deliver(text: str) -> None:
+            # The only route to the clipboard: an explicit Copy action.
+            QApplication.clipboard().setText(text)
+            self._diag_copy.setText("Copied")
+            QTimer.singleShot(1500,
+                              lambda: self._diag_copy.setText("Copy diagnostics"))
+
+        self._run_diagnostics(deliver)
+
+    def _save_diagnostics(self) -> None:
+        def deliver(text: str) -> None:
+            suggested = os.path.join(
+                os.path.expanduser("~"),
+                diagnostics.default_filename(
+                    datetime.now().strftime("%Y%m%d-%H%M%S")))
+            chosen, _filter = QFileDialog.getSaveFileName(
+                self, "Save diagnostic report", suggested, "Text files (*.txt)")
+            if not chosen:
+                return
+            try:
+                _write_report(chosen, text)
+            except OSError as exc:
+                QMessageBox.warning(self, "Could not save the report", str(exc))
+
+        self._run_diagnostics(deliver)
+
     # ------------------------------------------------------------ status tab --
 
     def _build_status_tab(self) -> QWidget:
@@ -386,6 +466,27 @@ class MainWindow(QMainWindow):
         layout.addWidget(note)
 
         layout.addStretch(1)
+
+        # D37: support export. Deliberately on the Status tab and available in
+        # every lifecycle state, because a failure state is exactly when a
+        # report is worth having.
+        diag = QHBoxLayout()
+        self._diag_copy = QPushButton("Copy diagnostics")
+        self._diag_copy.setToolTip(
+            "Put a privacy-safe diagnostic report on the clipboard")
+        self._diag_copy.clicked.connect(self._copy_diagnostics)
+        self._diag_save = QPushButton("Save diagnostic report…")
+        self._diag_save.clicked.connect(self._save_diagnostics)
+        self._diag_paths = QCheckBox("Include folder names")
+        self._diag_paths.setToolTip(
+            "Off by default: folder names are replaced with placeholders. "
+            "Passwords, credentials files, command environments and file "
+            "contents are never included either way.")
+        diag.addWidget(self._diag_copy)
+        diag.addWidget(self._diag_save)
+        diag.addWidget(self._diag_paths)
+        diag.addStretch(1)
+        layout.addLayout(diag)
 
         buttons = QHBoxLayout()
         open_files = QPushButton("Open iCloud folder")
@@ -694,6 +795,15 @@ class MainWindow(QMainWindow):
         """Undo :meth:`quiesce` after an aborted shutdown."""
         self.set_io_paused(False)
         self._poll_timer.start()
+
+    def selection_facts(self) -> tuple[int | None, tuple[str, ...]]:
+        """The loaded exclusion revision and paths, for a D37 report.
+
+        The *loaded* selection, not the staged one: a report should describe what
+        the bridge actually holds, not what the operator is part-way through
+        choosing.
+        """
+        return self._loaded_revision, tuple(self._loaded_wanted)
 
     def last_write_info(self) -> tuple[int | None, datetime | None]:
         """The revision this GUI last wrote, for the D23 revision-lag check."""

@@ -421,6 +421,11 @@ Files: `gui/icloud_bridge_gui/backup.py` (new),
 
 ## 5. Export a privacy-safe diagnostic report (D37, I-002)
 
+> **Status: done.** `diagnostics.py` takes an allowlisted `Facts` dataclass and
+> runs only the six `systemctl is-active` probes and the two `sudo -n -l`
+> checks; the Status tab gained **Copy diagnostics** and **Save diagnostic
+> report…**. D37 and E14 are recorded.
+
 Support currently means hand-collecting GUI rows, Docker output, systemd state
 and journal fragments. Add **Copy diagnostics** and **Save diagnostic
 report…** to the Status tab.

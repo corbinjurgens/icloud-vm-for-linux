@@ -528,6 +528,15 @@ allocation on the host permanently.
 
 ## Troubleshooting quick reference
 
+**Before reporting any of these, attach a diagnostic report.** The GUI's Status
+tab has **Save diagnostic report…** (and **Copy diagnostics** for pasting).
+It records versions, lifecycle and container state, host-unit and helper
+authorization results, and the bridge document versions and timestamps. Folder
+names are replaced with placeholders unless you tick **Include folder names**,
+and it never contains your share password, `/etc/credentials-icloud`, command
+environments, Apple account data, or any file contents (v2 plan D37). It works
+in every state, including setup and powered-off.
+
 | Symptom | Cause | Fix |
 |---|---|---|
 | `error gathering device information … "/dev/kvm": no such file or directory` on `docker run` | Docker Desktop context active | §2 — install native Engine, `docker context use default` |

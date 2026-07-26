@@ -15,6 +15,7 @@ keeps `AGENTS.md`'s with-and-without-Qt rule satisfiable.
 from __future__ import annotations
 
 import os
+import stat
 import sys
 import threading
 
@@ -35,8 +36,8 @@ from icloud_bridge_gui import __main__ as app_module              # noqa: E402
 from icloud_bridge_gui import window as window_module             # noqa: E402
 
 _RealMessageBox = window_module.QMessageBox
-from icloud_bridge_gui import (backup, bridge, health, lifecycle, listing,  # noqa: E402
-                               power)
+from icloud_bridge_gui import (backup, bridge, diagnostics, health, lifecycle,  # noqa: E402
+                               listing, power)
 
 
 # ------------------------------------------------------------------ fakes --
@@ -61,6 +62,17 @@ class Recorder:
     @property
     def count(self) -> int:
         return len(self.calls)
+
+
+class FakeRunner:
+    """A bounded runner for the D37 collector: no systemctl, no sudo, no docker."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, ...]] = []
+
+    def __call__(self, argv, timeout):
+        self.calls.append(tuple(argv))
+        return power.RunResult(0, "active\n", "")
 
 
 class FakeTray:
@@ -737,3 +749,137 @@ def test_a_missing_backup_is_an_error_dialog_and_changes_nothing(controller, fak
     assert dialogs.count("critical") == 1
     assert written.count == 0
     assert window._loaded_wanted == []
+
+
+# ---------------------------------------- the D37 diagnostic export (wiring) --
+
+def test_collection_runs_on_a_worker_and_only_copy_reaches_the_clipboard(
+        controller, fakes, monkeypatch):
+    app, window = running_controller(controller, fakes)
+    threads = []
+    real_report_text = diagnostics.report_text
+
+    def recording_report_text(facts, *args, **kwargs):
+        threads.append(threading.current_thread())
+        return real_report_text(facts, FakeRunner(), **kwargs)
+
+    monkeypatch.setattr(diagnostics, "report_text", recording_report_text)
+    clipboard = QApplication.clipboard()
+    clipboard.setText("untouched")
+
+    # Building the report alone must not reach the clipboard.
+    window._run_diagnostics(lambda text: None)
+    pump(2.0, until=lambda: bool(threads))
+    pump(0.3)
+    assert clipboard.text() == "untouched"
+    assert threads and threads[0] is not threading.main_thread()
+
+    window._copy_diagnostics()
+    pump(2.0, until=lambda: clipboard.text() != "untouched")
+    assert diagnostics.HEADER in clipboard.text()
+
+
+def test_the_report_carries_the_controller_facts_and_no_folder_names(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    window._loaded_wanted = ["Tax Returns 2019"]
+    window._loaded_revision = 7
+    facts = app._diagnostic_facts()
+    assert facts.lifecycle == "running"
+    assert facts.exclusion_paths == ("Tax Returns 2019",)
+    assert facts.documents.exclusions_revision == 7
+
+    text = diagnostics.report_text(facts, FakeRunner())
+    assert "Tax Returns 2019" not in text
+    assert "<path-1>" in text
+
+
+def test_a_no_cifs_state_reports_from_cache_and_says_so(controller, fakes):
+    """Setup has no mount to gather from; the report must still be useful."""
+    fakes.inspect.result = power.DockerStatus("absent", detail="no such object")
+    app = controller()
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.SETUP)
+    facts = app._diagnostic_facts()
+    assert facts.lifecycle == "setup"
+    assert facts.gathered_at == ""
+    text = diagnostics.report_text(facts, FakeRunner())
+    assert "not gathered" in text
+    assert fakes.gather.count == 0           # and nothing was read to build it
+
+
+def test_the_last_helper_result_is_retained_for_the_report(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    fakes.power_off.result = power.HelperResult(False, 1, "target is busy")
+    app._on_power_off_requested()
+    pump(2.0, until=lambda: app._last_helper_ok is False)
+
+    facts = app._diagnostic_facts()
+    assert facts.last_helper_action == "off"
+    assert facts.last_helper_ok is False
+    assert "target is busy" in facts.last_helper_detail
+
+
+def test_a_successful_power_off_records_the_marker_without_another_read(
+        controller, fakes):
+    app, window = running_controller(controller, fakes)
+    assert app._marker_present is False
+    app._on_power_off_requested()
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.POWERED_OFF)
+    assert app._marker_present is True
+    assert app._diagnostic_facts().marker_present is True
+
+
+def test_saving_a_report_writes_it_mode_0600(controller, fakes, tmp_path, monkeypatch):
+    app, window = running_controller(controller, fakes)
+    target = tmp_path / "report.txt"
+    monkeypatch.setattr(window_module.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(target), "")))
+    monkeypatch.setattr(diagnostics, "report_text",
+                        lambda facts, *a, **k: "report body\n")
+
+    window._save_diagnostics()
+    pump(2.0, until=target.exists)
+    assert target.read_text(encoding="utf-8") == "report body\n"
+    assert stat.S_IMODE(os.lstat(target).st_mode) == 0o600
+
+
+def test_saving_over_a_loose_mode_file_tightens_it(controller, fakes, tmp_path,
+                                                   monkeypatch):
+    app, window = running_controller(controller, fakes)
+    target = tmp_path / "report.txt"
+    target.write_text("old", encoding="utf-8")
+    os.chmod(target, 0o644)
+    monkeypatch.setattr(window_module.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(target), "")))
+    monkeypatch.setattr(diagnostics, "report_text",
+                        lambda facts, *a, **k: "fresh\n")
+
+    window._save_diagnostics()
+    pump(2.0, until=lambda: target.read_text(encoding="utf-8") == "fresh\n")
+    assert stat.S_IMODE(os.lstat(target).st_mode) == 0o600
+
+
+def test_saving_refuses_a_symlink_destination(controller, fakes, tmp_path, monkeypatch,
+                                              dialogs):
+    app, window = running_controller(controller, fakes)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("do not touch", encoding="utf-8")
+    link = tmp_path / "report.txt"
+    link.symlink_to(victim)
+    monkeypatch.setattr(window_module.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(link), "")))
+    monkeypatch.setattr(diagnostics, "report_text",
+                        lambda facts, *a, **k: "fresh\n")
+
+    window._save_diagnostics()
+    pump(2.0, until=lambda: dialogs.count("warning") == 1)
+    assert victim.read_text(encoding="utf-8") == "do not touch"
+
+
+def test_the_export_buttons_work_in_every_lifecycle_state(controller, fakes):
+    """A failure state is exactly when a report matters, so nothing gates these."""
+    fakes.inspect.result = power.DockerStatus("absent", detail="no such object")
+    app = controller()
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.SETUP)
+    window = app._window
+    assert window._diag_copy.isEnabled()
+    assert window._diag_save.isEnabled()
