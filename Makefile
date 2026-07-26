@@ -17,6 +17,16 @@ SHELL := /usr/bin/env bash
 VERSION := $(shell sed -n 's/^__version__ = "\(.*\)"/\1/p' gui/icloud_bridge_gui/__init__.py)
 DEB     := dist/icloud-bridge_$(VERSION)_all.deb
 
+# This project's container can only run on the native Engine: Docker Desktop's
+# daemon lives in its own VM and cannot pass /dev/kvm, /dev/net/tun or
+# /dev/vhost-net. Desktop also reclaims the user's *active context* every time it
+# starts, so `docker context use default` does not stay selected — leaving the
+# rest of your Docker work free to use Desktop as the default. Exporting
+# DOCKER_HOST here makes every docker call below independent of whichever context
+# was last chosen; it is the same pin the GUI applies in
+# gui/icloud_bridge_gui/power.py (DOCKER_SOCKET).
+export DOCKER_HOST := unix:///var/run/docker.sock
+
 VENV       := .venv
 VENV_STAMP := $(VENV)/.stamp-dev
 VENV_QT    := .venv-qt
@@ -26,7 +36,7 @@ PYTHON     ?= python3
 # Every shell script in the repo, including the two extensionless root helpers.
 SHELL_SCRIPTS := $(wildcard host/*.sh gui/*.sh packaging/*.sh tools/*.sh) \
                  host/icloud-bridge-power host/icloud-bridge-configure
-PS_SCRIPTS    := $(wildcard provision/*.ps1 guest-agent/*.ps1 tools/*.ps1)
+PS_SCRIPTS    := $(wildcard provision/*.ps1 guest-agent/*.ps1 tools/*.ps1 packaging/*.ps1)
 
 PWSH_VERSION := 7.4.6
 PWSH_DIR     := build/pwsh
@@ -34,7 +44,7 @@ PWSH         := $(PWSH_DIR)/pwsh
 
 .PHONY: help version venv venv-qt hooks test test-qt test-all lint lint-ps test-ps check \
         deb install uninstall purge configure install-gui run deps acceptance \
-        clean distclean
+        vm-up vm-down vm-ps vm-logs clean distclean
 
 # ------------------------------------------------------------------- meta ----
 
@@ -45,7 +55,8 @@ help: ## List the available targets
 		{printf "  \033[1m%-14s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 	@echo
 	@echo "  Targets needing a real host (KVM, guest, mounts): deps, install,"
-	@echo "  uninstall, purge, configure, acceptance."
+	@echo "  uninstall, purge, configure, acceptance, vm-up, vm-down, vm-ps,"
+	@echo "  vm-logs."
 
 version: ## Print the version the package will carry
 	@echo $(VERSION)
@@ -130,6 +141,8 @@ $(PWSH):
 lint-ps: $(PWSH) ## Parse the .ps1 files with PowerShell 7 (downloads ~70 MB)
 	@echo "==> Parsing PowerShell scripts"
 	@$(PWSH) -NoProfile -File packaging/lint-ps1.ps1 $(PS_SCRIPTS)
+	@echo "==> Guest check/work state matrix (provision/guest-state.ps1)"
+	@$(PWSH) -NoProfile -NonInteractive -File packaging/test-guest-state.ps1
 	@echo "NOTE: PS 7 parses a superset of PS 5.1 and cannot execute the guest-only"
 	@echo "      parts (cfapi interop, Get-LocalUser, SMB cmdlets, scheduled tasks)."
 
@@ -180,6 +193,24 @@ run: ## Run the GUI from the source tree (uses .venv-qt if you built it)
 
 acceptance: ## HOST: run the host-side acceptance checks
 	./host/acceptance-tests.sh
+
+# ------------------------------------------------------------------- vm ------
+
+# These wrap `docker compose` purely so the DOCKER_HOST pin above applies. Run
+# the bare compose commands only with that variable set, or Desktop's daemon will
+# answer instead and report the guest as missing.
+
+vm-up: ## HOST: start the Windows guest on the native Engine
+	docker compose up -d
+
+vm-down: ## HOST: stop and remove the guest container (the disk in /srv survives)
+	docker compose down
+
+vm-ps: ## HOST: show the guest container's state (running or not)
+	docker compose ps -a
+
+vm-logs: ## HOST: follow the guest container's logs
+	docker compose logs -f
 
 # -------------------------------------------------------------- cleaning -----
 

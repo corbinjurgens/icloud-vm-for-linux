@@ -93,12 +93,35 @@ hit on the first run:
   installs `docker-ce` + the systemd `docker.service` anyway.
 
 Context selection is **per-user** and does not take effect from inside the
-root-run setup script for your login, so switch it yourself:
+root-run setup script for your login, so select the Engine yourself:
 
 ```bash
 docker context use default
 docker context ls          # confirm: default *
 ```
+
+**But do not rely on that staying selected.** Docker Desktop reclaims the active
+context every time it starts, silently rewriting `currentContext` back to
+`desktop-linux` in `~/.docker/config.json`. Any command you run afterwards
+answers from Desktop's daemon, which has never heard of `icloud-windows`.
+
+So pin the socket per command instead of switching a global setting — that also
+leaves Desktop free to be your default for every *other* project:
+
+```bash
+DOCKER_HOST=unix:///var/run/docker.sock docker compose up -d
+```
+
+The `Makefile` exports exactly that variable, so the wrappers are immune without
+you typing it:
+
+```bash
+make vm-up      # start the guest        make vm-ps     # container state
+make vm-down    # stop and remove it     make vm-logs   # follow its logs
+```
+
+The GUI pins the same socket internally (`gui/icloud_bridge_gui/power.py`), so it
+is unaffected by the context either way.
 
 ---
 
@@ -178,9 +201,10 @@ $EDITOR .env
 Set:
 
 - `SHARE_PASS` — **generate a strong 20+ char random password.** This is the SMB
-  account password; you'll paste the *same* value into the guest in §7. `.env` is
-  gitignored — never commit it, and never put the real value in this file or any
-  other tracked file.
+  account password. The app delivers this same value into the guest during setup
+  (§8), from an env file you select at that moment; the manual fallback pastes it
+  by hand instead. `.env` is gitignored — never commit it, and never put the real
+  value in this file or any other tracked file.
 - `DISK_SIZE` / `RAM_SIZE` / `CPU_CORES` — size per `.env.example` comments. The
   qcow2 grows on demand, so oversizing `DISK_SIZE` is free. Don't drop `RAM_SIZE`
   below 2.5G (Windows servicing needs it).
@@ -216,8 +240,9 @@ docker compose logs -f     # Ctrl-C stops the log tail, not the container
 
 The **first** `up` downloads a multi-gigabyte Windows 11 ISO and runs an unattended
 install — typically **20–40 min**. Watch live at **http://127.0.0.1:8006**
-(noVNC). The debloat step runs automatically via the `/oem` mount and drops a
-`NEXT-STEPS.txt` on the guest desktop. Wait for the Windows desktop to appear.
+(noVNC). The debloat step runs automatically via the `/oem` mount, registers the
+provisioning watcher the app talks to (§8), and drops a `NEXT-STEPS.txt` on the
+guest desktop. Wait for the Windows desktop to appear.
 
 Quick pre-boot KVM passthrough check (should print the device, not an error):
 
@@ -312,10 +337,111 @@ different file from the pristine download. Don't mistake it for the cached ISO.
 
 ---
 
-## 8. One-time in-guest setup (manual — needs your Apple ID)
+## 8. In-guest setup (the app drives it; the Apple sign-in is yours)
 
-On the guest desktop (web viewer, or RDP to `127.0.0.1:3389`), open **PowerShell
-as Administrator** and follow plan §5–§7:
+Install the GUI first (§10) if you have not already — it is what performs this
+section. With the VM created and Windows installed, its **Setup** tab offers
+
+> **Set up Windows automatically**
+
+which installs iCloud for Windows, waits while you sign in, creates the SMB
+share, installs the bridge agent, and then hands over to **Check setup and
+connect**. The host stages the app's own current copies of the provisioning
+scripts on a share the guest cannot write to, and an elevated task inside Windows
+runs them; nothing is typed into the VM and no password is ever displayed
+(v2 plan D40-D42, §4.1).
+
+**Signing in to iCloud — Apple ID, two-factor authentication, and the iCloud
+Drive toggle — is the only step you perform inside the guest.** It stays manual
+deliberately: 2FA cannot be automated without risking an account lockout
+(`CONTRIBUTING.md` Scope).
+
+Every run **inspects before it changes anything**. It evaluates a fixed checklist
+of guest invariants, repairs only the components that are missing or have
+drifted, and evaluates the whole checklist again afterwards; a component it
+cannot classify safely stops the run before any mutation and reports the exact
+diagnosis instead of being guessed past (v2 plan D44, §4.2). Re-running it is
+therefore always safe, and a healthy component is skipped rather than replayed.
+
+### While it runs
+
+The app shows the checklist and the work it plans to do, and follows the run
+phase by phase. Two moments need you:
+
+- **Sign in.** When the app says so, open the VM screen, launch iCloud, sign in
+  with your Apple ID + 2FA, turn **iCloud Drive ON**, **leave Files On-Demand
+  ON**, and leave Photos/Mail/Contacts/Calendar **OFF**. The app polls for the
+  sync root and simply continues once it appears — there is no timeout on this
+  step and nothing to click afterwards. (`./tools/watch-sync.sh` from the host is
+  a cheap proxy for "the initial metadata population has stopped growing".)
+
+  **Do not pin the library.** v1 told you to disable Files On-Demand and run
+  `attrib +P -U`; live testing on 2026-07-22/23 disproved the premise behind
+  that instruction — dataless placeholders *do* hydrate on demand over SMB — so
+  v2 keeps Files On-Demand on and pins nothing. If you already pinned during an
+  earlier run, the bridge agent clears that intent once on its first start,
+  without evicting any content.
+- **The share password**, but only when the run actually has to set it — a first
+  run, a missing `syncshare` account, or an explicit reset. The app then asks you
+  to select the env file and streams `SHARE_PASS` straight into the guest at that
+  moment; it is never stored by the app, never shown, and never put on a command
+  line (v2 plan D41). An ordinary repair never asks for it at all.
+
+The share-credential row is **never green**. It reads *reset during this run* or
+*preserved*, both qualified with the reason: Windows never reveals a password, so
+this app cannot confirm it; connecting is the proof. That proof is the existing
+**Check setup and connect** step, which is where a successful first run leads.
+
+If you deliberately select a *different* password from the one this host already
+mounts with, the app tells you so and prints the matching
+`sudo icloud-bridge-configure --env-file …` follow-up (§9) — it cannot read or
+write root's `/etc/credentials-icloud` itself.
+
+### Re-running it later
+
+**Re-run Windows provisioning…** is on the Status tab and in the tray menu, and
+is also what the agent-skew and protocol-incompatible banners point at. It is
+one action with one enablement rule, deliberately available while the bridge
+protocol is `skewed` or `incompatible` — that is exactly when you need it
+(v2 plan D35).
+
+Its confirmation, *Re-run Windows provisioning?*, carries an **unchecked**
+**Reset share password from an env file** option. Leave it off unless the
+password itself is wrong: the ordinary repair keeps the working credential and
+never asks for your `.env`. The confirmation also states plainly that
+`/mnt/icloud` and `/mnt/icloud_bridge` **stay mounted** — the app pauses its own
+bridge reads, but it does not unmount them and cannot stop another program from
+using them. **Close files, transfers and shells under `/mnt/icloud*` before
+continuing.**
+
+Because the run reconciles rather than replays, an agent-build mismatch on an
+otherwise healthy VM renders exactly `Planned: Update bridge agent`: no env file
+is requested, no password is reset, and the share and ACL boundaries are left
+alone.
+
+### One-time bootstrap on a VM created before automated provisioning
+
+A VM installed before this feature has no watcher task inside it, so a staged run
+is simply never picked up. That is **not an error** — the app keeps polling and,
+after 90 seconds without an acknowledgement, shows this command to run **once**,
+in an elevated PowerShell inside the guest:
+
+```
+powershell -ExecutionPolicy Bypass -NoProfile -File \\host.lan\Provision\watcher.ps1 -Install
+```
+
+The installer checks its own elevation and that the `icloud` account really is an
+administrator before registering anything. Once it has run, the watcher picks up
+the request that is already staged — you do not click anything on the host again.
+VMs created from this repo afterwards register the watcher during the OEM
+install, so this step never applies to them.
+
+### Fallback: the manual script sequence
+
+The scripts are still exactly what the automated run executes, and running them
+by hand is still supported — for a diagnosed provisioning failure, or on a guest
+you would rather configure yourself. The Setup tab keeps them one click away
+under **Show manual steps**.
 
 > **Scripts are blocked by default.** Windows 11 sets the PowerShell execution
 > policy to `Restricted`, so launching a `.ps1` directly fails with *"running
@@ -325,11 +451,19 @@ as Administrator** and follow plan §5–§7:
 > window. (`01-debloat.ps1` ran unattended only because `install.bat` already
 > invokes it that way.)
 
-1. Install the client:
-   ```powershell
-   powershell -ExecutionPolicy Bypass -NoProfile -File C:\OEM\02-install-icloud.ps1
-   ```
-   It's a single command, so pasting it directly works just as well:
+**Use the right copy.** Every provisioning run refreshes an administrator-only
+`C:\ProgramData\icloud-bridge-provision\current` with the bundle this app is
+shipping, so that directory is the one to run from once the app has provisioned
+this VM at least once. `C:\OEM` is the copy dockur made at install time and is
+never updated afterwards — the author's live VM was found four commits behind,
+missing the skew detection it was supposed to have — so treat it as the starting
+point on a VM the app has never provisioned, and nothing more (v2 plan D42).
+
+On the guest desktop (web viewer, or RDP to `127.0.0.1:3389`), open **PowerShell
+as Administrator**, set `$P` to whichever of those two directories applies, and
+follow plan §5–§7:
+
+1. Install the client. This is a single command, so paste it directly:
    ```powershell
    winget install --id 9PKTQ5699M62 --source msstore --accept-package-agreements --accept-source-agreements
    ```
@@ -337,33 +471,23 @@ as Administrator** and follow plan §5–§7:
    on that ID, not the `AppleInc.iCloud` moniker — verified 2026-07-22.)
    Or install "iCloud" from the Microsoft Store if winget/msstore errors.
 2. Launch iCloud, **sign in + 2FA**. Turn **iCloud Drive ON**, **leave Files
-   On-Demand ON**, leave Photos/Mail/Contacts/Calendar **OFF**. Wait for the
-   initial metadata population to settle (`./tools/watch-sync.sh` from the host
-   is a cheap proxy for "it has stopped growing").
-
-   **Do not pin the library.** v1 told you to disable Files On-Demand and run
-   `attrib +P -U`; live testing on 2026-07-22/23 disproved the premise behind
-   that instruction — dataless placeholders *do* hydrate on demand over SMB — so
-   v2 keeps Files On-Demand on and pins nothing. If you already pinned during an
-   earlier run, the bridge agent clears that intent once on its first start,
-   without evicting any content.
-3. Edit `C:\OEM\03-create-share.ps1`, set `$pass` to the **same** `SHARE_PASS`
-   from your host `.env`, then run it (same bypass):
+   On-Demand ON**, leave Photos/Mail/Contacts/Calendar **OFF**, and do not pin
+   anything (see the note above).
+3. Edit `03-create-share.ps1`, replace the `STRONG_PASSWORD_HERE` placeholder
+   with the **same** `SHARE_PASS` from your host `.env`, then run it:
    ```powershell
-   notepad C:\OEM\03-create-share.ps1
-   powershell -ExecutionPolicy Bypass -NoProfile -File C:\OEM\03-create-share.ps1
+   notepad $P\03-create-share.ps1
+   powershell -ExecutionPolicy Bypass -NoProfile -File $P\03-create-share.ps1
    ```
    Creates the `syncshare` account and shares the sync root over SMB.
 4. Install the bridge agent, the control share, and Access-Based Enumeration on
    the data share:
    ```powershell
-   powershell -ExecutionPolicy Bypass -NoProfile -File C:\OEM\04-bridge-agent.ps1
+   powershell -ExecutionPolicy Bypass -NoProfile -File $P\04-bridge-agent.ps1
    ```
    It prints `bridge ready` once the scheduled task is running and a fresh
-   `status.json` has appeared. `C:\OEM\agent.ps1` must be present — it ships in
-   `provision/`, so a guest built from this repo already has it. On a guest
-   built before that file existed, deliver it through `\\host.lan\Data` first
-   (see `docs/automation-notes.md` §3).
+   `status.json` has appeared. It takes `agent.ps1` from beside itself, so run it
+   from a directory that holds both — either of the two above does.
 
 ---
 
@@ -475,8 +599,10 @@ docker compose -p icloud-bridge -f <bundle>/docker-compose.yml --env-file <your 
 
 Use that same `-p icloud-bridge` project name for later terminal commands so
 they address the same project. The assistant then waits through the Windows
-install — it does not try to mount anything — lists the §8 in-guest steps, and
-hands back to the power helper when you choose **Check setup and connect**.
+install — it does not try to mount anything — offers **Set up Windows
+automatically** to drive the §8 guest sequence for you (the manual list stays
+behind **Show manual steps**), and hands back to the power helper when you choose
+**Check setup and connect**.
 
 The GUI is the bridge's on/off switch (v2 plan D29/D30). Launching it powers the
 Windows VM on and mounts the shares; the tray's **Quit → Quit and power off VM**
@@ -518,12 +644,13 @@ docker compose up -d               # recreates the container, now with /dev/vhos
 ./host/acceptance-tests.sh         # section 2 must report the device AND vhost=on
 ```
 
-Then, in the guest (elevated PowerShell), re-run the share script — it is
-idempotent, which is why this is safe:
-
-```powershell
-C:\OEM\03-create-share.ps1
-```
+Then reconcile the guest half from the app: **Re-run Windows provisioning…**
+(Status tab or tray menu). The data-share check covers the D32 signing and
+encryption settings, so a guest that still has signing on is repaired as ordinary
+drift — with the credential preserved, and without touching the agent or the ACL
+boundaries if they are already correct (§8). The manual equivalent, if you prefer
+it, is step 3 of the fallback sequence in §8; it is idempotent, which is why
+either route is safe.
 
 `make acceptance` proves the D33 half from the host, and it is the half that is
 definitely worth doing: a container that predates the compose line provably
@@ -628,9 +755,10 @@ in every state, including setup and powered-off.
 | Selective Sync says the saved copy is *newer* than the VM's configuration | Normal after a VM rebuild: the fresh guest reports revision 0 and the host deliberately keeps the better copy | **Restore from backup…** to push your choices back into the rebuilt VM |
 | Tray icon shows yellow, `status.json` stale | The guest scheduled task is not running (it only runs in the logged-on `icloud` session) | Open `:8006`, confirm auto-logon happened; `Start-ScheduledTask icloud-bridge-agent` |
 | An exclusion is stuck at `pending-dehydrate` | Cloud Files refuses to dehydrate content that is open, modified, or not yet uploaded | Wait for the upload; the item is already hidden and inaccessible from the host. See `docs/selective-sync.md` |
-| An exclusion reports `acl-write-denied` | Provisioning step 4 (the agent's `RC,WDAC` grant) did not take, or that object has a protected DACL | Re-run `04-bridge-agent.ps1` as Administrator and read its protected-DACL report |
-| *"The guest agent does not match this app"* (yellow banner) | The GUI was updated but `C:\ProgramData\icloud-bridge\agent.ps1` was not — a package upgrade cannot reach inside the guest (v2 plan D35). Everything still works | Re-run `04-bridge-agent.ps1` as Administrator; it copies the bundled agent over the installed one. Your exclusions are untouched |
-| *"not speaking this app's bridge protocol"* (red banner); Apply and browsing disabled | Same cause, but the guest agent predates the version check entirely, so nothing will be written to it | Re-run `04-bridge-agent.ps1` as Administrator. The current `exclusions.json` is deliberately left exactly as it is until the versions agree |
+| An exclusion reports `acl-write-denied` | Provisioning step 4 (the agent's `RC,WDAC` grant) did not take, or that object has a protected DACL | **Re-run Windows provisioning…** — the bridge-boundary repair re-applies the grant, and a protected child DACL is reported as blocked with the exact paths so you restore inheritance deliberately (§8) |
+| *"The guest agent does not match this app"* (yellow banner) | The GUI was updated but `C:\ProgramData\icloud-bridge\agent.ps1` was not — a package upgrade cannot reach inside the guest (v2 plan D35). Everything still works | Use the banner's **Re-run Windows provisioning…** button. On a healthy VM the plan is just *Update bridge agent*: no password is asked for and your exclusions are untouched. A VM created before automated provisioning needs the one-time bootstrap in §8 first |
+| *"not speaking this app's bridge protocol"* (red banner); Apply and browsing disabled | Same cause, but the guest agent predates the version check entirely, so nothing will be written to it | The same **Re-run Windows provisioning…** action — it stays available in this state precisely because it is the way out. The current `exclusions.json` is deliberately left exactly as it is until the versions agree |
+| Provisioning runs but the VM never acknowledges it (the app shows a one-line bootstrap command after ~90 s) | The VM was created before automated provisioning, so it has no watcher task. Not an error — the app is still polling | Run that command once in an elevated PowerShell inside the VM (§8). The already-staged request is then picked up with no further click on the host |
 | GUI shows *"could not be powered on/off within the time allowed"* and offers only **Retry** | The outer timeout fired. Killing this app's `sudo` is no proof the root helper stopped, so nothing is read or changed until you retry (v2 plan D38) | Give the helper a moment, then press **Retry** — `flock` serializes it against any surviving run. `journalctl -u icloud-health.timer` and the diagnostic report show what actually happened |
 | After restarting the GUI mid-install it says *"Setup was interrupted while Windows was installing"* | The D39 record survived the restart, so the app resumed the no-CIFS Provisioning state instead of guessing | Continue the guest steps and choose **Check setup and connect**; the note clears itself once the bridge powers on |
 | Setup offers **Discard failed setup record** | This app noted that a VM creation was started, but Docker says that container is absent or is a different one | Use it if you gave up on that attempt. It removes only this app's note — no container, no virtual disk, no `.env` |
