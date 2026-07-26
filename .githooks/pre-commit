@@ -2,11 +2,15 @@
 # .githooks/pre-commit — the gate every commit in this repo passes.
 #
 # What:    hygiene (tools/hygiene-checks.sh) plus the logic tests (pytest
-#          gui/tests), both run against a snapshot of the *index* rather than
-#          the working tree. That distinction is the point: several agents may
-#          be editing this checkout at once, and a commit must be judged on the
-#          content it actually contains, not on whatever half-finished edit
-#          somebody else has open. It also makes `git add -p` honest.
+#          gui/tests), both run against a snapshot of the tree being committed
+#          rather than the working tree. That distinction is the point: another
+#          session may be editing this same folder, and a commit must be judged
+#          on the content it actually contains, not on whatever half-finished
+#          edit somebody else has open. It also makes `git add -p` honest.
+#          `git checkout-index` follows GIT_INDEX_FILE, so this stays exact for
+#          `git commit -- <paths>` too, where git builds a temporary index: the
+#          hook then sees only your paths plus HEAD, never another session's
+#          staged work. That form is what AGENTS.md tells you to use.
 # Where:   Linux host, installed by `make hooks` (which sets core.hooksPath).
 # Invoke:  git runs it. To run it by hand: .githooks/pre-commit
 # Idempotent: yes — read-only apart from its own temp directory.
@@ -33,7 +37,11 @@ if [ -n "$(git diff --cached --diff-filter=U --name-only)" ]; then
   exit 1
 fi
 
-echo "==> pre-commit: checking the staged tree"
+# Print what is about to be committed. With another session working in the same
+# folder, a commit that quietly swept in somebody else's staged file is the
+# expensive mistake, and it is only obvious if the list is on screen.
+echo "==> pre-commit: committing these paths"
+git diff --cached --name-status | sed 's/^/    /'
 
 snap=$(mktemp -d) || exit 1
 trap 'rm -rf "$snap"' EXIT
