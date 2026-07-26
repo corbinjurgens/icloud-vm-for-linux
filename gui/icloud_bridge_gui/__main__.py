@@ -1711,7 +1711,7 @@ class Application(QObject):
             self._prov_note = CREDENTIAL_FAILURE_EXPLANATION
             self._prov_warning = result.message
             self._setup_detail = ""
-            self._dispatch(lifecycle.Event.STARTUP_RESUME_PROVISIONING)
+            self._dispatch(lifecycle.Event.PROVISION_CONNECT_FAILED)
             return
         self._start_error = result.message
         self._dispatch(lifecycle.Event.POWER_ON_FAILED)

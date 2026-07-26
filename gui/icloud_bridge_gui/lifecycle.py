@@ -98,7 +98,9 @@ class Event(Enum):
     STARTUP_PROVISION_NEEDED = "startup_provision_needed"
     STARTUP_INSPECT_FAILED = "startup_inspect_failed"
     #: D39: a provisioning record matches a live container, so the app re-enters
-    #: the no-CIFS Provisioning Windows state it was interrupted in.
+    #: the no-CIFS Provisioning Windows state it was interrupted in. This is a
+    #: startup classification and nothing else; a later return to that state has
+    #: its own event.
     STARTUP_RESUME_PROVISIONING = "startup_resume_provisioning"
 
     # The power-on transaction.
@@ -132,6 +134,12 @@ class Event(Enum):
     PROVISION_BEGIN_REPROVISION = "provision_begin_reprovision"
     PROVISION_SUCCEEDED = "provision_succeeded"
     PROVISION_FAILED = "provision_failed"
+    #: The third door into a run's own state, from the power-on that follows a
+    #: converged one: the helper was rejected on the share *credential*
+    #: specifically (§4.2). Windows never reveals the account password, so
+    #: connecting is the only proof it matches, and the run's D43 record is
+    #: still live. Every other connect failure is `POWER_ON_FAILED`.
+    PROVISION_CONNECT_FAILED = "provision_connect_failed"
 
 
 class Effect(Enum):
@@ -446,6 +454,12 @@ def _starting(model: Model, event: Event) -> Transition | None:
     if event in (Event.STARTUP_PROVISION_NEEDED, Event.STARTUP_INSPECT_FAILED):
         return Transition(_next(model, Phase.SETUP), _ENTER_SETUP)
     if event is Event.STARTUP_RESUME_PROVISIONING:
+        return Transition(_next(model, Phase.PROVISIONING), _ENTER_PROVISIONING)
+    if event is Event.PROVISION_CONNECT_FAILED:
+        # Not a start failure: the guest's own checklist converged and only the
+        # credential is in doubt, so this returns to the surface of the run that
+        # is still in progress rather than to the red banner. The mode is
+        # carried, so the offered retry stays that same run.
         return Transition(_next(model, Phase.PROVISIONING), _ENTER_PROVISIONING)
     if event is Event.POWER_ON_SUCCEEDED:
         return Transition(_next(model, Phase.RUNNING), _ENTER_RUNNING)

@@ -1927,6 +1927,19 @@ def _ready_host(monkeypatch):
     monkeypatch.setattr(firstrun, "check_container", Recorder([]))
 
 
+def _recorded_events(app, monkeypatch):
+    """The lifecycle events the controller dispatches from here on, in order."""
+    seen = []
+    dispatch = app._dispatch
+
+    def record(event, token=None):
+        seen.append(event)
+        dispatch(event, token)
+
+    monkeypatch.setattr(app, "_dispatch", record)
+    return seen
+
+
 def test_a_credential_specific_connect_failure_offers_a_reset(controller, fakes,
                                                               monkeypatch):
     app, window = provisioning_controller(controller, fakes)
@@ -1935,10 +1948,16 @@ def test_a_credential_specific_connect_failure_offers_a_reset(controller, fakes,
     _ready_host(monkeypatch)
     fakes.power_on.result = power.HelperResult(
         False, 5, "mount error(13): Permission denied (NT_STATUS_LOGON_FAILURE)")
+    events = _recorded_events(app, monkeypatch)
 
     app._on_connect_requested()
     assert pump(3.0, until=lambda: app._prov_offer_reset)
     assert app._model.phase is lifecycle.Phase.PROVISIONING
+    # By its own name: this is not D39's startup resumption, and not a start
+    # failure either.
+    assert lifecycle.Event.PROVISION_CONNECT_FAILED in events
+    assert lifecycle.Event.STARTUP_RESUME_PROVISIONING not in events
+    assert lifecycle.Event.POWER_ON_FAILED not in events
     assert "never reveals the account password" in window._prov_note.text()
     assert window._prov_retry_button.text() == "Retry and reset share password…"
     assert firstrun.read_provisioning_record() is not None
@@ -1962,10 +1981,13 @@ def test_a_generic_connect_failure_never_offers_a_password_reset(controller,
     fakes.power_on.result = power.HelperResult(
         False, 7, "The Windows VM is running but its iCloud shares did not "
                   "become usable within 300s.")
+    events = _recorded_events(app, monkeypatch)
 
     app._on_connect_requested()
     assert pump(3.0, until=lambda: app._model.phase is lifecycle.Phase.START_FAILED)
     assert app._prov_offer_reset is False
+    assert lifecycle.Event.PROVISION_CONNECT_FAILED not in events
+    assert lifecycle.Event.POWER_ON_FAILED in events
     assert firstrun.read_provisioning_record() is not None
 
 

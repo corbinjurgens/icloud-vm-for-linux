@@ -71,6 +71,8 @@ EXPECTED: dict[tuple[P, E], tuple[P, tuple[F, ...]]] = {
     (P.STARTING, E.STARTUP_INSPECT_FAILED): (P.SETUP, lifecycle._ENTER_SETUP),
     (P.STARTING, E.STARTUP_RESUME_PROVISIONING): (P.PROVISIONING,
                                                   lifecycle._ENTER_PROVISIONING),
+    (P.STARTING, E.PROVISION_CONNECT_FAILED): (P.PROVISIONING,
+                                               lifecycle._ENTER_PROVISIONING),
     (P.STARTING, E.POWER_TRANSITION_UNKNOWN): (P.TRANSITION_UNKNOWN,
                                                lifecycle._ENTER_TRANSITION_UNKNOWN),
     (P.STARTING, E.POWER_ON_SUCCEEDED): (P.RUNNING, lifecycle._ENTER_RUNNING),
@@ -432,6 +434,32 @@ def test_a_reprovision_cannot_be_started_from_anywhere_else(phase):
 def test_a_run_result_outside_the_provisioning_state_is_invalid(phase, event):
     """A result can only belong to a run, and a run is only ever that state."""
     assert lifecycle.reduce(model(phase), event).effects == (
+        F.REPORT_INVALID_TRANSITION,)
+
+
+@pytest.mark.parametrize("mode", [lifecycle.MODE_FIRST_RUN, lifecycle.MODE_REPROVISION])
+def test_a_credential_connect_failure_returns_to_the_run_it_belongs_to(mode):
+    """§4.2: the one connect failure that is evidence about the password.
+
+    It has its own event rather than borrowing D39's startup resumption, and it
+    lands on the same surface with the same effects: the run's record is still
+    live, so this is still that transaction.
+    """
+    transition = lifecycle.reduce(model(P.STARTING, mode=mode),
+                                  E.PROVISION_CONNECT_FAILED)
+    assert transition.model.phase is P.PROVISIONING
+    assert transition.effects == lifecycle._ENTER_PROVISIONING
+    assert not (set(transition.effects) & lifecycle.CIFS_EFFECTS)
+    assert not (set(transition.effects) & lifecycle.MUTATING_EFFECTS)
+    # The mode is carried, so the offered retry does not silently change what
+    # the run is for.
+    assert transition.model.provisioning_mode == mode
+
+
+@pytest.mark.parametrize("phase", [p for p in P if p is not P.STARTING])
+def test_a_credential_connect_failure_can_only_follow_a_power_on(phase):
+    """It is one outcome of the helper call, so only the phase running it has it."""
+    assert lifecycle.reduce(model(phase), E.PROVISION_CONNECT_FAILED).effects == (
         F.REPORT_INVALID_TRANSITION,)
 
 
