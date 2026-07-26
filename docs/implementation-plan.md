@@ -639,9 +639,12 @@ run from there: `tray.py` resolves its icons relative to `__file__`. The system
 autostart entry goes to `/etc/xdg/autostart/`, whose basename a per-user
 `~/.config/autostart/` entry overrides, so a package install and a
 `gui/install-gui.sh` install cannot double-launch the tray. The package also
-ships `README.md`, `SETUP.md`, and `CHANGELOG.md` under
-`/usr/share/doc/icloud-bridge/`, so the operator retains the runbook and the
-improvement/decision history without a source checkout.
+ships `README.md`, `SETUP.md`, `CHANGELOG.md`, and
+`docs/acceptance-results.md` under `/usr/share/doc/icloud-bridge/`, so the
+operator retains the runbook, the improvement/decision history and the live
+acceptance record without a source checkout. The acceptance record keeps its
+`docs/` subdirectory there so the repository-relative links to it in `SETUP.md`
+and `CHANGELOG.md` resolve from the installed copies too.
 
 ### 14.4 What none of this proves
 

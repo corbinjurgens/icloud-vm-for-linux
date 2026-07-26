@@ -419,6 +419,10 @@ cold, online-only file reads back correctly through the *kernel* CIFS client
 iCloud. Steps and pass/fail criteria are in
 [`docs/selective-sync.md`](docs/selective-sync.md#deployment-checklist).
 
+Record the outcome of E0 — and of every other live check — in
+[`docs/acceptance-results.md`](docs/acceptance-results.md), which is the durable
+result table. Only a run on this real host may fill in a row there.
+
 ---
 
 ## 10. Install the host GUI and tray icon

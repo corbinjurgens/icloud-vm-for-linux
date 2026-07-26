@@ -60,6 +60,11 @@ notification/tray interaction; and both first-run install routes. Capture the
 Windows, iCloud, Docker, dockur image, kernel, and `cifs.ko` versions plus useful
 timings so later regressions have a baseline.
 
+Results are recorded in
+[`docs/acceptance-results.md`](docs/acceptance-results.md), which also carries the
+environment baseline those results are read against. Rows are filled in only from
+the real host.
+
 **Completion gate:** E0 and every applicable E1–E11d case in
 [`docs/plan-gui-selective-sync.md`](docs/plan-gui-selective-sync.md#phase-e--v2-live-acceptance-tests-require-the-real-vm)
 has a dated result, with failures turned into fixes or explicit accepted

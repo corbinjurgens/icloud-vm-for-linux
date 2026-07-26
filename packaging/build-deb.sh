@@ -110,6 +110,10 @@ install -D -m 0644 "$repo_root/README.md" "$STAGE/usr/share/doc/$PKG/README.md"
 install -D -m 0644 "$repo_root/SETUP.md"  "$STAGE/usr/share/doc/$PKG/SETUP.md"
 install -D -m 0644 "$repo_root/CHANGELOG.md" \
   "$STAGE/usr/share/doc/$PKG/CHANGELOG.md"
+# Under docs/ so the repository-relative `docs/acceptance-results.md` links in
+# SETUP.md and CHANGELOG.md still resolve from the installed copies.
+install -D -m 0644 "$repo_root/docs/acceptance-results.md" \
+  "$STAGE/usr/share/doc/$PKG/docs/acceptance-results.md"
 install -D -m 0644 "$here/deb/lintian-overrides" \
   "$STAGE/usr/share/lintian/overrides/$PKG"
 
