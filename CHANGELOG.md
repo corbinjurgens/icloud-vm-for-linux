@@ -77,6 +77,129 @@ has a dated result in
 [`docs/acceptance-results.md`](docs/acceptance-results.md), with failures turned
 into fixes or explicit accepted limitations.
 
+### I-008 — Apply D32 and D33 to the running guest
+
+**Status:** Ready; operator action only, no code  
+**Evidence:** Measured on the author's live host on 2026-07-26. The container had
+been running since 2026-07-25, and commit `26d29ac` — which added
+`/dev/vhost-net` to `docker-compose.yml` for D33 and the signing assertions to
+`03-create-share.ps1` for D32 — landed on 2026-07-26. Both were therefore
+unapplied to the guest that was actually running, and **neither was detectable by
+any check in the repository**:
+
+- `docker inspect` listed only `/dev/kvm` and `/dev/net/tun`, and the guest
+  QEMU command line carried a plain `tap,...` netdev with no `vhost=on`. Every
+  SMB byte was being copied through QEMU's userspace main loop.
+- An unauthenticated SMB2 NEGOTIATE to `127.0.0.1:10445` returned security mode
+  `0x0003` — signing **required** — so `03-create-share.ps1` had not been re-run
+  since that assertion was added.
+
+`host/acceptance-tests.sh` tested `[ -e /dev/vhost-net ]`, a *host* fact, and
+printed PASS while the container lacked the device. That gap is now closed (see
+the shipped entry below); the remediation itself is still outstanding.
+
+**What the operator runs**, in this order: power the bridge down through the D29
+helper (never `docker rm`/`docker kill` a live bridge); `docker compose up -d` to
+recreate the container with the device; then re-run `C:\OEM\03-create-share.ps1`
+elevated in the guest. `make acceptance` then confirms the first half.
+
+**Completion gate:** `make acceptance` reports the container device and
+`vhost=on` checks green, and a before/after of `tools/test-smb-read.sh` is
+recorded in [`docs/acceptance-results.md`](docs/acceptance-results.md). That
+before/after is the only honest measurement of what D32 and D33 are worth, and it
+needs `SHARE_PASS`, so it is the operator's to run.
+
+### I-009 — Reduce the guest agent's per-entry walk cost
+
+**Status:** Candidate, measured under PowerShell 7 on Linux  
+**Evidence:** Follows the same review that produced the serializer work already
+shipped below, and is the remainder of it. All four recursive walks call
+`Join-Path` per entry (`agent.ps1` `Measure-SubtreeCheap`,
+`Measure-ExclusionAllocation`, `Get-SweepCandidates`, `Build-Node`) — a
+provider-aware cmdlet, measured at 31.4 us/call against 1.16 us for string
+concatenation — and two of them additionally build a `List[object]` and sort it
+with a **scriptblock** comparator per directory, ~54 us/entry at 20 entries per
+directory. Aggregate ~84 us/entry, so ~8.4 s per pass at 100k entries.
+
+Two further items from the same review, both **worth nothing on a guest with no
+exclusions configured** and both requiring a locked row to be amended first, so
+they rank behind the above:
+
+- Skip the per-entry DACL read inside a validated excluded root during
+  `Invoke-FullScan` reconciliation, where the target-deny removal condition is
+  provably false. Extends D34(a) with a second condition; must be gated on
+  `$ConfigValid` exactly as the existing fast path is, must not advance
+  `$aclState.last`, and must be evaluated *before* the resume-cursor comparison
+  or it trades a DACL read for a string split. The consequence to write into the
+  D34 row is that a stale non-inheritable guard inside the subtree heals on
+  **re-inclusion**, not spontaneously.
+- Deduplicate the two walks of excluded subtrees (`Measure-SubtreeCheap` from
+  enforcement, and `Build-Node`, which recurses into them and only drops them
+  from the output). **Correct the staleness claim before writing this up:** the
+  enforcement block runs before the tree block on the same tick, so consuming the
+  tree's measurement pushes an `applied` label's worst-case staleness to ~20 min,
+  double what D34(b) sanctions in writing. Either amend that number or reorder
+  the loop.
+
+**Not to be confused with** DFR-001 (the `attrib` -> `SetFileAttributesW`
+substitution, which hard rule 6 and D14/D26 pin) or R-023 (caching the
+`exclusions.json` containment validation, which is a live safety check). Neither
+is reopened here.
+
+**Completion gate:** emission order stays exactly OrdinalIgnoreCase-then-Ordinal
+— `Compare-RelPathDfs` must match the walk's comparator or the ACL resume cursor
+can skip never-visited subtrees — proven by a fixture under `make test-ps`; and
+path-concatenation equivalence to `Join-Path` is confirmed **on the guest**,
+because a Linux host cannot prove it.
+
+### I-010 — Attribute the guest's idle CPU burn
+
+**Status:** Candidate; needs the operator present  
+**Evidence:** `tools/vcpu-profile.py` (shipped below) measured the idle guest at
+18.3% of one core, stable across 180 s and 600 s windows, split 68.5% guest mode
+/ 28.6% host kernel / 2.9% QEMU userspace. That **bounds every host-side tuning
+knob at about 5% of one core** and puts the rest inside Windows. Separately, the
+guest writes ~66 KiB/s in bursts — roughly 5-8 GB/day of host SSD writes while
+doing no user work — and no acceptance criterion covers that in any form.
+
+Nothing in this repository can name the Windows process responsible. The channel
+exists, though, and is already checked in: `tools/guest-ctl.sh` +
+`tools/qemu-monitor.py` drive the guest through QEMU's monitor socket, and
+[`docs/automation-notes.md`](docs/automation-notes.md) documents delivering a
+script through the container's `\\host.lan\Data` share. The safe shape is
+therefore: `docker cp` a read-only sampler into that share, type one short
+command to launch it, and have it write a two-sample `Get-Process` CPU **delta**
+back as text — not blind keystrokes, and not lifetime CPU.
+
+**Expect a documented cost, not a saving.** R-012 and hard rule 5 close the
+Store/AppX/WebView2/servicing stack; R-022 closes Defender real-time protection,
+WNS and memory compression; R-020 keeps ScheduledDefrag; R-021 keeps the input
+services; R-019 keeps last-access. That is most of what such a sample will name.
+Anyone returning from this proposing "disable Defender" has re-run R-022.
+
+**Completion gate:** the idle burn is attributed to named processes with a dated
+figure in [`docs/acceptance-results.md`](docs/acceptance-results.md), and each
+one is either fixed, or recorded as an accepted recurring cost with its share.
+It also needs the operator watching: it types into a live, Apple-signed-in
+desktop, and every command must be read-only.
+
+### I-011 — Replace section 11.3's guest-idle acceptance criterion
+
+**Status:** Ready  
+**Evidence:** The criterion reads "guest idles < 5% host CPU (check
+`docker stats`)". Followed exactly as its own parenthetical instructs, `docker
+stats` reports percent-of-one-core on Linux, so the author's guest reads ~18% and
+this criterion **fails** — it does not pass either way. Nobody noticed because it
+sits in the un-run MANUAL block and every row of `docs/acceptance-results.md`
+still says `not yet run`. Make it absolute: core-seconds of container CPU per
+wall second from the cgroup's `cpu.stat` over a stated window, which is what
+`tools/vcpu-profile.py` now reports. Add the write-churn figure in the same pass.
+
+**Completion gate:** the criterion names a measurement that can pass, an idle-cost
+row exists in the environment baseline table, and `SETUP.md`'s performance
+section and plan section 8.1 agree with it (they currently both say
+`docker stats`, so they move together or they drift).
+
 ### I-007 — Establish release boundaries
 
 **Status:** Ready; blocked on live acceptance  
@@ -103,6 +226,96 @@ Bumping the minor digit is a one-line change; `Makefile` and
 happens after that, never before.
 
 ## Shipped improvements
+
+### 2026-07-26 — First measurements from a real guest, and what they changed
+
+The first review in this project's history conducted with a **live Windows guest
+running on the same machine as the checkout**. Every earlier performance entry —
+including the whole-path review of the same date below, and the R-012..R-024 rows
+it closed — reasoned from source and specification because no guest was
+reachable. The measurements changed the conclusions, and in one case reversed the
+priority order outright.
+
+**What the guest actually costs, measured.** Idle CPU 18.1% of one core over
+180 s and 18.4% over 600 s (25.1% over the container's 26 h lifetime), with block
+reads near zero. Of that, 68.5% is guest mode, 28.6% host kernel, 2.9% QEMU
+userspace; the four vCPU threads account for essentially all of it, while the
+block iothread contributed 54 s of 23 800 lifetime core-seconds and the QEMU main
+loop 18 s. **The cost is inside Windows, not in host emulation and not in I/O**,
+which bounds every host-side knob at roughly 5% of one core. Writes run
+~66 KiB/s in bursts, about 5-8 GB/day, on a guest doing nothing.
+
+- **Two shipped decisions were found unapplied to the running container, and no
+  check in the repository could see it** (`80947be`). `acceptance-tests.sh` asked
+  the *host* whether `/dev/vhost-net` existed and printed PASS while the
+  container did not have it. It now asks the container's device list and greps
+  the guest QEMU command line for `vhost=on`, which is ground truth. The
+  remediation is the operator's and is tracked as I-008 — it is drift, not a
+  performance improvement, and is deliberately not counted as one.
+- **`tools/vcpu-profile.py`** (`80947be`). Splits the guest's CPU by execution
+  mode from `/proc`, so an aggregate `docker stats` percentage stops being the
+  only evidence — that number cannot distinguish "the guest is busy" from "we are
+  burning host CPU emulating it", and those have different fixes. Three traps are
+  documented in it because each cost real time: QEMU is a *grandchild* of
+  `.State.Pid`, `comm` must be split on the **last** `)` because the vCPU threads
+  are named `CPU 0/KVM` with a space, and `utime - gtime` needs a >=60 s window
+  and a clamp at zero.
+- **The agent's JSON serializer is 5.3x faster, byte for byte** (`82500af`).
+  `tree.json` was escaped by a per-character PowerShell loop through an
+  eight-branch chain with a `StringBuilder` allocated per call, and every level of
+  the recursion materialized each child as a complete string before `-join`ing
+  them — recopying every byte once per level of nesting, for the whole tree every
+  ten minutes, forever. Escaping moved into the compiled native helper with a
+  fast path for the overwhelmingly common no-escape case, and a document is now
+  appended into a single `StringBuilder`. Measured 3.07 s -> 0.58 s on a
+  5 461-node / 796 KB tree under PowerShell 7. `make test-ps` is new and asserts
+  the **exact output bytes**; its expectations were captured from the old
+  implementation before the rewrite, so it is a regression test rather than a
+  restatement of current behaviour. `$AgentBuild` 1 -> 2, so a guest still running
+  the old agent is reported (D35) instead of being silently slower.
+- **The GUI stops re-rendering an unchanged state column** (`7594d6e`). The 5 s
+  tick called `apply_snapshot` unconditionally and every non-rebuild pass walked
+  every tree row — including while the window was hidden in the tray, against a
+  `status.json` the agent rewrites only every 15 s. Measured at 5 219 rows:
+  `apply_snapshot` 12.07-13.43 ms per tick, of which the state column was
+  12.4-12.7 ms; with the early-out, 0.016-0.034 ms. Small against the guest's
+  burn, but linear in library size, and it removes a periodic block of the GUI
+  thread. Extends D34's host-side rule from the document *parse* to the *render*.
+  A row epoch is part of the memo key so a newly listed file cannot inherit a
+  "nothing changed" decision and keep an empty state cell.
+- **The version is pre-1.0** (`37a6fab`). `2.0.0` claimed a stability history
+  that never existed; it is now `0.2.0`, and the withheld release boundary moves
+  to `0.3.0`. See I-007.
+
+**Two things were attempted and withdrawn**, recorded so they are not retried
+blind:
+
+- An automated SMB posture probe. The D32 finding above is real and was
+  reproduced several times, but a checked-in tool that runs a raw
+  unauthenticated NEGOTIATE proved unshippable. The layout every specification
+  and implementation agrees on — 36 bytes of fixed fields, matching the Linux
+  kernel's own `smb2_negotiate_req` — is answered by this guest only when the
+  dialect array is written at offset 40 instead; and after roughly 25 abandoned
+  handshakes the guest's SMB server began closing *every* connection for minutes
+  at a time, including framings that had worked moments earlier. An acceptance
+  check that can produce false failures, and that has to poke a live guest to
+  run, is worse than none. The guest was verified healthy afterwards (container
+  up, no restarts, CPU normal, web viewer and TCP fine). Explaining the framing
+  — ideally by capturing what the kernel `cifs` client puts on the wire during a
+  real mount and diffing — is open work. Until then the D32 check is the
+  operator's, via `03-create-share.ps1` being idempotent.
+- Nothing else. The remaining reviewed candidates are I-009 to I-011 above; the
+  ideas rejected outright are R-025 onward below.
+
+**Verified here:** `make check`, `make test-all` (517 with PySide6, 452 without),
+`make lint-ps` (all ten `.ps1` files parse), `make test-ps`, `make deb`, and the
+new acceptance checks run against the live container. **Not verified here:** the
+agent has still never been *executed* — the serializer figures come from
+PowerShell 7 on Linux against synthetic data, and Windows PowerShell 5.1 remains
+an inference. One note for whoever sees it next:
+`test_a_matching_record_resumes_provisioning_without_any_cifs` flaked once under
+load and passed on rerun and in isolation; its `pump(2.0, until=...)` deadline is
+timing-sensitive.
 
 ### 2026-07-26 — Reviewed follow-up work: skew, backup, diagnostics, progress
 
@@ -271,6 +484,41 @@ closed the following:
 | R-023 | Cache `exclusions.json` containment validation across passes | Parsing is cheap; the containment walk is the runtime check that detects a formerly safe path whose parent became an unsafe reparse point. |
 | R-024 | Lengthen only one part of the health-canary cadence | The timer, script freshness threshold and GUI threshold are coupled. A partial change creates false stale reports; the current cadence favors faster hung-guest detection. |
 
+### Closed by the live-host review of 2026-07-26
+
+These are the first rows in this table closed against **measurements from a
+running guest** rather than reasoning alone, which is why several of them close
+by showing the ceiling is too low to bother with. The measurements are in the
+shipped entry above.
+
+| ID | Idea | Why it is closed |
+|---|---|---|
+| R-025 | Optimize or bypass `docker-proxy` on the SMB data path | `SETUP.md` already states the mechanism and names the benchmark, and the proxy on the SMB port had used 00:00:00 of CPU in 95 259 s of uptime because no CIFS mount has ever existed on this host. Routing around it by mounting the container IP stays forbidden by hard rule 3, R-010 and acceptance section 3. |
+| R-026 | Change the guest disk model (`DISK_IO`, `DISK_CACHE`, `ALLOCATE`) | The QEMU block iothread used 54 s of 23 800 lifetime core-seconds — 0.23% — and the sampled idle window did 0.7 KiB/s of reads. Any disk-model change is provably capped at a quarter of one percent. Adds the measurement R-014 and R-015 lacked; supersedes neither. |
+| R-027 | Add more inbox apps to `$bloat`, or set Edge `BackgroundModeEnabled=0` | Legal under hard rule 5's inbox-only carve-out, but the measured residual is episodic on a multi-minute scale rather than a resident constant, so not one byte of the 18% is attributable to them. Micro-tweaks without a numerator. |
+| R-028 | Disable `ProactiveScan` or Automatic Maintenance | Maintenance is the umbrella that runs the retrim R-020 exists to protect, and it is an episodic daily event, not a sustained load. |
+| R-029 | Switch the guest to the High Performance power scheme | Plausible on bare metal, but with `+hypervisor` and `hv_passthrough` Windows cedes P-state management to the hypervisor. No measurable mechanism in this configuration. |
+| R-030 | Remove `usb-tablet` / `qemu-xhci` to cut idle vmexits | dockur-supplied, would need the `ARGUMENTS` surgery section 8.1 forbids, and would break the VNC mouse input Apple sign-in needs. Empirically moot: QEMU userspace non-guest time is ~0.15% of a core at idle. |
+| R-031 | Lengthen the agent's 2 s tick, the 15 s `Get-Process` in `Write-Status`, SMB `echo_interval`, or the GUI's per-tick mount stats | Each measures between 0.01% and 0.3% of a core — three to four orders of magnitude below the measured idle burn. D17 locks the tick cadence independently. |
+| R-032 | Stream `tree.json` straight to disk instead of building the node tree in memory | Each node's rolled-up totals precede its `dirs` array in the required key order, so streaming needs a key reorder or a two-pass build. Not worth the churn now that the `StringBuilder` serializer has removed the O(size x depth) recopying. |
+| R-033 | Skip the `tree.json` write when the serialized bytes are unchanged | `generatedAt` is what D23's tree-staleness rule reads, so an unchanged document must still be re-stamped. Splitting freshness into a separate `walkedAt` field is DFR-002's precondition, not an independent win. |
+| R-034 | Merge the health and D30-classification `ContainerProbe` instances into one `docker inspect` | Saves ~0.13% of a core, and only while health is red. D34 specifies one probe per consumer; not worth an amendment. |
+| R-035 | Populate tree items lazily on expand instead of materializing every directory | The ~3.9 KiB of host RSS per directory is real, but `_filterable_paths` iterates materialized items and the filter's contract is "folders plus files loaded this session". A design change, not a tuning change, and it needs the operator's real directory count first. |
+| R-036 | Reduce `RAM_SIZE` from the live 4G toward D10's 3G | cgroup memory is already 3.49 GiB against a 4 GiB guest, and R-022's own reasoning keeps memory compression *because* of pagefile I/O in a small guest. Shrinking trades CPU for exactly the I/O R-022 protects. `.env` is operator machine state and D10's figure is a floor, not a cap. |
+| R-037 | Replace `os.path.ismount` with a `/proc/self/mountinfo` scan in the GUI's health gather | Removes two CIFS round trips per tick and would not block on a sick mount, but the canary `stat` in the same gather still hangs, so the responsiveness gain is partial and the CPU gain is seconds per day. |
+| R-038 | Add an automated check that the running `-smp`/`-m` match D10's literal values | It passes on the live 4-vCPU configuration it was meant to catch, and keyed to D10's literal 2 it would fail every operator who legitimately sized up — contradicting plan section 3 and `SETUP.md`, which make these operator values. A MANUAL note is the correct form. |
+| R-039 | Reduce `CPU_CORES` from 4 as a compliance fix | Not a compliance question at all: D10's "2 vCPU, 3 GB" is a **measured floor**, plan section 3 classes `CPU_CORES` as an operator value from `.env`, and `.env` is gitignored machine state. Worth *measuring* during the I-008 container recreate, but with no predicted win — the per-vCPU spread (143/86/85/79 min) is a boot-CPU-heavy profile, and the plausible idle consumers redistribute under fewer vCPUs rather than vanishing. |
+
+Two adjacent concerns cleared rather than closed, recorded because they are
+otherwise written down nowhere. `rasize=16777216` does **not** over-hydrate: the
+kernel's readahead ramps from a small initial window and only reaches `ra_pages`
+on sustained sequential reads, so a thumbnailer reading 64 KB of a dataless
+placeholder does not pull 16 MiB — which is D33's stated intent. But **a desktop
+file manager thumbnailing `/mnt/icloud` will hydrate real content**, and no entry
+here or in the docs warns about it. Separately, `restart: unless-stopped` is
+consistent with D29: an explicit `docker stop` from the power helper is not
+restarted, including across a host reboot, so it cannot fight the marker.
+
 ## Visited ideas: deferred pending evidence
 
 These are not rejected, but they are not implementation-ready.
@@ -282,6 +530,30 @@ These are not rejected, but they are not implementation-ready.
 | DFR-003 | Install host-wide KVM/Docker/THP tuning | Benchmark first. `halt_poll_ns=0` and Docker `userland-proxy=false` are host-global and version-sensitive; THP is usually already suitable. Keep these operator choices, not installer mutations. |
 | DFR-004 | Pattern exclusions, rename-following, per-item pinning/pre-warming, or hydration progress | These are explicitly outside v2. Each needs a separate design and live data-safety/performance evidence; none should be treated as an incidental GUI enhancement. |
 | DFR-005 | Pause only iCloud sync while leaving the VM and mounts up | D30 controls the whole bridge, not the Apple client's private sync engine. Revisit only if Apple exposes a reliable supported control and observable queue state. |
+
+**Where the 2026-07-26 live-host review left these rows.** Both DFR-002 and
+DFR-003 survived a deliberate attempt to close them, and the attempts are worth
+recording so they are not repeated:
+
+- **DFR-002 stays deferred verbatim.** Two independent proposals in that review
+  converged on closing it with host-side CPU data, and neither goes near its
+  stated condition, which is *watcher event rates on a live Cloud Files root*.
+  Worse, the walk cannot be isolated from outside the guest even in principle:
+  `$TreeEverySeconds`, `$SweepCooldownSeconds` and `$RequestTtlSeconds` are all
+  600, and `Invoke-FullScan` carries up to 120 s of DACL reads, so any periodic
+  hump is an upper bound on the whole ten-minute pass rather than on the walk.
+  Measured 5 s-bucket noise was mean 0.927 core-s with sd 0.331 (CV 36%). A null
+  result would not be understanding, and this table's own rule is that a row moves
+  to Closed when the cost *is* understood.
+- **DFR-003 does not move, but its THP leg is settled** by direct observation:
+  transparent hugepages are already `madvise` on this host, so there is nothing
+  to install for that third. The `halt_poll_ns` benchmark it demands is still
+  unrun — and note the ceiling, which is new: halt polling spins inside `KVM_RUN`
+  in kernel mode, so `halt_poll_ns=0` can only ever recover part of the host-kernel
+  share, measured at ~5% of one core. `userland-proxy` is untouched and
+  `tools/vcpu-profile.py` cannot see it, because `docker-proxy` is a separate host
+  process outside the sampled QEMU process.
+- **DFR-001, DFR-004 and DFR-005** were untouched by anything measured.
 
 Photos, Passwords, Mail/Contacts/Calendar, Apple-session automation, and custom
 Windows-image work remain outside this repository's scope rather than hidden

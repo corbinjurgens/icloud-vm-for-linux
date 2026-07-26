@@ -480,6 +480,44 @@ health timer) until you log in with autostart enabled, or run
 
 ---
 
+## Taking the data-path work onto a guest built before 2026-07-26
+
+**Read this if your container predates that date.** Two performance decisions —
+D32 (SMB signing off) and D33 (`/dev/vhost-net`) — shipped on 2026-07-26, and
+neither can reach a container or a guest that already exists:
+
+- `docker-compose.yml` gained the `/dev/vhost-net` device, but Docker only
+  applies a device list when it **creates** a container. A container started
+  before that line keeps running without it, and dockur silently falls back to
+  userspace virtio, so QEMU copies every SMB byte through its own main loop.
+- `03-create-share.ps1` gained `RequireSecuritySignature $false`, but that runs
+  inside the guest. Until you re-run it, Windows keeps signing every byte on both
+  ends of a path where there is nothing to protect (the host is the security
+  boundary, D9, and the ports are loopback-only).
+
+Do it in this order. Do **not** `docker rm` or `docker kill` a live bridge —
+that is what the ordered teardown exists to prevent:
+
+```bash
+sudo icloud-bridge-power off       # or Quit from the GUI; unmounts first, then stops the VM
+docker compose up -d               # recreates the container, now with /dev/vhost-net
+./host/acceptance-tests.sh         # section 2 must report the device AND vhost=on
+```
+
+Then, in the guest (elevated PowerShell), re-run the share script — it is
+idempotent, which is why this is safe:
+
+```powershell
+C:\OEM\03-create-share.ps1
+```
+
+`make acceptance` proves the first half from the host. The second half has no
+host-side check: an automated probe was attempted and withdrawn (see the
+2026-07-26 entry in `CHANGELOG.md` for why), so re-running the script is the
+mechanism. If you want the throughput number, run `tools/test-smb-read.sh` before
+and after — that is the only honest measurement of what these two are worth, and
+it needs `SHARE_PASS`.
+
 ## Optional host tuning (measure first, none of this is installed for you)
 
 Everything the project needs is already configured by the scripts above. The
@@ -494,10 +532,16 @@ this can show as steady host CPU against the `qemu` process even when the guest
 reports idle:
 
 ```bash
-docker stats icloud-windows            # measure BEFORE changing anything
+./tools/vcpu-profile.py --seconds 120  # measure BEFORE changing anything
 echo 0 | sudo tee /sys/module/kvm/parameters/halt_poll_ns     # revertible at runtime
 # to persist: echo 'options kvm halt_poll_ns=0' | sudo tee /etc/modprobe.d/kvm.conf
 ```
+
+Use the profiler rather than `docker stats`: halt polling spins inside `KVM_RUN`
+in **kernel** mode, so it can only ever show up in the profiler's `kernel` column,
+and an aggregate percentage cannot tell you whether there is anything there to
+recover. On the author's host that column is about 5% of one core, which is the
+absolute ceiling on this knob and on every other host-side knob.
 
 The cost is microseconds of extra wakeup latency, irrelevant at loopback-SMB
 timescales. The gain may well be nil — KVM's polling is adaptive and the guest
