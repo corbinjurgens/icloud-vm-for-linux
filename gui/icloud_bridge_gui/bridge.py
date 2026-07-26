@@ -26,7 +26,7 @@ DEFAULT_MOUNT_DIR = "/mnt/icloud"
 #: The one supported protocol version, carried by every document in both
 #: directions (v2 plan D35). There is deliberately no compatibility matrix: the
 #: project is pre-release, the GUI and the agent ship together, and skew is
-#: something to detect and report rather than accommodate (`AGENTS.md` rule 9).
+#: something to detect and report rather than accommodate (`CONTRIBUTING.md`).
 PROTOCOL_VERSION = 1
 
 #: The agent build this app was shipped with. A non-negative integer bumped in

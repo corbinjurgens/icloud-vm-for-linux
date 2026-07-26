@@ -28,12 +28,13 @@ The v2 decision register currently ends at D34. This backlog proposes five new
 decisions, including one correction to interrupted first-run behavior. This
 todo is not itself authoritative: each decision must be added to
 `docs/plan-gui-selective-sync.md` §1 **before** its implementation lands (hard
-rule 1 in `AGENTS.md`):
+the plan/file ownership rule in `CONTRIBUTING.md`):
 
 - **D35** (item 3): bridge-protocol version validation and agent-build skew
   detection, fail-closed for writes while compatibility is unknown or the
   protocol is unsupported. Exactly one supported protocol version, per
-  `AGENTS.md` hard rule 9 — detect and report skew, never accommodate it.
+  the `CONTRIBUTING.md` pre-release policy — detect and report skew, never
+  accommodate it.
 - **D36** (item 4): host-side snapshot of `exclusions.json` with explicit,
   previewed restore; never automatic.
 - **D37** (item 5): privacy-safe diagnostic report; redaction-by-default,
@@ -72,10 +73,10 @@ report instead of improvising one.
   process environments into any new file, report, or backup.
 - `guest-agent/agent.ps1` and `provision/agent.ps1` stay byte-identical
   (`make lint` and the pre-commit hook both check this).
-- The project is pre-release (`AGENTS.md` hard rule 9). No item here may add a
-  compatibility shim, a deprecation window, or a migration path for an earlier
-  build of this code. Change the format, change every reader and writer, delete
-  the old path, and record the operator's re-run step in `SETUP.md`. The
+- The project is pre-release (the policy in `CONTRIBUTING.md`). No item here may
+  add a compatibility shim, a deprecation window, or a migration path for an
+  earlier build of this code. Change the format, change every reader and writer,
+  delete the old path, and record the operator's re-run step in `SETUP.md`. The
   operator's live state — `exclusions.json`, credentials, the VM disk, the
   synced files — is data safety, not compatibility, and is still protected.
 - Every item that adds live behavior adds a distinct Phase E acceptance ID to
@@ -225,12 +226,13 @@ should be needed — verify the Qt leg actually collects the new file.
 
 Update `docs/plan-gui-selective-sync.md` §6.1 (layout row for `lifecycle.py`)
 and add one sentence to §6.2 noting the state machine is implemented as a pure
-reducer; add the module to the `AGENTS.md` layout table with the Qt-free rule.
+reducer; add the module to the `CONTRIBUTING.md` layout table with the Qt-free
+rule.
 
 Files: `gui/icloud_bridge_gui/lifecycle.py` (new),
 `gui/icloud_bridge_gui/__main__.py`, `gui/icloud_bridge_gui/window.py`,
 `gui/tests/test_lifecycle.py` (new), `gui/tests/test_qt_wiring.py` (new),
-`docs/plan-gui-selective-sync.md`, `AGENTS.md`.
+`docs/plan-gui-selective-sync.md`, `CONTRIBUTING.md`.
 
 ## 3. Detect protocol and agent-version skew (D35, I-003)
 
@@ -246,10 +248,11 @@ at all. A package upgrade ships a newer `agent.ps1` into the host bundle but
 cannot replace `C:\ProgramData\icloud-bridge\agent.ps1`, so GUI/agent skew is
 silent today.
 
-This item is deliberately small, because `AGENTS.md` hard rule 9 removes the
-part that would have been large: the project is pre-release, so there is exactly
-**one** supported protocol and the GUI and agent are expected to match. Skew is
-something to *detect and report*, not something to be compatible with. No
+This item is deliberately small, because the `CONTRIBUTING.md` pre-release
+policy removes the part that would have been large: the project is pre-release,
+so there is exactly **one** supported protocol and the GUI and agent are
+expected to match. Skew is something to *detect and report*, not something to be
+compatible with. No
 `legacy`/`older`/`newer` matrix, no reserved `capabilities` field, no
 conditional exception for documents an older agent used to emit.
 
@@ -421,7 +424,7 @@ Files: `gui/icloud_bridge_gui/backup.py` (new),
 `gui/icloud_bridge_gui/window.py`, `gui/icloud_bridge_gui/__main__.py`,
 `gui/tests/test_backup.py` (new), `gui/tests/test_qt_wiring.py`,
 `docs/plan-gui-selective-sync.md`,
-`docs/selective-sync.md`, `SETUP.md`, `AGENTS.md`.
+`docs/selective-sync.md`, `SETUP.md`, `CONTRIBUTING.md`.
 
 ## 5. Export a privacy-safe diagnostic report (D37, I-002)
 
@@ -501,7 +504,7 @@ Files: `gui/icloud_bridge_gui/diagnostics.py` (new),
 `gui/icloud_bridge_gui/window.py`, `gui/icloud_bridge_gui/__main__.py`,
 `gui/tests/test_diagnostics.py` (new), `gui/tests/test_qt_wiring.py`,
 `docs/plan-gui-selective-sync.md`,
-`SETUP.md`, `AGENTS.md`.
+`SETUP.md`, `CONTRIBUTING.md`.
 
 ## 6. Show progress and preserve provisioning state (D38/D39, I-005)
 
@@ -610,7 +613,7 @@ Files: `gui/icloud_bridge_gui/power.py`, `gui/icloud_bridge_gui/__main__.py`,
 `host/icloud-bridge-power` only if its phase audit requires a change,
 `gui/tests/test_power.py`, `gui/tests/test_firstrun.py`,
 `gui/tests/test_lifecycle.py`, `gui/tests/test_qt_wiring.py`,
-`docs/plan-gui-selective-sync.md`, `AGENTS.md`.
+`docs/plan-gui-selective-sync.md`, `CONTRIBUTING.md`.
 
 ## 7. Establish the first release boundary (I-007)
 
@@ -644,10 +647,11 @@ Decisions:
   acceptance appropriate to the release) means the operator tags `v0.3.0`
   after the relevant item-1 rows are recorded. The agent's deliverable ends at
   the version bump, changelog entry, and verification above.
-- This is the point at which `AGENTS.md` hard rule 9 stops being free. Up to
-  the first tag there is nothing to be compatible with; the moment a release
-  exists, breaking it becomes a decision with a cost. Nothing before this item
-  needs to think about that, and this item is where it gets thought about.
+- This is the point at which the `CONTRIBUTING.md` pre-release policy stops
+  being free. Up to the first tag there is nothing to be compatible with; the
+  moment a release exists, breaking it becomes a decision with a cost. Nothing
+  before this item needs to think about that, and this item is where it gets
+  thought about.
 
 Files: `gui/icloud_bridge_gui/__init__.py`, `CHANGELOG.md`, and whatever
 `gui/tests/test_cli.py` asserts about the version string.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tools/hygiene-checks.sh — the mechanical half of the AGENTS.md rules.
+# tools/hygiene-checks.sh — the mechanical half of the CONTRIBUTING.md rules.
 #
 # What:    every repo rule a machine can decide on its own — no live secret and
 #          no intact-placeholder regressions (hard rule 2), loopback-only

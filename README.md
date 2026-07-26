@@ -10,6 +10,7 @@ host as a normal mounted directory at `/mnt/icloud`.
 |---|---|
 | Stand this up on a fresh host | [`SETUP.md`](SETUP.md) — the annotated runbook, with the snags a real machine actually hits |
 | Follow the condensed happy path | [Usage](#usage), below |
+| Contribute or change the code | [`CONTRIBUTING.md`](CONTRIBUTING.md) — required workflow, design constraints, tests, and commit rules |
 | Lint, test or run the code | [Development](#development), below |
 | Exclude folders from sync | [`docs/selective-sync.md`](docs/selective-sync.md) |
 | Fix something that broke | [`SETUP.md` troubleshooting](SETUP.md#troubleshooting-quick-reference) |
@@ -76,6 +77,7 @@ cached until the guest needs the space back.
 ├── docker-compose.yml     # the dockur/windows service definition
 ├── .env.example           # operator-specific values (copy to .env, gitignored)
 ├── SETUP.md               # annotated real-machine runbook + troubleshooting
+├── CONTRIBUTING.md        # canonical rules for contributors and coding agents
 ├── CHANGELOG.md           # shipped improvements, next candidates, ruled-out ideas
 ├── packaging/             # .deb build
 │   ├── build-deb.sh       # stages a tree, dpkg-deb (no debhelper/fakeroot/root)

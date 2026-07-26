@@ -23,10 +23,11 @@ entries below are unchanged by that renumbering; where an older entry named a
 
 Because nothing has shipped, **no entry here is a compatibility promise**. Until
 the first tag, a change is free to break any format, protocol or interface
-outright (`AGENTS.md` hard rule 9); what an entry records is what changed and
-why, plus the operator step — usually re-running `04-bridge-agent.ps1` — that a
-break requires. Preserving the operator's own state (exclusions, credentials,
-the VM disk, the synced files) is a separate and non-negotiable obligation.
+outright (the pre-release policy in `CONTRIBUTING.md`); what an entry records is
+what changed and why, plus the operator step — usually re-running
+`04-bridge-agent.ps1` — that a break requires. Preserving the operator's own
+state (exclusions, credentials, the VM disk, the synced files) is a separate and
+non-negotiable obligation.
 
 ## How to maintain this document
 
@@ -47,7 +48,8 @@ the VM disk, the synced files) is a separate and non-negotiable obligation.
 ## Further improvements
 
 These are ordered by current value. They are not commitments and must preserve
-the security, lifecycle, Files On-Demand, and no-secret contracts in `AGENTS.md`.
+the security, lifecycle, Files On-Demand, and no-secret contracts in
+`CONTRIBUTING.md`.
 
 ### I-001 — Close the live-hardware acceptance matrix
 

@@ -109,7 +109,7 @@ icloud-vm-for-linux/
 ├── docker-compose.yml
 ├── .env                          # operator-specific values (gitignored)
 ├── .env.example
-├── AGENTS.md  (== CLAUDE.md)     # working rules for coding agents
+├── CONTRIBUTING.md               # canonical contributor and coding-agent rules
 ├── README.md                     # overview, usage, selective-sync summary
 ├── SETUP.md                      # annotated real-machine runbook
 ├── CHANGELOG.md                  # improvement + investigation log
@@ -565,7 +565,7 @@ front end over the scripts that already existed rather than a new build system.
 |---|---|---|
 | `make venv` | Creates `.venv` with pytest. PEP 668 forbids `pip install --user` on this class of system and `install-gui.sh` already refuses `--break-system-packages` (v2 plan D18), so a venv is the only correct route | no |
 | `make venv-qt` | Same plus PySide6, for the with-Qt half of the suite | no |
-| `make test` / `test-qt` / `test-all` | Runs `pytest gui/tests` without Qt, with Qt, or both — `AGENTS.md` requires the suite to pass either way, and `test-all` is what actually proves it | no |
+| `make test` / `test-qt` / `test-all` | Runs `pytest gui/tests` without Qt, with Qt, or both — `CONTRIBUTING.md` requires the suite to pass either way, and `test-all` is what actually proves it | no |
 | `make lint` | `bash -n` over every shell script, `sh -n` over the maintainer scripts, `compileall` over the Python, `cmp` of the two `agent.ps1` copies, and `docker compose config`. Prints `SKIP:` for absent optional linters rather than passing silently | no |
 | `make lint-ps` | Fetches PowerShell 7 into `build/pwsh` and runs `packaging/lint-ps1.ps1`: parse check plus a PSScriptAnalyzer pass | no |
 | `make check` | `lint` + `test`; the whole of what a checkout can prove | no |

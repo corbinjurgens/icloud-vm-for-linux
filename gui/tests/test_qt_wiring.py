@@ -9,7 +9,7 @@ thread pool, so they live here.
 Everything expensive or dangerous is faked: `power`, `bridge` and `health` are
 monkeypatched, the modal dialogs are replaced, and no docker, sudo or mount is
 ever touched. The whole file is skipped when PySide6 is absent, which is what
-keeps `AGENTS.md`'s with-and-without-Qt rule satisfiable.
+keeps `CONTRIBUTING.md`'s with-and-without-Qt rule satisfiable.
 """
 
 from __future__ import annotations

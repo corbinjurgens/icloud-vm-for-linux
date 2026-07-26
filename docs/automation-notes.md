@@ -31,7 +31,7 @@ This file is the engineering record ("why it was manual, and how to remove it").
 
 **Net:** everything except #11 (and arguably #12) can be automated. #11 is a hard
 stop by design — 2FA cannot be automated and attempting it risks account lockout
-(explicitly out of scope in `AGENTS.md`).
+(explicitly out of scope in `CONTRIBUTING.md`).
 
 Step 12 got *smaller* between v1 and v2. v1 needed two toggles (iCloud Drive on,
 Files On-Demand **off**) plus a global `attrib +P -U` pin. Live testing on

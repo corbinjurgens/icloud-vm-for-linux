@@ -361,7 +361,7 @@ confirmed action does.
   summary. Both desired-on and desired-off reboot behavior must be documented.
 - `README.md`, `SETUP.md`, and `docs/selective-sync.md` — day-to-day GUI
   lifecycle and updated manual acceptance.
-- `AGENTS.md` — add the helper and `power.py` to the repository layout/rules so
+- `CONTRIBUTING.md` — add the helper and `power.py` to the repository layout/rules so
   later changes preserve the lifecycle contract.
 
 No change is expected in `docker-compose.yml`, `icloud-health.sh`, or the
