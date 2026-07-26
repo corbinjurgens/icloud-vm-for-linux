@@ -517,19 +517,25 @@ C:\OEM\03-create-share.ps1
 definitely worth doing: a container that predates the compose line provably
 cannot have the device, because Docker sets devices only at create time.
 
-The D32 half has **no host-side check**, and the honest state of it is that a
-raw-packet probe was attempted, produced a signing-required reading four times,
-then stopped reproducing entirely — see the 2026-07-26 entry in `CHANGELOG.md`.
-So do not take "your guest requires signing" on faith. Ask the guest itself:
+The D32 half has **no scripted host-side check**, but it does have a real one:
+connect with a genuine SMB client that refuses to sign. On 2026-07-27 the
+author's guest accepted `smbclient --option='client signing=disabled'` sessions
+both before and after a cold boot, which means the server does **not** require
+signing — and retires the raw-packet probe's four "signing required" readings
+(2026-07-26 entry in `CHANGELOG.md`) as the probe's own artifact. The direct
+form of the question is still the guest's to answer:
 
 ```powershell
 Get-SmbServerConfiguration | Select-Object RequireSecuritySignature, EncryptData, RejectUnencryptedAccess
 ```
 
 All three should read `False` (D32: off, deliberately — do not "harden" them).
-If any is `True`, `03-create-share.ps1` sets them. If you want the throughput
-number these two are worth, run `tools/test-smb-read.sh` before and after; it
-needs `SHARE_PASS`, so it is yours to run.
+If any is `True`, `03-create-share.ps1` sets them. Temper the throughput
+expectation: on the author's host the recreate produced **no measurable change**
+in warm 20 MB reads through userland `smbclient` (overlapping distributions,
+medians 653 vs 426 MB/s — see the 2026-07-27 entry in `CHANGELOG.md`). The
+measurement that matters is the kernel-cifs E0 read on large files, which needs
+the real mount.
 
 ## Optional host tuning (measure first, none of this is installed for you)
 

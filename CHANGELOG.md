@@ -81,44 +81,30 @@ into fixes or explicit accepted limitations.
 
 ### I-008 — Apply D33 to the running guest, and re-confirm D32
 
-**Status:** Ready; operator action only, no code  
-**Evidence:** Measured on the author's live host on 2026-07-26. The container had
-been running since 2026-07-25, and commit `26d29ac` — which added
-`/dev/vhost-net` to `docker-compose.yml` for D33 and the signing assertions to
-`03-create-share.ps1` for D32 — landed on 2026-07-26. Neither could reach a
-container or guest that already existed, and **neither was detectable by any
-check in the repository**. The two halves now stand on very different footing:
+**Status:** Done 2026-07-27 (see the shipped entry of that date)  
+**Evidence:** Measured on the author's live host on 2026-07-26; remediated and
+re-measured there on 2026-07-27. The container had been running since
+2026-07-25, and commit `26d29ac` — `/dev/vhost-net` in `docker-compose.yml` for
+D33 and the signing assertions in `03-create-share.ps1` for D32 — could not
+reach a container or guest that already existed, and **neither drift was
+detectable by any check in the repository** until `80947be` taught
+`acceptance-tests.sh` to ask the container and QEMU instead of the host.
 
-- **D33 — confirmed, and re-confirmed after a host restart.** `docker inspect`
-  lists only `/dev/kvm` and `/dev/net/tun`, and the guest QEMU command line
-  carries a plain `tap,...` netdev with no `vhost=on`, so every SMB byte is
-  copied through QEMU's userspace main loop. Docker applies a device list only
-  when it **creates** a container, so restarting — even across a host reboot —
-  provably cannot fix this. Reproduce with `make acceptance`.
-- **D32 — observed, then not reproducible. Treat as unconfirmed.** An
-  unauthenticated SMB2 NEGOTIATE returned security mode `0x0003` (signing
-  required) four consecutive times, then stopped being answered at all, and has
-  not been answered since — including after a cold boot of the guest. The follow-up
-  showed the guest's SMB server is healthy and was correctly rejecting a malformed
-  probe packet; see the withdrawal note in the shipped entry below. Do not spend
-  anything on this until it is re-confirmed **from inside the guest**, where
-  `Get-SmbServerConfiguration` answers it directly and without guesswork.
+How it ended, with the full record in
+[`docs/acceptance-results.md`](docs/acceptance-results.md):
 
-`host/acceptance-tests.sh` tested `[ -e /dev/vhost-net ]`, a *host* fact, and
-printed PASS while the container lacked the device. That gap is now closed (see
-the shipped entry below); the remediation itself is still outstanding.
-
-**What the operator runs**, in this order: power the bridge down through the D29
-helper (never `docker rm`/`docker kill` a live bridge); `docker compose up -d` to
-recreate the container with the device; then re-run `C:\OEM\03-create-share.ps1`
-elevated in the guest. That script is idempotent, so running it settles the D32
-question rather than requiring it to be diagnosed first.
-
-**Completion gate:** `make acceptance` reports the container device and
-`vhost=on` checks green, and a before/after of `tools/test-smb-read.sh` is
-recorded in [`docs/acceptance-results.md`](docs/acceptance-results.md). That
-before/after is the only honest measurement of what D32 and D33 are worth, and it
-needs `SHARE_PASS`, so it is the operator's to run.
+- **D33 applied.** The container was gracefully recreated and `make acceptance`
+  now reports the device and `vhost=on` checks green. The before/after read
+  benchmark showed **no measurable throughput change** at warm-20 MB-read scale
+  through userland `smbclient`; the honest measurement of the data path remains
+  E0's kernel-cifs read, which requires provisioning this guest first.
+- **D32 resolved: signing is not required.** A real SMB client refusing to sign
+  was accepted before the recreate and after a cold boot. The four raw-packet
+  "signing required" readings of 2026-07-26 were the probe's artifact. The
+  in-guest `Get-SmbServerConfiguration` check folds into the next run of
+  `03-create-share.ps1` — which, it turned out, has **never been run on this
+  guest** (only the historical D5 test share exists), so the remaining work is
+  I-001's provisioning runbook, not remediation.
 
 ### I-009 — Reduce the guest agent's per-entry walk cost
 
@@ -237,6 +223,55 @@ Bumping the minor digit is a one-line change; `Makefile` and
 happens after that, never before.
 
 ## Shipped improvements
+
+### 2026-07-27 — I-008 executed live: D33 applied, D32 disproven, and an honest null result
+
+The remediation the 2026-07-26 review left for the operator, executed on the
+live host, with the evidence recorded in
+[`docs/acceptance-results.md`](docs/acceptance-results.md). No repository code
+changed for the remediation itself; what changed is the record, `SETUP.md`'s
+guidance, and what the project now knows.
+
+- **The container was gracefully recreated and now runs `vhost=on`.** The D29
+  power helper has never been installed on this machine (neither have the
+  mounts or units), so the ordered teardown legitimately reduced to
+  `docker compose down`, which honored the 2-minute ACPI grace; Windows shut
+  down and booted cleanly, `RestartCount` stayed 0, and all guest services
+  (SMB, noVNC, RDP) came back. `make acceptance` now passes all three D33
+  checks it failed the day before.
+- **The predicted D33 throughput win did not materialize at the scale that was
+  measurable**: warm 20 MB reads via userland `smbclient` measured median
+  652.6 MB/s before vs 425.6 MB/s after, with widely overlapping distributions
+  — recorded as *no demonstrated change*, not a regression. Transfers that
+  finish in tens of milliseconds are scheduling-noise-bound, `docker-proxy`
+  and `smbclient` sit in the measured path, and the E0 kernel-cifs read of a
+  large file remains the measurement that matters. `SETUP.md` now tempers the
+  expectation instead of promising a number.
+- **D32 is settled, in the opposite direction from the original scare:** the
+  guest **does not require SMB signing**. A real client with
+  `client signing=disabled` was accepted before the recreate and after the
+  cold boot — evidence of a kind the malformed raw-packet probe could never
+  give. `SETUP.md`'s "do not take it on faith" passage now records this and
+  keeps `Get-SmbServerConfiguration` as the in-guest confirmation.
+- **Discovery: this guest was never production-provisioned.** Only the
+  historical D5 `icloudtest` share exists; `03-create-share.ps1` and
+  `04-bridge-agent.ps1` have never run here. The "re-run script 03" framing of
+  I-008 was wrong on this machine — the remaining work is I-001's first-run
+  runbook. This also means the agent — including yesterday's serializer and
+  today's walk rewrite — has still never executed on a real guest.
+- **Post-recreate idle measured 16.2% of one core** (120 s window) with
+  14.5 KiB/s of container writes — both below the 2026-07-26 figures (18.1-
+  18.4%, ~66 KiB/s), unattributed, possibly just the fresh boot. With vhost on,
+  the virtio worker shows up as a `vhost-<pid>` thread row in
+  `tools/vcpu-profile.py` on this kernel, so the profiler keeps seeing the
+  network cost D33 moved out of QEMU's main loop.
+
+**Tried and blocked this session, so it is not retried blind:** the
+`halt_poll_ns=0` benchmark DFR-003 demands needs root to write
+`/sys/module/kvm/parameters/halt_poll_ns`, and this session's passwordless
+sudo covers only `/usr/sbin/ip`. The procedure stays fully documented in
+`SETUP.md`; the ceiling on it re-measured at 4.8-5.5% of one core (the
+kernel column at idle). DFR-003 is unchanged.
 
 ### 2026-07-26 — The agent's walks: 73x less overhead, and a crash found under them
 

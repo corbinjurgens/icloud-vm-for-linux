@@ -91,3 +91,50 @@ Every row starts as `not yet run`. `Result` is one of `not yet run`, `pass`,
 | E13 | | not yet run | |
 | E14 | | not yet run | |
 | E15 | | not yet run | |
+
+## Remediation evidence outside the Phase E matrix
+
+### 2026-07-27 — I-008: D33 applied to the running container; D32 disproven
+
+Executed on the author's live host. The bridge host setup (mounts, units,
+power helper) has never been installed on this machine, so the D29 helper did
+not exist to run; with no CIFS mounts and no units, the ordered teardown
+reduces to stopping the container, done with a graceful `docker compose down`
+(the 2-minute ACPI grace was honored and Windows shut down cleanly).
+
+- **D33 applied.** `docker compose up -d` recreated the container;
+  `docker inspect` now lists `/dev/vhost-net` and the guest QEMU command line
+  carries `vhost=on,vhostfd=…`. `make acceptance` reports all three D33 checks
+  `PASS` (host device, container device, `vhost=on`). The mount/unit/helper
+  checks still `FAIL` because host setup was never installed here — that is
+  I-001 territory, not new drift.
+- **Throughput before/after: no measurable change at this scale.** Method: a
+  20.0 MB already-hydrated file fetched repeatedly by userland `smbclient` in a
+  throwaway container through the loopback published port; per-get rate from
+  `smbclient`; n=12 each. Before (userspace virtio, guest up ~1.5 h at 20.0%
+  idle): median 652.6 MB/s, min 399.6, max 699.3. After (`vhost=on`, guest
+  settled at 16.2%): median 425.6 MB/s, min 167.3, max 753.0. The distributions
+  overlap widely — 20 MB transfers finish in tens of milliseconds and are
+  scheduling-noise-bound — so this records *no demonstrated win*, not a
+  regression. The honest measurement remains E0's kernel-cifs read of a large
+  file, which needs scripts 03/04 to have been run first.
+- **D32 disproven host-side.** A real SMB client with
+  `client signing=disabled` was accepted before the recreate and again after
+  the cold boot. The server therefore does not require signing; the 2026-07-26
+  raw-packet probe's four "signing required" readings were the probe's own
+  artifact. The in-guest `Get-SmbServerConfiguration` confirmation folds into
+  the next provisioning run.
+- **Guest provisioning state discovered en route:** only the historical D5
+  test share exists on this guest. `03-create-share.ps1` (the `icloud` share)
+  and `04-bridge-agent.ps1` (the bridge share and agent) have never been run
+  here, which is consistent with no CIFS mount ever having existed on this
+  host.
+- **Post-recreate idle:** 16.2% of one core over 120 s (67.6% guest / 2.9%
+  QEMU / 29.6% kernel), container writes 14.5 KiB/s — both below the
+  2026-07-26 pre-recreate figures (18.1-18.4%, ~66 KiB/s). Not attributed;
+  could be the reboot rather than the device. With `vhost=on` the virtio
+  worker appears as a `vhost-<pid>` thread row in `tools/vcpu-profile.py`
+  (0.45 core-s during a 60 s 40-read burst), so its cost stays visible to the
+  profiler on this kernel (7.0.0 `vhost_task`).
+- **Not measured:** `CPU_CORES` stayed at the operator's 4 (R-039 predicted no
+  win and `.env` is operator state; changing it was not this session's call).
