@@ -48,10 +48,18 @@ def test_inspect_stopped_variants(word):
     assert status.raw == word
 
 
-def test_inspect_absent_is_not_error():
-    runner = FakeRunner(power.RunResult(1, "", "Error: No such object: icloud-windows"))
-    status = power.inspect_container(runner)
+@pytest.mark.parametrize("stderr", [
+    # Docker <= 28 capitalized both words; 29 lowercases the whole line. Both
+    # must classify as absent, or a first-run host with no container yet is
+    # reported as an inspect error instead of "create the VM first".
+    "Error: No such object: icloud-windows",
+    "error: no such object: icloud-windows",
+    "Error: No such container: icloud-windows",
+])
+def test_inspect_absent_is_not_error(stderr):
+    status = power.inspect_container(FakeRunner(power.RunResult(1, "", stderr)))
     assert status.state == "absent"
+    assert status.detail == stderr
 
 
 def test_inspect_daemon_error():
@@ -120,6 +128,50 @@ def test_plan_error_never_mutates():
     assert plan.detail == "daemon down"
 
 
+# ---------------------------------------------------- in-session lifecycle ---
+
+@pytest.mark.parametrize("container,expected", [
+    ("running", power.ACTION_POWER_OFF),
+    # Definitively exited/created/dead: recoverable in-session.
+    ("stopped", power.ACTION_START),
+    # Never offer to start what we cannot see or cannot classify.
+    ("absent", power.ACTION_NONE),
+    ("error", power.ACTION_NONE),
+    (None, power.ACTION_NONE),
+])
+def test_running_lifecycle_follows_the_docker_classification(container, expected):
+    assert power.available_action(power.LIFECYCLE_RUNNING, container) == expected
+
+
+def test_powered_off_always_offers_start():
+    # Whatever Docker says, this app powered it off and owns the way back.
+    for container in ("stopped", "running", "error", None):
+        assert power.available_action(
+            power.LIFECYCLE_POWERED_OFF, container) == power.ACTION_START
+
+
+def test_start_failed_keeps_retry_wording():
+    assert power.available_action(
+        power.LIFECYCLE_START_FAILED, "running") == power.ACTION_RETRY
+
+
+def test_setup_offers_setup_only_for_a_definitely_absent_container():
+    assert power.available_action(power.LIFECYCLE_SETUP, "absent") == power.ACTION_SETUP
+    assert power.available_action(power.LIFECYCLE_SETUP, "error") == power.ACTION_NONE
+    assert power.available_action(power.LIFECYCLE_SETUP, None) == power.ACTION_NONE
+
+
+def test_transitions_offer_nothing():
+    for lifecycle in (power.LIFECYCLE_STARTING, power.LIFECYCLE_SHUTTING_DOWN):
+        for container in ("running", "stopped", "absent", "error", None):
+            assert power.available_action(lifecycle, container) == power.ACTION_NONE
+
+
+def test_an_unrecognized_docker_state_never_enables_a_mutating_action():
+    """`inspect_container` reports unknown words as `error`; belt and braces."""
+    assert power.available_action(power.LIFECYCLE_RUNNING, "removing") == power.ACTION_NONE
+
+
 # ------------------------------------------------------------ helper calls ---
 
 def test_power_on_exact_argv():
@@ -163,3 +215,44 @@ def test_helper_timeout():
     result = power.power_off(FakeRunner(raises=TimeoutError()), timeout=130)
     assert result.success is False
     assert "Timed out" in result.message
+
+
+# ------------------------------------------------------- the real adapters ---
+# The injected fake runners above prove the decision logic but say nothing about
+# what the *default* adapters actually hand to subprocess. These exercise them
+# for real, using `env` as the observable output so no Docker daemon is needed.
+
+def _print_env(name: str) -> list[str]:
+    return [sys.executable, "-c",
+            f"import os,sys; sys.stdout.write(os.environ.get({name!r}, '<unset>'))"]
+
+
+def test_docker_runner_pins_socket_and_keeps_the_environment(monkeypatch):
+    monkeypatch.setenv("ICLOUD_TEST_SENTINEL", "kept")
+    monkeypatch.setenv("DOCKER_HOST", "unix:///home/alice/.docker/desktop/docker.sock")
+
+    pinned = power.docker_runner(_print_env("DOCKER_HOST"), 30)
+    assert pinned.stdout == power.DOCKER_SOCKET
+
+    # A copy with one override — not a replacement: the CLI still needs HOME,
+    # PATH and any proxy settings it was launched with.
+    sentinel = power.docker_runner(_print_env("ICLOUD_TEST_SENTINEL"), 30)
+    assert sentinel.stdout == "kept"
+
+
+def test_default_runner_leaves_docker_host_alone(monkeypatch):
+    """`sudo` and other helpers must not inherit the Docker override."""
+    monkeypatch.setenv("DOCKER_HOST", "unix:///home/alice/.docker/desktop/docker.sock")
+    result = power.default_runner(_print_env("DOCKER_HOST"), 30)
+    assert result.stdout == "unix:///home/alice/.docker/desktop/docker.sock"
+
+
+def test_docker_env_does_not_mutate_the_process_environment(monkeypatch):
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    assert power.docker_env()["DOCKER_HOST"] == power.DOCKER_SOCKET
+    assert "DOCKER_HOST" not in os.environ
+
+
+def test_default_runner_normalizes_a_timeout():
+    with pytest.raises(TimeoutError):
+        power.default_runner([sys.executable, "-c", "import time; time.sleep(5)"], 0.2)

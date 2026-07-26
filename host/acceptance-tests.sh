@@ -30,6 +30,15 @@ echo "== 2. Container running =="
 docker inspect -f '{{.State.Running}}' icloud-windows 2>/dev/null | grep -q true \
   && ok "icloud-windows running" || bad "icloud-windows not running"
 
+# The compose file passes /dev/vhost-net so QEMU runs the virtio NIC with
+# vhost=on (v2 plan D33). Without the node the container cannot start at all,
+# so this reports the cause rather than leaving a bare "not running" above.
+if [ -e /dev/vhost-net ]; then
+  ok "/dev/vhost-net present (accelerated virtio networking)"
+else
+  bad "/dev/vhost-net missing — run host/setup-prereqs.sh (modprobe vhost_net)"
+fi
+
 echo "== 3. Published ports answer only on 127.0.0.1 =="
 for p in 8006 3389 10445; do
   lines=$(ss -tlnH "sport = :$p" 2>/dev/null)

@@ -8,18 +8,19 @@ mount can block even a ``stat``.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QPalette
 from PySide6.QtWidgets import (
-    QAbstractItemView, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
-    QPushButton, QSizePolicy, QTabWidget, QTreeWidget, QTreeWidgetItem,
-    QTreeWidgetItemIterator, QVBoxLayout, QWidget,
+    QAbstractItemView, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QMessageBox, QPushButton, QSizePolicy, QTabWidget, QTreeWidget,
+    QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget,
 )
 
-from . import bridge, health
+from . import __version__, bridge, filtering, firstrun, health, listing, power, sizes
 from .tray import VM_VIEWER_URL, open_externally
 
 ROLE_PATH = Qt.ItemDataRole.UserRole
@@ -32,6 +33,14 @@ LIST_TIMEOUT_SECONDS = 15
 LIST_PAGE = 1000
 
 DOT_COLORS = {health.GREEN: "#2e9e4f", health.YELLOW: "#d99b1a", health.RED: "#c8402c"}
+#: Underlined and coloured, so a "Load more…" row reads as something to click.
+LINK_COLOR = "#1a5fb4"
+#: Setup-check dots. A warning is not a blocker, and must not look like one.
+SETUP_COLORS = {
+    firstrun.OK: DOT_COLORS[health.GREEN],
+    firstrun.WARN: DOT_COLORS[health.YELLOW],
+    firstrun.FAIL: DOT_COLORS[health.RED],
+}
 
 EXCLUDE_WARNING = (
     "These items will disappear from /mnt/icloud on this computer. Windows will "
@@ -63,6 +72,15 @@ class MainWindow(QMainWindow):
     #: Emitted by the in-window "Retry start" button after a failed power-on (the
     #: no-tray equivalent of the tray's Retry action).
     retry_start_requested = Signal()
+    #: D30: the same two lifecycle actions the tray offers, for a no-tray session
+    #: and for anyone who has the window open anyway.
+    power_off_requested = Signal()
+    start_requested = Signal()
+    #: D31 first-run assistant.
+    setup_recheck_requested = Signal()
+    create_vm_requested = Signal()
+    connect_requested = Signal()
+    env_file_selected = Signal(str)
 
     def __init__(self, run_async: Callable[..., None]) -> None:
         super().__init__()
@@ -92,9 +110,25 @@ class MainWindow(QMainWindow):
         self._last_written_revision: int | None = None
         self._last_write_at: datetime | None = None
         self._items_by_path: dict[str, QTreeWidgetItem] = {}
-        self._pending_requests: dict[str, dict] = {}
+        #: Per-folder idle/loading/loaded state and the in-flight list requests;
+        #: a Qt-free model so the failure/retry cases are testable.
+        self._requests = listing.FolderRequests()
+        #: Sizes of files listed during this session, keyed by lowercase path.
+        #: tree.json carries recursive sizes for folders only, so this is the
+        #: only size source for an excluded *file* (item 7).
+        self._file_sizes: dict[str, Any] = {}
+        #: Recursive folder sizes harvested from tree.json, same keying.
+        self._folder_sizes: dict[str, Any] = {}
         self._polls_in_flight: set[str] = set()
         self._suppress_item_signals = False
+        #: Set while the code (not the user) expands items, so filter-driven
+        #: expansion never fires a listing request.
+        self._suppress_expansion = False
+        #: The operator's own expanded/collapsed state, saved when a filter
+        #: starts rearranging the tree and restored when it is cleared.
+        self._pre_filter_expanded: set[str] | None = None
+        self._power_action = power.ACTION_NONE
+        self._env_path = ""
         self._tree_generated_at: str | None = None
 
         central = QWidget()
@@ -109,9 +143,25 @@ class MainWindow(QMainWindow):
         self._banner.hide()
         central_layout.addWidget(self._banner)
 
+        # Health incident notices for a session with no tray to notify through.
+        # Separate from the banner on purpose: a lifecycle message ("shutdown
+        # aborted, a file is in use") must not be overwritten by the next health
+        # snapshot, nor the other way round.
+        self._notice = QLabel("")
+        self._notice.setWordWrap(True)
+        self._notice.setContentsMargins(10, 6, 10, 6)
+        self._notice.setStyleSheet(f"color: {DOT_COLORS[health.RED]};")
+        self._notice.hide()
+        central_layout.addWidget(self._notice)
+
         self._tabs = QTabWidget()
         self._tabs.addTab(self._build_status_tab(), "Status")
-        self._tabs.addTab(self._build_sync_tab(), "Selective Sync")
+        self._sync_page = self._build_sync_tab()
+        self._tabs.addTab(self._sync_page, "Selective Sync")
+        # The Setup tab exists only while the bridge is not provisioned; it is
+        # inserted in front of the others so it cannot be missed, and removed
+        # again once the bridge is running (D31).
+        self._setup_page = self._build_setup_tab()
         central_layout.addWidget(self._tabs, 1)
         self.setCentralWidget(central)
 
@@ -119,6 +169,152 @@ class MainWindow(QMainWindow):
         self._poll_timer.setInterval(1000)
         self._poll_timer.timeout.connect(self._poll_pending)
         self._poll_timer.start()
+
+    # ------------------------------------------------------------- setup tab --
+
+    def _build_setup_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        self._setup_title = QLabel("Setup required")
+        font = self._setup_title.font()
+        font.setBold(True)
+        self._setup_title.setFont(font)
+        layout.addWidget(self._setup_title)
+
+        self._setup_intro = QLabel("")
+        self._setup_intro.setWordWrap(True)
+        layout.addWidget(self._setup_intro)
+
+        # Which copy of the compose file and provisioning scripts is in play —
+        # shown because it is resolved from the installation, never from the
+        # working directory, and the operator should not have to guess (D31).
+        self._setup_paths = QLabel("")
+        self._setup_paths.setWordWrap(True)
+        self._setup_paths.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._setup_paths.setEnabled(False)
+        layout.addWidget(self._setup_paths)
+
+        env_row = QHBoxLayout()
+        self._env_label = QLabel("Configuration file: (none selected)")
+        self._env_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        env_row.addWidget(self._env_label, 1)
+        self._env_button = QPushButton("Choose .env file…")
+        self._env_button.clicked.connect(self._choose_env_file)
+        env_row.addWidget(self._env_button)
+        layout.addLayout(env_row)
+
+        self._setup_checks = QWidget()
+        self._setup_checks_layout = QVBoxLayout(self._setup_checks)
+        self._setup_checks_layout.setContentsMargins(0, 0, 0, 0)
+        self._setup_checks_layout.setSpacing(4)
+        layout.addWidget(self._setup_checks)
+
+        self._setup_detail = QLabel("")
+        self._setup_detail.setWordWrap(True)
+        self._setup_detail.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._setup_detail.hide()
+        layout.addWidget(self._setup_detail)
+
+        layout.addStretch(1)
+
+        buttons = QHBoxLayout()
+        self._setup_recheck = QPushButton("Re-check")
+        self._setup_recheck.clicked.connect(self.setup_recheck_requested.emit)
+        buttons.addWidget(self._setup_recheck)
+        self._setup_create = QPushButton("Create Windows VM")
+        self._setup_create.clicked.connect(self.create_vm_requested.emit)
+        self._setup_create.setEnabled(False)
+        buttons.addWidget(self._setup_create)
+        setup_vm = QPushButton("Open VM screen")
+        setup_vm.clicked.connect(lambda: open_externally(VM_VIEWER_URL))
+        buttons.addWidget(setup_vm)
+        self._setup_connect = QPushButton("Check setup and connect")
+        self._setup_connect.clicked.connect(self.connect_requested.emit)
+        self._setup_connect.hide()
+        buttons.addWidget(self._setup_connect)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+        return page
+
+    def _choose_env_file(self) -> None:
+        start = os.path.dirname(self._env_path) if self._env_path else os.path.expanduser("~")
+        chosen, _filter = QFileDialog.getOpenFileName(
+            self, "Choose the .env file", start, "Environment files (.env *.env);;All files (*)")
+        if chosen:
+            self.env_file_selected.emit(chosen)
+
+    def show_setup_tab(self) -> None:
+        """Put the assistant in front; the other tabs stay but are disabled."""
+        if self._tabs.indexOf(self._setup_page) < 0:
+            self._tabs.insertTab(0, self._setup_page, "Setup")
+        self._tabs.setCurrentWidget(self._setup_page)
+
+    def hide_setup_tab(self) -> None:
+        index = self._tabs.indexOf(self._setup_page)
+        if index >= 0:
+            self._tabs.removeTab(index)
+
+    def update_setup(self, *, title: str, intro: str, checks, paths: str,
+                     env_path: str, can_create: bool, show_connect: bool,
+                     detail: str = "", busy: bool = False) -> None:
+        """Render one assistant state.  Pure presentation of firstrun's answers."""
+        self._env_path = env_path
+        self._setup_title.setText(title)
+        self._setup_intro.setText(intro)
+        self._setup_paths.setText(paths)
+        self._env_label.setText(f"Configuration file: {env_path or '(none selected)'}")
+        self._setup_create.setEnabled(can_create and not busy)
+        self._setup_recheck.setEnabled(not busy)
+        self._setup_connect.setVisible(show_connect)
+        self._setup_connect.setEnabled(not busy)
+        self._env_button.setEnabled(not busy)
+        if detail:
+            self._setup_detail.setText(detail)
+            self._setup_detail.show()
+        else:
+            self._setup_detail.hide()
+
+        while self._setup_checks_layout.count():
+            item = self._setup_checks_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        for check in checks:
+            self._setup_checks_layout.addWidget(self._build_check_row(check))
+
+    def _build_check_row(self, check) -> QWidget:
+        row = QWidget()
+        row_layout = QVBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(1)
+        head = QHBoxLayout()
+        dot = QLabel("●")
+        dot.setFixedWidth(16)
+        dot.setStyleSheet(f"color: {SETUP_COLORS.get(check.status, DOT_COLORS[health.RED])};")
+        name = QLabel(check.name)
+        name.setMinimumWidth(170)
+        name.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        detail = QLabel(check.detail)
+        detail.setWordWrap(True)
+        detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        head.addWidget(dot)
+        head.addWidget(name)
+        head.addWidget(detail, 1)
+        row_layout.addLayout(head)
+        if check.command and check.status != firstrun.OK:
+            command = QLabel(check.command)
+            command.setContentsMargins(16, 0, 0, 0)
+            command.setStyleSheet("font-family: monospace;")
+            command.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse)
+            command.setToolTip("Run this yourself in a terminal — the GUI never "
+                               "installs packages or runs sudo commands for you")
+            row_layout.addWidget(command)
+        return row
 
     # ------------------------------------------------------------ status tab --
 
@@ -160,13 +356,22 @@ class MainWindow(QMainWindow):
         refresh.clicked.connect(self.request_refresh)
         for button in (open_files, open_vm, refresh):
             buttons.addWidget(button)
-        # Shown only after a failed power-on; the controller wires it to Retry.
-        self._retry_button = QPushButton("Retry start")
-        self._retry_button.clicked.connect(self.retry_start_requested.emit)
-        self._retry_button.hide()
-        buttons.addWidget(self._retry_button)
+        # One lifecycle button, whose meaning the controller sets from the D30
+        # state machine: Retry start, Power off bridge, or Start bridge. Hidden
+        # whenever no mutating action is safe.
+        self._power_button = QPushButton("Retry start")
+        self._power_button.clicked.connect(self._on_power_button)
+        self._power_button.hide()
+        buttons.addWidget(self._power_button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
+
+        # Selectable so a bug report can carry the exact build; the same string
+        # `icloud-bridge-gui --version` prints.
+        version = QLabel(f"Version {__version__}")
+        version.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        version.setEnabled(False)
+        layout.addWidget(version)
         return page
 
     def _ensure_check_row(self, name: str) -> tuple[QLabel, QLabel]:
@@ -203,6 +408,35 @@ class MainWindow(QMainWindow):
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
+        # An honest total, updated on every selection/status/tree change. Never
+        # phrased as space saved: sizes are logical and dehydration is
+        # asynchronous (item 7).
+        self._summary_label = QLabel("")
+        self._summary_label.setWordWrap(True)
+        layout.addWidget(self._summary_label)
+        summary_note = QLabel(
+            "Excluded items are hidden from Linux and requested online-only. "
+            "Sizes are logical content size, not space already freed — the "
+            "Status tab reports reclamation separately.")
+        summary_note.setWordWrap(True)
+        summary_note.setEnabled(False)
+        layout.addWidget(summary_note)
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Filter:"))
+        self._filter_edit = QLineEdit()
+        self._filter_edit.setPlaceholderText("folder name or path")
+        self._filter_edit.setClearButtonEnabled(True)
+        self._filter_edit.textChanged.connect(self._apply_filter)
+        filter_row.addWidget(self._filter_edit, 1)
+        layout.addLayout(filter_row)
+        self._filter_note = QLabel(
+            "Searches the folder list plus files already loaded in this session.")
+        self._filter_note.setWordWrap(True)
+        self._filter_note.setEnabled(False)
+        self._filter_note.hide()
+        layout.addWidget(self._filter_note)
+
         self._sync_error = QLabel("")
         self._sync_error.setWordWrap(True)
         self._sync_error.setStyleSheet(f"color: {DOT_COLORS[health.RED]};")
@@ -216,7 +450,11 @@ class MainWindow(QMainWindow):
         self._tree_widget.setUniformRowHeights(True)
         self._tree_widget.itemChanged.connect(self._on_item_changed)
         self._tree_widget.itemExpanded.connect(self._on_item_expanded)
-        self._tree_widget.itemDoubleClicked.connect(self._on_item_double_clicked)
+        # "Load more…" responds to a single click, Enter/Space, and a double
+        # click alike; the handler is idempotent because one gesture can emit
+        # more than one of these.
+        self._tree_widget.itemClicked.connect(self._on_item_activated)
+        self._tree_widget.itemActivated.connect(self._on_item_activated)
         self._tree_widget.itemSelectionChanged.connect(self._update_buttons)
         layout.addWidget(self._tree_widget, 1)
 
@@ -251,8 +489,10 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------- lifecycle gating --
 
     BANNER_STYLES = {
-        "starting": f"background: #e7f0fb; color: #1a3a63;",
-        "shutdown": f"background: #e7f0fb; color: #1a3a63;",
+        "starting": "background: #e7f0fb; color: #1a3a63;",
+        "shutdown": "background: #e7f0fb; color: #1a3a63;",
+        # Neutral grey: an intentional off state is not an error (D30).
+        "off": "background: #ececec; color: #3a3a3a;",
         "error": f"background: #fbecea; color: {DOT_COLORS[health.RED]};",
     }
 
@@ -265,8 +505,58 @@ class MainWindow(QMainWindow):
     def hide_banner(self) -> None:
         self._banner.hide()
 
-    def show_retry_start(self, visible: bool) -> None:
-        self._retry_button.setVisible(visible)
+    def show_notice(self, text: str) -> None:
+        """The window's stand-in for a desktop notification (no tray)."""
+        self._notice.setText(text)
+        self._notice.show()
+
+    def hide_notice(self) -> None:
+        self._notice.hide()
+
+    #: Button text per D30 action. ``power.ACTION_SETUP`` has no button here —
+    #: first-run guidance is a banner, not a one-click action.
+    POWER_BUTTON_TEXT = {
+        power.ACTION_RETRY: "Retry start",
+        power.ACTION_POWER_OFF: "Power off bridge",
+        power.ACTION_START: "Start bridge",
+    }
+
+    def set_power_action(self, action: str) -> None:
+        """Show the one lifecycle action the current state allows (D30)."""
+        self._power_action = action
+        text = self.POWER_BUTTON_TEXT.get(action)
+        if text is None:
+            self._power_button.hide()
+            return
+        self._power_button.setText(text)
+        self._power_button.setToolTip(
+            "Unmount both shares and power off the Windows VM. This app keeps running."
+            if action == power.ACTION_POWER_OFF else "")
+        self._power_button.show()
+
+    def _on_power_button(self) -> None:
+        if self._power_action == power.ACTION_POWER_OFF:
+            self.power_off_requested.emit()
+        elif self._power_action == power.ACTION_START:
+            self.start_requested.emit()
+        elif self._power_action == power.ACTION_RETRY:
+            self.retry_start_requested.emit()
+
+    def clear_health_rows(self) -> None:
+        """Blank the health rows when they stop describing anything real.
+
+        An intentionally powered-off bridge must not leave the last snapshot on
+        screen: those green/red dots would describe a machine that no longer
+        exists (D30).
+        """
+        self._checks = []
+        self._status = None
+        for dot, detail in self._check_widgets.values():
+            dot.setStyleSheet("color: palette(mid);")
+            detail.setText("-")
+        self._disk_label.setText("Guest disk: -")
+        self._local_label.setText("Fully local content: -")
+        self._scan_label.setText("Last full scan: -")
 
     def set_bridge_controls_enabled(self, enabled: bool) -> None:
         """Enable/disable everything that reads or writes the bridge/mount.
@@ -274,7 +564,9 @@ class MainWindow(QMainWindow):
         The Selective Sync tab and the "Open iCloud folder" button touch CIFS;
         the "Open VM screen" button does not and stays available for diagnosis.
         """
-        self._tabs.setTabEnabled(1, enabled)
+        index = self._tabs.indexOf(self._sync_page)
+        if index >= 0:
+            self._tabs.setTabEnabled(index, enabled)
         if hasattr(self, "_open_files_button"):
             self._open_files_button.setEnabled(enabled)
 
@@ -294,7 +586,7 @@ class MainWindow(QMainWindow):
         """
         self.set_io_paused(True)
         self._poll_timer.stop()
-        self._pending_requests.clear()
+        self._requests.reset()
 
     def resume(self) -> None:
         """Undo :meth:`quiesce` after an aborted shutdown."""
@@ -344,6 +636,8 @@ class MainWindow(QMainWindow):
                 self.reload_selective_sync()
         else:
             self._refresh_state_column()
+        # status.json can supply the last applied size for a configured root.
+        self._update_excluded_summary()
 
     # -------------------------------------------------- selective-sync loading --
 
@@ -373,9 +667,13 @@ class MainWindow(QMainWindow):
         self._run_async(work, done, failed)
 
     def _rebuild_tree(self) -> None:
-        self._pending_requests.clear()
+        # A new tree generation: every folder is idle again and any answer still
+        # in flight from the previous tree is discarded rather than applied.
+        self._requests.reset()
         self._polls_in_flight.clear()
         self._items_by_path.clear()
+        self._file_sizes.clear()
+        self._folder_sizes.clear()
         self._suppress_item_signals = True
         try:
             self._tree_widget.clear()
@@ -408,6 +706,12 @@ class MainWindow(QMainWindow):
         self._refresh_check_states()
         self._refresh_state_column()
         self._update_buttons()
+        self._update_excluded_summary()
+        self._update_excluded_summary()
+        # A rebuild replaces every row, so a filter typed before it must be
+        # re-applied against the new ones.
+        self._pre_filter_expanded = None
+        self._apply_filter()
 
     def _add_dir_item(self, parent: QTreeWidgetItem, node: Any) -> None:
         if not isinstance(node, dict):
@@ -425,6 +729,7 @@ class MainWindow(QMainWindow):
         item.setData(0, ROLE_PATH, path)
         item.setData(0, ROLE_KIND, "dir")
         self._items_by_path[path.lower()] = item
+        self._folder_sizes[path.lower()] = node.get("logicalBytes")
         for child in node.get("dirs") or []:
             self._add_dir_item(item, child)
         if not item.childCount():
@@ -452,6 +757,112 @@ class MainWindow(QMainWindow):
             child.setData(0, ROLE_KIND, "missing")
             child.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
         group.setExpanded(True)
+
+    # ---------------------------------------------------------------- filter --
+
+    def _filterable_paths(self) -> list[str]:
+        """Every row a filter can match: folders, loaded files, missing items."""
+        paths = []
+        for item in self._iter_items():
+            if item.data(0, ROLE_KIND) in ("dir", "file", "missing"):
+                path = item.data(0, ROLE_PATH)
+                if isinstance(path, str) and path:
+                    paths.append(path)
+        return paths
+
+    def _capture_expansion(self) -> set[str]:
+        expanded = set()
+        for item in self._iter_items():
+            if item.isExpanded():
+                path = item.data(0, ROLE_PATH)
+                if isinstance(path, str):
+                    expanded.add(filtering.normalize(path))
+        return expanded
+
+    def _apply_filter(self, _text: str | None = None) -> None:
+        """Show only matching rows and their ancestors; never change selection.
+
+        This is presentation only: ``_wanted``, the check states and the
+        in-memory tree are untouched, so clearing the filter restores exactly
+        what was there — including which folders the operator had open.
+        """
+        query = self._filter_edit.text()
+        visible = filtering.visible_paths(query, self._filterable_paths())
+
+        # Expanding ancestors to reveal a match must not be read as the operator
+        # opening a folder, or every visible folder would fire a list request.
+        self._suppress_expansion = True
+        try:
+            if visible is None:
+                self._filter_note.hide()
+                for item in self._iter_items():
+                    item.setHidden(False)
+                if self._pre_filter_expanded is not None:
+                    for item in self._iter_items():
+                        path = item.data(0, ROLE_PATH)
+                        if isinstance(path, str):
+                            item.setExpanded(
+                                filtering.normalize(path) in self._pre_filter_expanded)
+                    self._pre_filter_expanded = None
+                return
+
+            if self._pre_filter_expanded is None:
+                self._pre_filter_expanded = self._capture_expansion()
+
+            for item in self._iter_items():
+                kind = item.data(0, ROLE_KIND)
+                if kind == "root":
+                    item.setHidden(False)
+                    item.setExpanded(True)
+                    continue
+                if kind in ("missing-group", "more"):
+                    continue        # handled below / follows its parent
+                path = item.data(0, ROLE_PATH)
+                shown = isinstance(path, str) and filtering.normalize(path) in visible
+                item.setHidden(not shown)
+                if shown and kind == "dir":
+                    item.setExpanded(True)
+            self._hide_empty_groups()
+            self._filter_note.setText(
+                "No folders or loaded files match this filter."
+                if not visible else
+                "Searching the folder list plus files already loaded in this session.")
+            self._filter_note.show()
+        finally:
+            self._suppress_expansion = False
+
+    def _hide_empty_groups(self) -> None:
+        """Group rows (Missing configured items, Load more…) follow their children."""
+        for index in range(self._tree_widget.topLevelItemCount()):
+            group = self._tree_widget.topLevelItem(index)
+            if group.data(0, ROLE_KIND) != "missing-group":
+                continue
+            any_visible = any(not group.child(i).isHidden()
+                              for i in range(group.childCount()))
+            group.setHidden(not any_visible)
+        for item in self._iter_items():
+            if item.data(0, ROLE_KIND) == "more":
+                parent = item.parent()
+                item.setHidden(parent is not None and parent.isHidden())
+
+    # --------------------------------------------------------- size summary --
+
+    def _update_excluded_summary(self) -> None:
+        """Restate how much is excluded, from whatever sources currently know."""
+        status_sizes = {}
+        entries = (self._status or {}).get("exclusions")
+        if isinstance(entries, list):
+            for entry in entries:
+                if isinstance(entry, dict) and isinstance(entry.get("path"), str):
+                    status_sizes[entry["path"].lower()] = entry.get("logicalBytes")
+        summary = sizes.summarize(
+            self._wanted,
+            folder_sizes=self._folder_sizes,
+            file_sizes=self._file_sizes,
+            status_sizes=status_sizes,
+            configured=self._loaded_wanted,
+        )
+        self._summary_label.setText(summary.text())
 
     # ------------------------------------------------------------ check state --
 
@@ -587,60 +998,116 @@ class MainWindow(QMainWindow):
         self._refresh_check_states()
         self._refresh_state_column()
         self._update_buttons()
+        self._update_excluded_summary()
 
     def _on_item_expanded(self, item: QTreeWidgetItem) -> None:
+        if self._suppress_expansion:
+            return          # a filter expanded this, not the user
         kind = item.data(0, ROLE_KIND)
         if kind not in ("dir", "root"):
-            return
-        if item.data(0, ROLE_EXTRA) == "files-loaded":
             return
         path = item.data(0, ROLE_PATH) or ""
         if bridge.is_under(path, self._wanted) and path:
             return   # the whole subtree is excluded; tree.json does not recurse there
-        item.setData(0, ROLE_EXTRA, "files-loaded")
-        self._request_files(path, 0)
+        # idle -> loading. A folder already loading or loaded is left alone, so
+        # collapsing and re-expanding cannot queue a duplicate request; a folder
+        # that failed is back at idle, so the same gesture retries it.
+        if not self._requests.begin_first_page(path):
+            return
+        self._request_files(path, 0, listing.FIRST_PAGE)
 
-    def _on_item_double_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+    def _on_item_activated(self, item: QTreeWidgetItem, _column: int) -> None:
+        """Activate a **Load more…** row (single click, Enter, or double click).
+
+        Qt can emit both ``itemClicked`` and ``itemActivated`` for one gesture,
+        so this must be idempotent: the row is consumed on the first call and
+        the second finds nothing to do.
+        """
         if item.data(0, ROLE_KIND) != "more":
             return
-        extra = item.data(0, ROLE_EXTRA) or {}
-        parent = item.parent()
-        if parent is not None:
-            parent.removeChild(item)
-        self._request_files(extra.get("path", ""), int(extra.get("offset", 0)))
+        extra = item.data(0, ROLE_EXTRA)
+        if not isinstance(extra, dict):
+            return          # already consumed, or already in flight
+        # Consume the row's payload and show it as busy rather than removing it:
+        # if the request fails the same offset is restored in place.
+        item.setData(0, ROLE_EXTRA, None)
+        item.setText(COL_NAME, "Loading…")
+        item.setDisabled(True)
+        self._request_files(extra.get("path", ""), int(extra.get("offset", 0)),
+                            listing.MORE)
 
-    def _request_files(self, path: str, offset: int) -> None:
-        if self._io_paused:
+    def _more_row(self, parent: QTreeWidgetItem, path: str, offset: int) -> None:
+        """Add (or restore) the continuation row under ``parent``."""
+        more = QTreeWidgetItem(parent, ["Load more…", "", "", "", ""])
+        more.setData(0, ROLE_KIND, "more")
+        more.setData(0, ROLE_EXTRA, {"path": path, "offset": offset})
+        more.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        # Link-like, so it reads as something to click rather than a file named
+        # "Load more…"; one click or a keyboard activation is enough.
+        font = more.font(COL_NAME)
+        font.setUnderline(True)
+        more.setFont(COL_NAME, font)
+        more.setForeground(COL_NAME, QBrush(QColor(LINK_COLOR)))
+
+    def _restore_more_row(self, request: listing.PendingRequest) -> None:
+        """Put a failed continuation back at its original offset so it can retry."""
+        parent = self._items_by_path.get((request.path or "").lower())
+        if parent is None:
             return
+        self._suppress_item_signals = True
+        try:
+            for index in range(parent.childCount()):
+                child = parent.child(index)
+                if child.data(0, ROLE_KIND) == "more":
+                    parent.removeChild(child)
+                    break
+            self._more_row(parent, request.path, request.offset)
+        finally:
+            self._suppress_item_signals = False
+
+    def _request_files(self, path: str, offset: int, kind: str) -> None:
+        if self._io_paused:
+            # Nothing was dispatched, so leave no state claiming otherwise.
+            self._on_request_dropped(path, offset, kind)
+            return
+
         def work():
             return bridge.request_listing(path, offset=offset, limit=LIST_PAGE)
 
         def done(request_id: str):
-            self._pending_requests[request_id] = {
-                "path": path,
-                "offset": offset,
-                "deadline": datetime.now(timezone.utc).timestamp() + LIST_TIMEOUT_SECONDS,
-            }
+            self._requests.dispatched(
+                request_id, path, offset, kind,
+                datetime.now(timezone.utc).timestamp() + LIST_TIMEOUT_SECONDS)
 
         def failed(message: str):
+            self._on_request_dropped(path, offset, kind)
             self._sync_error.setText(f"Cannot ask the guest agent for a file listing: {message}")
             self._sync_error.show()
 
         self._run_async(work, done, failed)
 
+    def _on_request_dropped(self, path: str, offset: int, kind: str) -> None:
+        """A request that never reached the bridge: undo the UI it claimed."""
+        if kind == listing.FIRST_PAGE:
+            self._requests.release(path)
+            return
+        parent = self._items_by_path.get((path or "").lower())
+        if parent is not None:
+            self._restore_more_row(
+                listing.PendingRequest("", path, offset, kind,
+                                       self._requests.generation, 0.0))
+
     def _poll_pending(self) -> None:
         if self._io_paused:
             return
         now = datetime.now(timezone.utc).timestamp()
-        for request_id, info in list(self._pending_requests.items()):
+        for expired in self._requests.expired(now):
+            self._fail_request(expired.request_id,
+                               "Guest agent not responding to file-listing requests.")
+            self._run_async(lambda rid=expired.request_id: bridge.cancel_request(rid),
+                            lambda _r: None, lambda _m: None)
+        for request_id in self._requests.pending_ids():
             if request_id in self._polls_in_flight:
-                continue
-            if now > info["deadline"]:
-                del self._pending_requests[request_id]
-                self._sync_error.setText("Guest agent not responding to file-listing requests.")
-                self._sync_error.show()
-                self._run_async(lambda rid=request_id: bridge.cancel_request(rid), lambda _r: None,
-                                lambda _m: None)
                 continue
             self._polls_in_flight.add(request_id)
             self._run_async(
@@ -649,27 +1116,51 @@ class MainWindow(QMainWindow):
                 lambda message, rid=request_id: self._on_response_failed(rid, message),
             )
 
+    def _fail_request(self, request_id: str, message: str) -> None:
+        """Common failure path: back to idle, or restore the continuation row."""
+        request = self._requests.fail(request_id)
+        self._sync_error.setText(message)
+        self._sync_error.show()
+        if request is not None and not request.is_first_page:
+            self._restore_more_row(request)
+
     def _on_response_failed(self, request_id: str, message: str) -> None:
         self._polls_in_flight.discard(request_id)
-        self._pending_requests.pop(request_id, None)
-        self._sync_error.setText(f"Bad reply from the guest agent: {message}")
-        self._sync_error.show()
+        self._fail_request(request_id, f"Bad reply from the guest agent: {message}")
 
     def _on_response(self, payload) -> None:
         request_id, response = payload
         self._polls_in_flight.discard(request_id)
         if response is None:
-            return
-        info = self._pending_requests.pop(request_id, None)
-        if info is None:
-            return
-        parent = self._items_by_path.get((info["path"] or "").lower())
+            return          # not answered yet; the request stays pending
+        request = self._requests.take(request_id)
+        if request is None:
+            return          # unknown, or answered after a Reload rebuilt the tree
+        parent = self._items_by_path.get((request.path or "").lower())
         if parent is None:
+            if request.is_first_page:
+                self._requests.release(request.path)
             return
         error = response.get("error")
         if isinstance(error, str) and error:
-            self._sync_error.setText(f"{info['path'] or 'iCloud Drive'}: {error}")
+            # A guest-side error leaves the folder retryable rather than
+            # permanently empty.
+            if request.is_first_page:
+                self._requests.release(request.path)
+            else:
+                self._restore_more_row(request)
+            self._sync_error.setText(f"{request.path or 'iCloud Drive'}: {error}")
             self._sync_error.show()
+            return
+        files = response.get("files")
+        if files is not None and not isinstance(files, list):
+            self._fail_request(
+                request_id,
+                f"{request.path or 'iCloud Drive'}: malformed file listing from the guest agent.")
+            if request.is_first_page:
+                self._requests.release(request.path)
+            elif request.offset:
+                self._restore_more_row(request)
             return
         # A successful listing must not clear the config-error banner: it
         # explains why Apply is disabled (fail closed) until reload succeeds.
@@ -678,7 +1169,14 @@ class MainWindow(QMainWindow):
 
         self._suppress_item_signals = True
         try:
-            for entry in response.get("files") or []:
+            # The continuation row (now showing "Loading…") is replaced by the
+            # page it fetched, plus a fresh row if there is still more.
+            for index in range(parent.childCount()):
+                child = parent.child(index)
+                if child.data(0, ROLE_KIND) == "more":
+                    parent.removeChild(child)
+                    break
+            for entry in files or []:
                 if not isinstance(entry, dict):
                     continue
                 name = entry.get("name")
@@ -694,16 +1192,19 @@ class MainWindow(QMainWindow):
                 ])
                 item.setData(0, ROLE_PATH, path)
                 item.setData(0, ROLE_KIND, "file")
+                self._file_sizes[path.lower()] = entry.get("logicalBytes")
             next_offset = response.get("nextOffset")
             if isinstance(next_offset, int) and not isinstance(next_offset, bool):
-                more = QTreeWidgetItem(parent, ["Load more…", "", "", "", ""])
-                more.setData(0, ROLE_KIND, "more")
-                more.setData(0, ROLE_EXTRA, {"path": info["path"], "offset": next_offset})
-                more.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                self._more_row(parent, request.path, next_offset)
         finally:
             self._suppress_item_signals = False
+        # An empty first page is still a successful load: the folder has no
+        # files, and re-expanding it must not ask again.
+        if request.is_first_page:
+            self._requests.mark_loaded(request.path)
         self._refresh_check_states()
         self._refresh_state_column()
+        self._update_excluded_summary()
 
     # ------------------------------------------------------------------ apply --
 
@@ -732,6 +1233,7 @@ class MainWindow(QMainWindow):
         self._refresh_check_states()
         self._refresh_state_column()
         self._update_buttons()
+        self._update_excluded_summary()
 
     def _apply(self) -> None:
         if self._io_paused:
@@ -777,6 +1279,7 @@ class MainWindow(QMainWindow):
             self._refresh_check_states()
             self._refresh_state_column()
             self._update_buttons()
+            self._update_excluded_summary()
 
         def failed(message: str):
             self._apply_writing = False

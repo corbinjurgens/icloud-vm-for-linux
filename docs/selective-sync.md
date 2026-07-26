@@ -85,6 +85,11 @@ tray icon shows yellow meanwhile.
 This ordering is deliberate: you are never in a window where the item is still
 readable from the host but its content is already gone.
 
+Once a folder has settled at `applied`, the agent stops re-walking it every
+minute and re-confirms it about every ten minutes instead — the same cadence the
+folder tree already refreshes at. Only the displayed size can lag; the
+permissions that hide it are still re-applied every minute.
+
 ### `not-found` is a warning, not an error
 
 A configured exclusion whose path does not exist yet has nothing for Windows to

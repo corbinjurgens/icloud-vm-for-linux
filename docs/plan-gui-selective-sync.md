@@ -214,8 +214,13 @@ Continues the v1 register (D1–D13).
 | D25 | Default hydration policy | **Files On-Demand on; nothing pinned by this project; hydrate lazily on read.** On first agent run, clear legacy v1 `P` intent with `attrib -P` but do not evict cached data. Initial cloud placeholders stay online-only; reads and host writes remain cached until D26 needs space | Verified for small SMB reads in §0.5, pending E0 for the real mount/large files. Avoids an upfront library download without falsely claiming every included file is always dataless |
 | D26 | Disk reclamation | When volume free space < **20 GB**, request online-only (`attrib +U -P`) for included, in-sync files with local content, oldest first, until **requested on-disk bytes** cover the deficit to 30 GB. Dehydration is asynchronous: re-measure on later cycles and continue until free ≥ **30 GB** or no eligible allocation remains. The sweep is **two-stage**: stage 1 considers files **without** `RECALL_ON_DATA_ACCESS` (fully local — the hydrated working set and the bulk of reclaimable bytes); only if stage 1 cannot cover the deficit does stage 2 examine `RECALL` files in bounded, cursor-based batches to find partially hydrated placeholders. Read `OnDiskDataSize`, `ModifiedDataSize`, and `InSyncState` with `CfGetPlaceholderInfo`; use `GetCompressedFileSizeW` only for non-placeholders. Use `LastAccessTime` only when NTFS last-access updates are enabled; otherwise use `LastWriteTime` as an explicitly approximate fallback. Dirty/open/not-in-sync files remain local and are reported, not deleted | Hysteresis prevents thrash. Cloud Files exposes the exact state needed and permits dehydration only for in-sync placeholders; free-space delta reports bytes truly reclaimed. Staging keeps the expensive per-file query proportional to the hydrated working set instead of the whole library, while stage 2 preserves correctness — a partially hydrated file has `RECALL` **and** `OnDiskDataSize > 0`, so the attribute alone cannot rule it out |
 | D27 | Bridge privilege boundary | SMB exports only `C:\ProgramData\icloud-bridge\io`; scheduled code is `...\agent.ps1` and private state is `...\state`, both outside the share. `syncshare` gets Modify only on `io`; `icloud` gets Modify on `io` and `state` and read/execute on the script | The host must be able to write requests/config, but SMB credentials must not grant code execution by allowing replacement of the scheduled agent script or its trusted state |
-| D29 | GUI-managed bridge lifecycle | An explicit GUI **Quit** confirms and then records a durable desired-off state (`/var/lib/icloud-bridge/powered-off`), quiesces health and CIFS activity, unmounts both shares, and gracefully stops `icloud-windows` (`docker stop --timeout 130`); starting a new GUI process automatically restores an existing stopped bridge before doing any CIFS I/O. All of this runs through one root helper, `host/icloud-bridge-power on\|off`, serialized by `flock`. The six mount/automount/health units gain `ConditionPathExists=!/var/lib/icloud-bridge/powered-off` so the marker survives a reboot without disabling the units. Window-close only hides when a tray exists; without a tray, close routes through the same confirmation. The confirmation retains **Quit GUI only** for maintenance. A checkable tray item **Start when the computer starts** toggles the XDG autostart entry (`Hidden=`), making start-at-login a user setting rather than an installer constant. `restart: unless-stopped` gives Docker the matching semantics, so no compose change is needed. | Makes the GUI the normal on/off boundary without confusing window management with shutdown. The marker keeps automounts and health checks off across reboot, while ordered teardown (health -> automount -> mount, then container) avoids stale CIFS mounts and refuses to interrupt open files. Power-on retries a real CIFS activation because a published-port TCP connect is not SMB readiness. Only the explicit confirmed action powers off — logout, signals, crashes, and `aboutToQuit` do not. Amends the v1/v2 always-on assumption |
 | D28 | Agent ACL authority | The task stays `RunLevel Limited`. Elevated provisioning grants the `icloud` **SID** an inheritable allow ACE of exactly `RC,WDAC` on the sync root (`(OI)(CI)(RC,WDAC)`), repeated explicitly on any protected child DACL that does not inherit. The agent preflights `READ_CONTROL\|WRITE_DAC` on every new target and parent before changing anything, reporting `acl-write-denied` per exclusion on failure | Editing a DACL needs `WRITE_DAC`. An owner gets it implicitly, but ownership of a new object depends on who created it — cloud-created items are owned by `icloud` while items created through SMB may be owned by `syncshare` — so ownership is not a dependable basis. Two rights are the minimum: no `WO`/`D`/data access is granted, and the ACE names `icloud`, never `syncshare`, so it cannot weaken an exclusion deny |
+| D29 | GUI-managed bridge lifecycle | An explicit GUI **Quit** confirms and then records a durable desired-off state (`/var/lib/icloud-bridge/powered-off`), quiesces health and CIFS activity, unmounts both shares, and gracefully stops `icloud-windows` (`docker stop --timeout 130`); starting a new GUI process automatically restores an existing stopped bridge before doing any CIFS I/O. All of this runs through one root helper, `host/icloud-bridge-power on\|off`, serialized by `flock`. The six mount/automount/health units gain `ConditionPathExists=!/var/lib/icloud-bridge/powered-off` so the marker survives a reboot without disabling the units. Window-close only hides when a tray exists; without a tray, close routes through the same confirmation. The confirmation retains **Quit GUI only** for maintenance. A checkable tray item **Start when the computer starts** toggles the XDG autostart entry (`Hidden=`), making start-at-login a user setting rather than an installer constant. `restart: unless-stopped` gives Docker the matching semantics, so no compose change is needed. | Makes the GUI the normal on/off boundary without confusing window management with shutdown. The marker keeps automounts and health checks off across reboot, while ordered teardown (health -> automount -> mount, then container) avoids stale CIFS mounts and refuses to interrupt open files. Power-on retries a real CIFS activation because a published-port TCP connect is not SMB readiness. Only the explicit confirmed action powers off — logout, signals, crashes, and `aboutToQuit` do not. Amends the v1/v2 always-on assumption. **Amended by D30**, which adds an equally explicit in-session power off/on that does not exit the app; the "only a user action powers off" rule is unchanged |
+| D30 | In-session bridge power control (amends D29) | The GUI offers **Power off bridge (keep this app running)** and **Start bridge** as tray items and one Status-tab button, driven by an explicit lifecycle state machine (`power.available_action`), never by a health colour. Power-off runs the *same* transaction as Quit — stop polling, refuse new bridge I/O, drain in-flight mount work and Apply, call `icloud-bridge-power off` — and differs only in its success continuation: idle in-process instead of exiting. The idle state clears the health rows, shows a grey **Bridge is powered off** icon/banner, keeps every mount-touching control disabled, and stops polling until **Start bridge** or process exit. Start reuses the D29 power-on path in full. Quit while already off never calls the helper again. | A temporary stop should not require quitting and relaunching, and a container stopped by hand mid-session had no in-app recovery at all. Sharing one transaction is what keeps the teardown ordering from drifting between the two callers. The state machine exists because **red is not evidence the bridge is off** — it equally means a running VM with a stale canary, a missing mount, or bad JSON — so only a definitive `docker inspect` (`exited`/`created`/`dead`) may enable Start. This is a whole-bridge power operation, **not** pausing iCloud sync, which stays out of scope (§9) |
+| D31 | First-run assistant (supersedes D29's "`provision_needed` never runs `docker compose up`") | A dedicated **Setup required** state — reached when no container exists *or* the inspection failed — performs **no** CIFS I/O at all: no `health.gather()`, no `bridge.read_*()`, no `ismount()`, no `xdg-open` of the mount. It shows read-only readiness checks from a Qt-free, mount-I/O-free `firstrun.py` (KVM/tun nodes, native Engine socket reachable by this session, Compose plugin, active-context warning, a complete resource bundle, a syntactically valid env file whose `SHARE_PASS` is not the placeholder, and whether the container is absent/running/stopped). Only with the container **absent** and no failing check does it offer a confirmed **Create Windows VM**, which runs `docker compose -p icloud-bridge -f <bundle>/docker-compose.yml --env-file <chosen> up -d` in a worker. Success enters **Provisioning Windows** — *not* `_begin_startup()` — which keeps I/O paused, offers the VM screen, and presents the manual guest sequence (02, sign-in, 03, 04) plus the matching host command. **Check setup and connect** then verifies the helper, both argument-exact `sudo -n -l` grants, the installed units and host config, and the Docker state, and only then calls the existing privileged `power_on()`. | v2's §6.2 said both "startup precedes all CIFS I/O" and "preserve today's red first-run state", and the old code resolved that the wrong way: `provision_needed` and `inspect_error` called `_enter_monitoring()`, which unpaused I/O and immediately scheduled selective-sync reads against a mount that does not exist. The safe reading is now the only one. Creation is a **confirmed user action** with a fixed project name and an explicitly chosen env file, which is a different thing from the helper silently manufacturing a container — `icloud-bridge-power on` still never does that. Windows' initial install legitimately leaves SMB unavailable for far longer than the helper's five-minute readiness deadline, so the provisioning state waits for the operator instead of failing a power-on. The password never passes through the GUI: the env file is parsed as text, never sourced, its value never printed, never in argv, never copied into a bundle or the clipboard |
+| D32 | SMB wire protection | **Off, deliberately.** `03-create-share.ps1` sets `RequireSecuritySignature $false` and asserts `EncryptData $false` / `RejectUnencryptedAccess $false`; neither mount unit asks for `sign` or `seal` | Since 24H2 a stock Windows 11 Pro requires SMB signing by default, so every hydration byte would be HMAC/GMAC-signed (and, if encryption ever flips on, AES-GCM'd) on both ends of a path that is host loopback → docker-proxy → container NAT → QEMU tap. Anyone positioned on that path already has root on the host, so there is no confidentiality or integrity property to lose — D9 already makes the host the security boundary. Authentication (D8) and the exclusion model (D15: ACLs + ABE) are untouched, and SMB 3.1.1 pre-auth integrity still protects negotiation. The settings are idempotent assertions, so the documented post-feature-update re-run of script 03 (v1 plan §10) is also the correction path for a future Microsoft default-flip |
+| D33 | Host I/O path | Pass `/dev/vhost-net` into the container (`host/setup-prereqs.sh` loads the module and persists it; `acceptance-tests.sh` checks the node). Add `rasize=16777216` to the **data** mount only. Everything else on the path keeps its default, and those defaults are recorded as load-bearing in the unit files: `cache=strict`, `actimeo=1`, negotiated `rsize`/`wsize`, no `mfsymlinks`, no `max_channels`, no `sign`/`seal` | dockur enables `vhost=on` only if it can open `/dev/vhost-net`; the default docker device cgroup denies that, so without the passthrough QEMU copies every SMB byte through its userspace main loop. `rasize` decouples readahead from the negotiated I/O size, which is what shortens a cold hydration — one long sequential read that blocks the reader. The recorded defaults are not incidental: `cache=strict` is what forces a placeholder read to reach the guest and trigger CfAPI hydration, `mfsymlinks` would create files iCloud syncs as junk, and multichannel cannot apply to one NATed virtio NIC |
+| D34 | Steady-state work elision | The agent may skip **reporting and discovery** work when it is provably redundant, never enforcement work: (a) the per-entry DACL reads of full-tree reconciliation are skipped while the wanted set and private state are empty and the previous pass completed clean, gated by a persisted flag that defaults to false and is cleared *before* any ACL write; (b) the re-verification walk of an already-applied exclusion runs every pass for its first few passes, then every ~10th, and immediately on a config change; (c) a reclamation episode reuses its candidate lists for ~5 passes but may never *end* on a stale list. On the host side the GUI keeps its 5 s cadence for file stats but re-parses `status.json`/`tree.json` only when `(mtime, size)` moves, and runs `docker inspect` — for the health row and the D30 power-control classification alike — at most every 15 s per consumer, with an explicit invalidation on every power transition and on Refresh | These are the three recurring costs that scale with library size rather than with anything the user did, and none of them is what makes the system safe. D15's denies and parent guards are still asserted on every 60 s pass; every dehydration candidate is still re-checked with `CfGetPlaceholderInfo` immediately before its request (D26); the cadences of D17 are unchanged. What degrades is label freshness — an `applied` exclusion's reported size, and the health rows' view of the container — by an interval far inside the thresholds D23 already uses |
 
 **Known accepted limitations (do not attempt to fix):**
 
@@ -329,6 +334,12 @@ use `ConvertTo-Json` must pass `-Depth 20`.)
   `acl-write-denied:` means the D28 preflight failed for that path — provisioning
   step 4 has not been applied, or that object carries a protected DACL; the item
   is left completely untouched.
+- An `applied` entry's `state` and `logicalBytes` may be up to ~10 minutes stale
+  (D34): once a root has settled, the recursive walk that re-confirms it runs
+  every ~10th pass rather than every one. Only the label lags — the deny and
+  parent guard behind it are re-asserted on every 60 s pass, so access never
+  does. `applying`, `pending-dehydrate` and `not-found` are measured every pass
+  as before, and any configuration change re-measures everything immediately.
 - `icloudClientRunning`: true iff a process named `iCloudServices` or `iCloudDrive`
   exists. This is process liveness only; it does not prove Apple-side sync health.
 - `lastError` contains the most recent currently unresolved agent/config error and
@@ -527,8 +538,17 @@ for each existing wanted root:
         was requested, so report those as pending-dehydrate
     re-query on later passes; state=applied only when target deny + parent guard
         are present and every non-empty file has OnDiskDataSize == 0
+    once applied, the cheap re-verification walk that keeps that label honest is
+        decimated (D34): every pass for the first few passes after the transition,
+        then every ~10th, and immediately on any configuration change. It is
+        reporting only -- the deny and guard above are re-asserted every pass --
+        so a label (and its logicalBytes) may lag by up to ~10 min, matching the
+        tree.json cadence. Content reappearing under an applied root drops it back
+        to per-pass measurement
 
-atomically persist {roots, guardedParents, appliedRevision, wantedHash} in private applied.json
+atomically persist {roots, guardedParents, appliedRevision, wantedHash} in private
+applied.json, alongside the reconciliation cursor, the D34 "nothing to reconcile"
+flag, and the sweep episode fields
 
 # --- disk-reclamation sweep of included areas (D26) ---
 read free bytes from the volume containing $SyncRoot
@@ -553,6 +573,16 @@ if free < $SweepFloorBytes or an earlier reclamation episode is in progress:
         a partially hydrated placeholder has RECALL and OnDiskDataSize > 0;
             apply the same eligibility rules and continue accumulating
         do not report "nothing eligible" until stage 2 has exhausted its cursor
+
+    the two candidate walks are the dominant recurring cost of an episode, and an
+        episode spans many passes: cache each stage's list and re-walk only every
+        ~5th pass (D34). Correctness does not depend on freshness -- every
+        candidate is re-checked with CfGetPlaceholderInfo immediately before its
+        request -- but an episode may NOT end on a stale list: "nothing eligible"
+        and stage-2 exhaustion both force a re-walk first. Iteration restarts from
+        the coldest entry each pass rather than consuming the list, so a request
+        that Windows has not yet honoured still counts towards the deficit instead
+        of pulling in further files
 
     do not busy-wait for allocation/free-space changes; persist the episode and
         re-query on the next 60 s pass because dehydration is asynchronous
@@ -600,6 +630,22 @@ Notes for the executor:
   validated wanted set, then update private state. Reconciliation may remove
   nothing unless the current config has passed full validation (D22f). This
   repairs preserved ACLs after cloud renames or a lost/corrupt private state file.
+- The per-entry DACL read that reconciliation performs is the expensive part of
+  that pass, and it is skippable in exactly one state (D34): the validated wanted
+  set is empty, private state holds no roots and no guarded parents, no resume
+  cursor is outstanding, and the previous pass ran to completion having removed
+  nothing and hit no error. An orphan agent-owned deny cannot exist under those
+  conditions. Persist that "nothing to reconcile" conclusion in private state as
+  a boolean, defaulting to **false** so a missing or corrupt state file forces a
+  real pass. The enforcement pass must clear and persist the flag **before** its
+  first ACL write, never after: a crash between adding a deny and persisting
+  state would otherwise leave an orphan no later pass looks for. Any exclusion,
+  any removal, and any reconciliation error also clear it, and **agent startup
+  clears it unconditionally** — the flag may only ever be re-armed by a pass this
+  process ran itself, so the startup reconciliation above still happens in full
+  and anything that changed while the agent was stopped is still caught. The
+  attribute-only walk that produces `tree.json` is unaffected and still runs
+  every ten minutes.
 
 ### 3.2 Files the agent maintains
 
@@ -789,7 +835,10 @@ off state).
 bounded `flock` under `/run/lock` serializing every transition, `==> ` progress,
 and distinct exit codes for usage / busy / container / readiness / unit / lock /
 ambiguous. It never uses `umount -l`, `umount -f`, `docker kill`, or `systemctl
-disable`.
+disable`. It exports `DOCKER_HOST=unix:///var/run/docker.sock` alongside its fixed
+`PATH`, and classifies a failed `docker inspect` through the pure, separately
+testable `classify_inspect_output`, which lowercases before matching "no such
+object"/"no such container" (both per §6.2 **Docker targeting**).
 
 - **off**: create the marker (recording whether it pre-existed); stop the health
   timer then service; stop both automounts; stop both mounts while the guest SMB
@@ -803,10 +852,16 @@ disable`.
 - **on**: a missing container fails without disturbing the marker (creation stays
   the explicit `docker compose up -d` step). Otherwise start the container if
   needed, then for up to five minutes retry a **real** CIFS activation — clear
-  failed state, drop the marker, start both automounts, trigger each with a
-  bounded metadata access, and require the `.mount` units active plus `mountpoint`
-  — because a published-port TCP connect is not SMB readiness. Between failed
-  attempts re-arm the marker and tear down partial jobs. On success the marker is
+  failed state, drop the marker, start both automounts, and require a bounded
+  **directory read** (`ls -A`) of each mount point to *succeed*, plus the
+  `.mount` units active plus `mountpoint` — because a published-port TCP connect
+  is not SMB readiness. The read must succeed rather than merely trigger the
+  automount (D30): after a manual `docker stop` the previous mount is often still
+  active and still a mountpoint while its server is gone, and a `ls -d` of the
+  directory entry can answer from cache, which would declare readiness and arm
+  the health timer against a dead share. Between failed attempts re-arm the
+  marker and tear down partial jobs — which is also how a stale mount is cleanly
+  (never lazily) removed before the next attempt. On success the marker is
   absent and the health timer starts; on timeout the VM is left running for
   inspection and the timer is never armed against an unverified mount.
 
@@ -837,6 +892,13 @@ gui/
 ├── icloud_bridge_gui/
 │   ├── __init__.py
 │   ├── __main__.py        # QApplication + tray + window wiring; single-instance lock
+│   ├── cli.py             # Qt-free: argument parser and the --version string
+│   ├── notify.py          # Qt-free: latching red-incident notification policy
+│   ├── listing.py         # Qt-free: per-folder idle/loading/loaded request state
+│   ├── filtering.py       # Qt-free: which tree rows a filter leaves visible
+│   ├── sizes.py           # Qt-free: the honest excluded-space aggregation
+│   ├── firstrun.py        # Qt-free, no mount I/O: readiness checks, resource
+│   │                      #   resolution, compose argv, host-setup verification (D31)
 │   ├── health.py          # host-side checks (no bridge): container/mount/canary
 │   ├── bridge.py          # bridge share I/O: read status/tree, write exclusions,
 │   │                      #   list-request round-trip; worker-thread I/O
@@ -858,7 +920,8 @@ gui/
 `(severity: green|yellow|red, detail: str)`:
 
 - container: `docker inspect -f '{{.State.Running}}' icloud-windows` == `true`
-  (subprocess, 5 s timeout).
+  (subprocess, 5 s timeout), run with `DOCKER_HOST=unix:///var/run/docker.sock`
+  — see **Docker targeting** below.
 - mount: `os.path.ismount('/mnt/icloud')`; same for `/mnt/icloud_bridge`.
 - canary: `/mnt/icloud/.linux-canary` exists and mtime age < 900 s (this reuses
   the v1 ten-minute health timer's canary with five minutes of scheduling slack;
@@ -876,6 +939,27 @@ gui/
   "reclamation in progress" from "nothing eligible; grow the disk or wait for
   uploads/files to close" instead of claiming every below-floor state is final.
 
+**Docker targeting.** Every unprivileged `docker` call the GUI makes — the health
+container check, `power.inspect_container()`, and the first-run/Compose flow —
+sets `DOCKER_HOST=unix:///var/run/docker.sock`. The bridge's container only ever
+exists on the native Engine, but Docker Desktop can leave the desktop user's
+active *context* on `desktop-linux`, whose daemon has never heard of
+`icloud-windows`; unpinned, a running VM then reports "no such object" and the
+GUI concludes it was never created. The override is applied as a copy of
+`os.environ` with that one key replaced — never a wholesale environment
+replacement, and never on `sudo` or unrelated helpers, which have their own
+reasons to keep the session environment. The root helper sets the same variable
+for consistency and future-proofing only: `sudo` already resets the environment,
+so the helper reads root's Docker configuration, and switching the desktop user's
+context does **not** reproduce a failure in its unpinned form.
+
+**No-such-container matching is case-insensitive everywhere** — `power.py` and
+`host/icloud-bridge-power` both lowercase before matching. The CLI changed the
+message's casing between major versions (`Error: No such object:` up to 28,
+`error: no such object:` on 29); a literal match demotes a first-run host to
+`inspect_error` in the GUI and breaks the helper's documented "a missing
+container is already off" idempotency of `off`.
+
 Overall state per D23. Refresh every 5 s, with at most one refresh in flight.
 Run **all** subprocess and filesystem operations—including `ismount`, CIFS
 `stat`/JSON reads, and request/response polling—in a `QThreadPool` worker (or
@@ -887,8 +971,34 @@ Return results to the GUI thread by signals; never touch widgets from a worker.
 - Icon = colored SVG per overall state; tooltip = one line per failing check, or
   "iCloud bridge: healthy".
 - Left-click and menu item "Open status window" → show/raise the window.
+- **Health notifications (`notify.py`, Qt-free).** A colour change is silent, so
+  a desktop notification marks the edges of a fault. The policy is a pure
+  latching reducer: `green`/`yellow`/nothing → **red** notifies once (body = the
+  first red check's name and detail) and latches the incident; further red or
+  yellow snapshots say nothing; a latched incident reaching **green** notifies
+  once and clears the latch. Yellow neither opens nor closes an incident. A
+  gather exception, represented by the synthetic red `GUI` check, takes the same
+  path. `TrayIcon.notify` selects Warning for failure and **Information** for
+  recovery — a recovery must not carry a fault icon. Without a tray the window
+  is the surface.
+  Only normal monitoring feeds the reducer: the starting, shutting-down,
+  provisioning and intentionally-powered-off states reset it and stop feeding
+  it, so an expected red never announces itself. After a successful `power_on`
+  a **bounded** startup grace (two minutes) suppresses the expected stale
+  canary without latching, so a bridge that is really broken still notifies once
+  the grace expires. The grace is specific to that transition — an
+  already-running bridge whose first snapshot is red, including a minimized
+  launch, notifies immediately.
 - Menu: **Open iCloud folder** (`xdg-open /mnt/icloud`), **Open status window**,
-  **Open VM screen** (`xdg-open http://127.0.0.1:8006`), separator, **Quit**.
+  **Open VM screen** (`xdg-open http://127.0.0.1:8006`), the single D30 power
+  action for the current state (**Retry start** / **Power off bridge (keep this
+  app running)** / **Start bridge**, at most one visible), **Start when the
+  computer starts**, separator, **Quit**.
+- Mount-touching items are gated by *two* independent conditions: a transition
+  is in progress (`set_lifecycle_busy`), or the bridge is intentionally down
+  (`set_bridge_available`). An idle powered-off bridge is not busy — Quit,
+  autostart and Start bridge stay usable — but **Open iCloud folder** would open
+  a bare mount point, so it is disabled.
 - Closing the window hides it when a tray is available; Quit exits. If
   `QSystemTrayIcon.isSystemTrayAvailable()` is false, a normal launch keeps the
   window visible and close exits so the process cannot become unreachable. An
@@ -900,7 +1010,15 @@ disk free/total from `status.json` and `fullyLocalLogicalBytes` labelled
 **"Fully local content"** with the note *"partially downloaded files are not
 counted"*, alongside `scan.lastCompletedAt`. Never label it as total space used
 by iCloud — it is a lower bound (§2.2). Buttons: the same three actions as the
-tray menu.
+tray menu. `Version <__version__>` sits at the bottom as selectable text.
+
+**Version.** `icloud_bridge_gui/__init__.py::__version__` is the single version
+source; the `Makefile` and `packaging/build-deb.sh` derive the package version
+from it, and no second packaging version is introduced to "keep in step". The
+parser lives in the Qt-free `cli.py` so `--version` — which prints exactly
+`icloud-bridge-gui <version>` — is testable in the no-Qt suite. `main()` parses
+before it claims the single-instance socket or constructs `QApplication`, so
+asking the binary for its version never disturbs a running tray instance.
 
 **Selective Sync tab:**
 
@@ -918,6 +1036,48 @@ tray menu.
   timeout → show "guest agent not responding"), files are inserted as child rows
   with the same columns. If `nextOffset` is non-null, add a **Load more…** row;
   do not materialize an unbounded single-folder listing at once.
+- **Listing state (`listing.py`, Qt-free).** Each folder carries an explicit
+  `idle` / `loading` / `loaded` state rather than a "requested" marker, because
+  a marker set before dispatch leaves a failed folder permanently empty with no
+  way to retry. Expansion moves `idle → loading` only when the request is
+  accepted for dispatch; another expansion while `loading` queues nothing; only
+  a successful first-page response — **including a valid empty one** — reaches
+  `loaded`. Paused I/O, dispatch failure, guest error, malformed response,
+  cancellation, timeout, and a response that arrives after a Reload all return
+  the folder to `idle`, which is exactly the state that permits a retry.
+  Requests are tagged with the current tree generation so a completion from a
+  prior Reload cannot mutate the rebuilt tree.
+- **Load more…** is styled link-like (underlined, link colour) and activates on
+  a single click, Enter/Space, or a double click; the handler is idempotent
+  because one gesture can emit several of those signals. While its request is in
+  flight the row shows *Loading…* and is disabled; every failure restores the
+  same offset in place so the operator can retry, and success replaces it with
+  the fetched page plus a fresh continuation row if there is more.
+- **Filter (`filtering.py`, Qt-free).** A filter field above the tree matches
+  folder names and relative folder paths case-insensitively with the same
+  normalization as `bridge.is_under`, showing each match and its ancestor chain
+  and hiding unrelated branches. It searches the folder snapshot plus the files
+  already loaded in this session, and says so — unloaded files were not
+  searched. Missing configured items participate by their full relative path.
+  Filtering changes nothing but visibility: not `_wanted`, not check states, not
+  selection semantics, not the in-memory tree. Ancestor expansion is performed
+  with the expansion handler suppressed so it fires no list requests, and the
+  operator's own expanded/collapsed state is saved when a filter starts and
+  restored when it is cleared.
+- **Excluded-space summary (`sizes.py`, Qt-free)** sits under the introduction
+  and is recomputed whenever `_wanted`, a tree/list response, `status.json`, or
+  a Reload changes something: *"Excluded: 3 roots, about 42 GB logical (1 size
+  unknown)"*. It is never called disk space saved and never claims the content
+  is already online-only — `logicalBytes` is logical content size and
+  dehydration is asynchronous, so an exclusion can sit at `pending-dehydrate`.
+  Sizes come from `tree.json` (folders, recursive), this session's list
+  responses (files), and `status.json.exclusions[].logicalBytes` for an exact,
+  **still-configured** root; anything else is reported as an unknown count
+  rather than silently counted as zero. Each canonical root is summed once —
+  D19's antichain prevents legitimate parent/child double counting, and the
+  aggregator re-derives it defensively so malformed input cannot inflate the
+  total. A short note says exclusions are hidden from Linux and requested
+  online-only, with reclamation reported separately on the Status tab.
 - Excluded rows: greyed text + unchecked box. An item inside an excluded folder is
   not shown with its own checkbox (whole subtree is excluded; `tree.json` doesn't
   recurse there).
@@ -958,12 +1118,19 @@ useful when the tray instance already exists.
 
 - `power.py` is Qt-free and does no mount I/O. `inspect_container()` classifies
   `docker inspect` output (5 s timeout) into `absent` / `stopped` / `running` /
-  `error`; `marker_exists()` reads `/var/lib/icloud-bridge/powered-off` through an
+  `error`, on the pinned native socket and with the case-insensitive
+  no-such-container match described under **Docker targeting** above.
+  `marker_exists()` reads `/var/lib/icloud-bridge/powered-off` through an
   injectable path; `plan_startup(marker, status)` returns one of **power_on**
   (marker set, or a cleanly stopped container — including a running container that
   is still marked off, which `on` reconciles), **already_on**, **provision_needed**
-  (no container: preserve today's red first-run state, never `docker compose up`),
-  or **inspect_error** (shown, never mutated). `power_on()`/`power_off()` run the
+  (no container), or **inspect_error**. `provision_needed` and `inspect_error`
+  both enter the D31 **Setup required** state: red *presentation* — a tray colour
+  and the assistant's own diagnostics — but **no health rows gathered from the
+  mounts**, because there is no evidence a mount exists and touching a dead CIFS
+  handle blocks the worker for the whole timeout. `icloud-bridge-power on` still
+  never manufactures a missing container; D31's confirmed **Create Windows VM**
+  is a separate, explicit user action. `power_on()`/`power_off()` run the
   exact argv `sudo -n /usr/local/bin/icloud-bridge-power on|off` — never a shell —
   and return the helper's own stderr for display.
 - **Startup precedes all CIFS I/O.** The controller pauses bridge I/O, runs the
@@ -987,6 +1154,86 @@ useful when the tray instance already exists.
   an Apply write is in flight), then runs `power_off()` behind a non-cancellable
   **Shutting down… about three minutes** progress state. It exits only on helper
   success; on failure it shows the error and keeps running.
+- **First-run assistant (`firstrun.py`, Qt-free and mount-I/O-free) — D31.**
+  A **Setup** tab appears in front of the others while the lifecycle is `setup`
+  or `provisioning`; health polling, selective sync and every bridge read stay
+  stopped for the whole of both. Two stages, because one checklist cannot both
+  require a container and offer to create it:
+
+  1. **Read-only readiness.** `/dev/kvm` and `/dev/net/tun` exist and are usable;
+     the native socket `unix:///var/run/docker.sock` answers *this desktop
+     session* (a `docker` group entry that has not taken effect in this session
+     is called out by name, since it looks identical to not being a member); the
+     Compose plugin is present; an active `desktop-linux` context is a **warning
+     only**, because every command this app runs is socket-pinned; one complete
+     resource bundle is readable; the operator's env file parses, has non-empty
+     `DISK_SIZE`/`RAM_SIZE`/`CPU_CORES`/`SHARE_PASS`, and its password is not the
+     placeholder; and the container is absent (the *expected* pre-create state,
+     not a failure), running, or stopped. Each failure carries a copyable command
+     from SETUP.md — the GUI itself never installs packages, changes groups, or
+     runs `icloud-bridge-configure` or any other sudo command.
+  2. **Creation and handoff.** **Create Windows VM** appears only with the
+     container absent and no failing check, confirms the multi-gigabyte download,
+     the 20–40 minute install and a long-lived VM, and runs the argv above in a
+     worker with a bounded
+     diagnostic. Success enters **Provisioning Windows**, which presents the
+     manual in-guest sequence and the host command matching this install
+     (`sudo icloud-bridge-configure --user … --env-file …` for a package,
+     `sudo ./host/setup-host.sh` from the recorded checkout for a source
+     install). **Check setup and connect** verifies the helper, both
+     argument-exact `sudo -n -l` grants, the installed units and
+     `/etc/icloud-bridge/config`, and the Docker state — none of which touches a
+     mount — and then calls `power_on()`, whose real CIFS activation is the only
+     honest mountability test. On failure it stays in the assistant with the
+     error and the VM link.
+
+  **Resource resolution is deterministic and never uses the working directory:**
+  the `ICLOUD_BRIDGE_RESOURCES` test/development override, then a source checkout
+  relative to `__file__`, then `~/.local/share/icloud-bridge-gui/resources`, then
+  `/usr/share/icloud-bridge`. The chosen paths are shown in the assistant. Both
+  installed bundles carry the env example as `env.example`; the resolver also
+  accepts the source tree's `.env.example`. The per-user installer records the
+  checkout it ran from in `resources/source-checkout`, and the assistant warns if
+  that checkout no longer contains `host/setup-host.sh`.
+- **In-session power control (D30).** The controller holds one lifecycle state —
+  `starting`, `running`, `start_failed`, `powered_off`, `shutting_down`,
+  `setup` — and `power.available_action(lifecycle, container)` maps it, together
+  with the last **definitive** `docker inspect` classification, to the single
+  action offered as a tray item and one Status-tab button:
+  - `running` + container `running` → **Power off bridge (keep this app running)**;
+  - `running` + container `stopped` (`exited`/`created`/`dead`) → **Start bridge**,
+    the in-app recovery for a container stopped by hand;
+  - `powered_off` → **Start bridge**;
+  - `start_failed` → **Retry start**, with D29's existing wording and diagnostics;
+  - `setup` + container `absent` → the first-run assistant, never Start;
+  - an inspect error, an unrecognized state, or any transition → **no mutating
+    action at all**.
+
+  An ordinary red/yellow/green health result never changes the action; when a
+  snapshot is not green the controller re-runs the Docker-only inspection (no
+  mount I/O, safe in every state) and the action follows *that*.
+
+  Power-off asks for confirmation carrying the same upload-queue caveat as Quit,
+  then runs the **same transaction** `_begin_power_off` as Quit — stop the 5 s
+  timer and the request/response poller, refuse new reads/writes/Apply/list,
+  drain in-flight mount work within the bounded gate, then `power_off()` — and
+  differs only in the continuation: `then_exit=False` enters the idle state
+  instead of quitting. The ordering is never duplicated for the second caller.
+  On helper failure or a busy drain, both callers restore the exact running
+  state, polling included.
+
+  The idle `powered_off` state does **not** exit: it clears the stale health
+  rows, shows a distinct grey **Bridge is powered off** banner and
+  `icloud-off.svg` tray icon (grey, because an intentional off state is not a
+  fault), keeps every mount-touching control disabled, and stops health polling
+  entirely. Start pauses all new I/O, then reuses the D29 `power_on` path in
+  full: on success it restarts both the controller's health timer and the
+  window's request/response poller, reloads selective sync and gathers a fresh
+  snapshot; on failure it stays paused on the existing Retry/Open VM screen
+  surface. The idle state lasts until **Start bridge** or process exit. Plain
+  Quit while off leaves the durable marker and the stopped VM alone and never
+  calls the helper again; a later process start still power-ons automatically
+  per D29.
 - **Close vs Quit.** With a tray, `closeEvent` hides with no prompt. Without a
   tray, close emits a quit request routed through the same confirmation, and
   `QuitOnLastWindowClosed` is off so it cannot bypass the controller. OS logout,
@@ -1006,7 +1253,13 @@ host side in §5.1 and installed by `host/setup-host.sh`.
 ### 6.3 `install-gui.sh` (run as the desktop user, not root)
 
 1. Copy `icloud_bridge_gui/` to `~/.local/share/icloud-bridge-gui/` and install a
-   launcher at `~/.local/bin/icloud-bridge-gui`.
+   launcher at `~/.local/bin/icloud-bridge-gui`. Also copy the D31 resource
+   bundle — `docker-compose.yml`, the whole `provision/` directory, and
+   `.env.example` **renamed to `env.example`** — into
+   `~/.local/share/icloud-bridge-gui/resources/`, matching the package's
+   `/usr/share/icloud-bridge` layout, and record the source checkout in
+   `resources/source-checkout`. The operator's real `.env` is never copied: it
+   holds the share password and stays where it is.
 2. If `python3 -c 'import PySide6'` fails, first try the Ubuntu packages
    `python3-pyside6.qtwidgets`, `python3-pyside6.qtgui`, and
    `python3-pyside6.qtcore` (plus `python3-pyside6.qtsvg` for SVG icon support).
@@ -1281,6 +1534,40 @@ still applies. This v2 document is not permission to let
   GUI stays responsive, performs no repeated automatic retries, and never arms the
   timer against a dead mount. Confirm the installed dockur image received SIGTERM
   and completed ACPI shutdown rather than reaching its force-kill fallback.
+- [ ] **E11d** (D31) **First run on a clean host, both install routes:** on a
+  KVM host with no `icloud-windows` container, launch the GUI from a per-user
+  install and again from the `.deb`. Each time: the Setup tab appears, no CIFS
+  access happens at all (confirm nothing touches `/mnt/icloud*`; health polling
+  and selective sync stay stopped), the resolved compose/provision paths name the
+  right bundle for that install, and a deliberately broken env file (missing key,
+  placeholder `SHARE_PASS`) blocks **Create Windows VM**. Fix it, create the VM,
+  and confirm the initial Windows install — longer than the helper's five-minute
+  readiness deadline — leaves the GUI in **Provisioning Windows** without a start
+  error. Run the manual guest sequence and the host command the assistant printed,
+  then **Check setup and connect**: with a missing sudo grant it must report that
+  and stay put; once configured it must power on and reach normal monitoring.
+  Also confirm **Create Windows VM** is unavailable whenever a container of that
+  name already exists, and that the share password appears nowhere in the UI,
+  the process argv, the resource bundle, or the clipboard.
+- [ ] **E11b** (D30) **Power off and start again without quitting:** with both
+  mounts active, choose **Power off bridge (keep this app running)**. The same
+  teardown as E8 happens — units inactive, marker present, container stopped —
+  but the app keeps running, shows the grey powered-off icon/banner, clears the
+  health rows, disables every mount-touching control, and stops polling. Confirm
+  no health FAIL spam and no CIFS access while off. **Start bridge** brings
+  everything back: VM boots, both mounts activate, the marker disappears, health
+  polling and the request/response poller both resume, selective sync reloads,
+  and health reaches green. Repeat the E9 busy matrix against **Power off
+  bridge**: it must abort identically, leave the VM running, and restore polling.
+  Then **Quit** while powered off — it must not invoke the helper again, and the
+  bridge must still be off after the process exits.
+- [ ] **E11c** (D30) **Recovery from a manual container stop:** with the bridge
+  up, `docker stop icloud-windows` by hand. The GUI must go red, classify the
+  container as stopped, and offer **Start bridge** (never merely because health
+  is red). Press it: the helper must recover the host units and mounts left in
+  that state and reach a live CIFS activation without any lazy or forced
+  unmount. This is what the `ls -A` readiness probe is for — verify from the
+  journal that readiness was not declared while the old mount was still stale.
 - [ ] **E11** (D29) **No-tray + autostart toggle:** with the tray unavailable, the
   window X presents the same three-way Quit dialog; with a tray it only hides.
   Untick **Start when the computer starts**, log out/in → the GUI does not launch
@@ -1290,12 +1577,112 @@ still applies. This v2 document is not permission to let
 
 ---
 
+## 8.1 Performance and resource posture (review of 2026-07-26)
+
+A review of the whole path — guest OS, hypervisor, SMB transport, agent and GUI —
+produced the changes locked as D32/D33/D34 plus the guest debloat additions in v1
+plan §4. Everything below was examined in the same pass and **deliberately not
+done**; record any future proposal against this list before re-opening it.
+
+**Closed avenues.**
+
+- **Windows LTSC/Enterprise (`VERSION: 11l` / `11e`).** dockur takes them as plain
+  config values, so no custom ISO is involved — but LTSC ships without the
+  Microsoft Store, and D4's locked install path is `winget --source msstore`.
+  Making iCloud installable there means sideloading the Store and its AppX
+  dependencies, i.e. touching exactly the stack hard rule 5/D3 forbids, and
+  leaves iCloud without its update channel. Enterprise has the Store but is
+  functionally identical to the already-debloated Pro for this workload.
+- **QEMU/`ARGUMENTS` tuning for Hyper-V enlightenments.** Already done upstream:
+  qemus/qemu applies `hv_passthrough` and `kvm-pit.lost_tick_policy=discard` for
+  Windows guests, which is what cuts idle timer-tick exits. Verify with
+  `docker exec icloud-windows ps aux | grep qemu`; do not add `ARGUMENTS`.
+- **`DISK_CACHE=writeback`.** Trades crash-consistency of the NTFS sync root for
+  throughput this loopback workload does not need.
+- **`ALLOCATE=Y` / disk preallocation.** Would consume the whole `DISK_SIZE`
+  immediately for no benefit; sparse growth plus `discard=unmap` is the shape
+  D25/D26 assumes.
+- **`mem_limit` on the container.** A cgroup OOM kill of QEMU is precisely the
+  unclean, non-explicit guest poweroff the D29/D30 lifecycle exists to prevent,
+  and it would bypass the marker and teardown ordering entirely. The protection
+  it offers against a hypothetical QEMU leak does not pay for that new kill path.
+- **virtio-balloon give-back.** dockur allocates the full `RAM_SIZE` by default;
+  ballooning is opt-in, so `docker compose pull` alone changes nothing, and
+  enabling it is an unvalidated compose change on this install.
+- **hugetlbfs (`-mem-path`).** Permanently pins the guest's RAM on the host and
+  needs the `ARGUMENTS` surgery this design avoids. THP in `madvise` (the distro
+  default) already gives QEMU 2 MB mappings.
+- **SMB multichannel (`max_channels`).** The guest has one virtio NIC behind
+  dockur's NAT and advertises an address the host cannot reach; extra channels
+  would multiplex the same path, whose cost is per-byte copying.
+- **`fsutil behavior set disablelastaccess 1`.** Would silently degrade the D26
+  sweep's LRU ordering to `LastWriteTime`; the agent checks that very setting.
+- **Disabling `ScheduledDefrag`.** On an SSD-presented volume that task performs
+  retrim, which is what hands blocks freed by the D26 sweep back to the sparse
+  qcow2 image. Keeping it is a storage win, not a cost.
+- **Disabling `TabletInputService`/`TextInputManagementService`.** On Windows 11
+  this breaks keyboard entry into Start, Settings and UWP apps — and iCloud is a
+  Store app whose sign-in the operator must type into.
+
+**Deferred, pending evidence this workspace cannot produce.**
+
+- **Replacing the sweep's per-file `attrib.exe` spawn with `SetFileAttributesW`.**
+  Factually sound — `attrib` is a thin wrapper over `Get`/`SetFileAttributes`, the
+  script already declares both attribute constants, and thousands of process
+  creations per pass would become microsecond calls. But D14/D26 and hard rule 6
+  pin the mechanism *as* `attrib +U -P`, so this is a mechanism substitution that
+  needs an explicit plan amendment, plus a §0.5-style live verification that
+  Cloud Files really dehydrates on the native call. D5 is the standing reminder
+  of what happens when a plausible assumption is not tested against the guest.
+- **Gating the ten-minute walk on a `FileSystemWatcher` dirty flag.** Feasible
+  inside the existing process (D17 intact), but a Cloud Files root generates
+  watcher events from the sync engine's own hydration and metadata churn, so on
+  a live library the skip may almost never fire. It also changes what
+  `tree.json`'s `generatedAt` attests — the host's staleness check leans on it —
+  so it needs a separate `walkedAt` field. Measure event rates on the real guest
+  before building it.
+- **Caching `exclusions.json` parsing across passes.** The parse and SHA-256 are
+  cheap; the expensive part is `Test-PathContainment`'s per-pass
+  `CfGetPlaceholderInfo` walk over intermediate directories, and that is not
+  config validation — it is the D19 runtime re-check that catches a
+  previously-valid path whose parent later became a non-cloud reparse point.
+  Caching it away would narrow a locked guarantee for a low-value saving.
+
+**Optional host knobs — operator's call, measured, not installed by any script.**
+Documented in `SETUP.md`; none of them is a repository file.
+
+- `halt_poll_ns=0` stops KVM spinning on idle vCPU halts, but it is host-global,
+  adaptive by design, and unmeasured here. Benchmark with `docker stats` first.
+- `"userland-proxy": false` in `/etc/docker/daemon.json` removes the userspace
+  copy on loopback-published ports, but it is daemon-wide, version-sensitive, and
+  needs a daemon restart — do that only with the bridge powered off via the D29
+  helper, and only if `pidstat` shows `docker-proxy` actually matters. Never
+  route around it by mounting the container IP: that abandons the published-port
+  topology `acceptance-tests.sh` §3 asserts.
+- Transparent hugepages: confirm `madvise` or `always` in
+  `/sys/kernel/mm/transparent_hugepage/enabled`. Most distros already are.
+
+**Accepted recurring cost, documented rather than changed.** The v1 health timer
+writes `/mnt/icloud/.linux-canary` every ten minutes, and that path is *inside*
+the sync root — so iCloud uploads a new version of it 144 times a day, forever,
+with server-side version history. The upload is not what the check proves (the
+script's own header says so); it proves the host→guest→NTFS path. Lengthening the
+interval would have to move three coupled values in lockstep — the timer's
+`OnUnitActiveSec`, `icloud-health.sh`'s 300 s freshness check, and `health.py`'s
+`CANARY_MAX_AGE_SECONDS` — plus the v1 plan §8/§9 verbatim copies, and a partial
+change would produce false "canary stale" reports. The tight cadence catches a
+hung guest fastest, so it stays as it is.
+
+---
+
 ## 9. Out of scope for v2 (explicitly)
 
 - Pattern/glob exclusions (e.g. `*.mp4`) — path-list only.
 - Following renames of excluded items.
 - A host-side FUSE filter layer.
-- Pause/resume sync from the GUI.
+- Pause/resume **sync** from the GUI — leaving the VM and mounts up while iCloud
+  stops syncing. D30's Power off/Start bridge is a different thing: a whole-bridge
+  power operation that stops the VM and disconnects both shares.
 - Per-item pinning ("always keep offline") or pre-warming; smarter cache
   policies than D26's coldest-first sweep. `attrib +P` machinery exists if a
   later version wants it.

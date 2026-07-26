@@ -49,6 +49,22 @@ if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
   usermod -aG docker "$TARGET_USER"
 fi
 
+echo "==> Ensuring vhost_net is available (accelerated virtio networking)"
+# docker-compose.yml passes /dev/vhost-net so dockur's QEMU can run the guest's
+# virtio NIC with vhost=on, moving packet processing for the SMB stream into a
+# host kernel thread instead of QEMU's userspace main loop (v2 plan D33). Docker
+# needs the device node to exist when the container is created, and nothing else
+# on a desktop host loads the module, so load it now and at every boot.
+if modprobe vhost_net 2>/dev/null && [ -e /dev/vhost-net ]; then
+  echo "vhost_net" > /etc/modules-load.d/icloud-bridge-vhost-net.conf
+  echo "    /dev/vhost-net present; module will load at boot"
+else
+  echo "    WARNING: vhost_net is unavailable on this kernel." >&2
+  echo "    Remove the '/dev/vhost-net' line from docker-compose.yml or the" >&2
+  echo "    container will fail to start; networking then falls back to" >&2
+  echo "    userspace virtio, which works but copies every SMB byte." >&2
+fi
+
 echo "==> Installing cifs-utils (host-side SMB mount)"
 apt-get install -y -qq cifs-utils
 

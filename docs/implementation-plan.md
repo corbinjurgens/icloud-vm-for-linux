@@ -41,7 +41,7 @@ Why this approach (context for the executor; do not deviate): every native-Linux
 | D8 | Share account | Dedicated local Windows user `syncshare` (SMB only), separate from the auto-logon user | Auto-logon user has a blank password (required for unattended logon); SMB must be password-protected |
 | D9 | Port exposure | All ports bound to `127.0.0.1` on the host only | VM holds an authenticated Apple session; never expose to LAN |
 | D10 | Resources | 2 vCPU, 3 GB RAM, disk = 40 GB + iCloud data size (see §2) | Measured floor for debloated Win11 + headroom |
-| D11 | Defender | Keep enabled; **exclude** the iCloud folder; disable scheduled scans | Full disable fights Tamper Protection; exclusion captures ~all of the CPU win |
+| D11 | Defender | Keep enabled; **exclude** the iCloud folder and (amended by v2) the bridge control directory `C:\ProgramData\icloud-bridge\io`; disable scheduled scans. Never exclude `powershell.exe` as a process | Full disable fights Tamper Protection; exclusion captures ~all of the CPU win. The bridge directory is rewritten every 15 s by the agent and written over SMB by the host, so scanning each write is pure overhead; it holds only JSON, and the executable agent plus its private state live outside it (v2 D27). The guest holds a live Apple session, so real-time protection and interpreter coverage stay on |
 | D12 | Windows Update | Notify-only, no auto-reboot | An unattended reboot mid-sync is the top availability risk |
 | D13 | Monitoring | Host-side systemd timer: mount check + write-canary + freshness check | Simple, no external dependencies |
 
@@ -69,6 +69,11 @@ sudo apt-get install -y cifs-utils
 #    The iCloud mirror's small-file writes during sync bursts are the only
 #    stressed I/O in this system.
 sudo mkdir -p /srv/icloud-vm/storage
+
+# 5. Accelerated virtio networking (v2 plan D33). §3 passes /dev/vhost-net into
+#    the container; the node must exist before `docker compose up`.
+sudo modprobe vhost_net
+echo vhost_net | sudo tee /etc/modules-load.d/icloud-bridge-vhost-net.conf
 ```
 
 **Sizing rule (D10, amended by v2 D25/D26):** size the disk for **Windows plus
@@ -166,6 +171,9 @@ SHARE_PASS=CHANGE_ME_STRONG_PASSWORD
 ## 3. docker-compose.yml (verbatim)
 
 ```yaml
+# iCloud-on-Linux Windows guest, built on dockur/windows.
+# See docs/implementation-plan.md sections 3 and 12 for the rationale behind
+# every setting here. Operator values come from .env (copy .env.example).
 services:
   windows:
     image: dockurr/windows
@@ -175,20 +183,29 @@ services:
       RAM_SIZE: "${RAM_SIZE}"
       CPU_CORES: "${CPU_CORES}"
       DISK_SIZE: "${DISK_SIZE}"
-      USERNAME: "icloud"       # auto-logon desktop user (blank password by design)
+      USERNAME: "icloud"       # auto-logon desktop user (blank password by design, plan D8)
       LANGUAGE: "English"
       REGION: "en-US"          # adjust if the Apple ID region requires it
       KEYBOARD: "en-US"
     devices:
       - /dev/kvm
       - /dev/net/tun
+      # dockur enables vhost=on for the virtio NIC only if it can *open*
+      # /dev/vhost-net. It mknods the node itself, but the default device cgroup
+      # then denies the open and it silently falls back to userspace virtio, so
+      # QEMU copies every SMB byte through its main loop. Passing the device moves
+      # virtio packet processing into a host kernel thread (v2 plan D33).
+      # Needs the host's vhost_net module — host/setup-prereqs.sh loads it and
+      # host/acceptance-tests.sh checks for it; without it the container will not
+      # start and this line can simply be removed.
+      - /dev/vhost-net
     cap_add:
       - NET_ADMIN
     ports:
       - "127.0.0.1:8006:8006"          # web viewer (noVNC) — install & login only
       - "127.0.0.1:3389:3389/tcp"      # RDP — admin access
       - "127.0.0.1:3389:3389/udp"
-      - "127.0.0.1:10445:445"          # guest SMB share → host mount
+      - "127.0.0.1:10445:445"          # guest SMB share -> host mount
     volumes:
       - /srv/icloud-vm/storage:/storage
       # Enhancement over the plan's manual paste (plan sections 4-5): dockur copies
@@ -213,9 +230,23 @@ This script runs unattended: dockur copies `./provision` to `C:\OEM` and `instal
 
 ```powershell
 # ============ 01-debloat.ps1 — run as Administrator ============
+# Idempotent. Auto-run by provision/install.bat at first boot, and safe to re-run
+# after a Windows feature update reset something (plan section 10).
+#
+# Everything here targets the same two costs: resident RAM in a 3 GB guest whose
+# desktop session is logged on forever, and background disk churn that inflates
+# the thin-provisioned qcow2 image on the host (v2 plan section 8.1).
 $ErrorActionPreference = "Continue"
 
 # --- Services not needed on a sync appliance ---
+# NEVER extend this list with: AppXSvc, ClipSVC, InstallService, LicenseManager,
+# StorSvc, DoSvc, wuauserv, cryptsvc (Store/servicing stack — hard rule 5, D3/D12),
+# TermService (the RDP maintenance path), LanmanServer (the whole bridge),
+# Schedule (the agent's logon task, D17), W32Time (Kerberos/TLS and the Apple
+# session need sane time), CldFlt/FltMgr (Files On-Demand, D14), or
+# TabletInputService/TextInputManagementService (on Windows 11 that breaks
+# keyboard entry into Start, Settings and UWP apps — and iCloud is a Store app
+# whose sign-in the operator types into).
 $services = @(
   "WSearch",        # Search indexer: the classic CPU/RAM hog over big sync folders
   "SysMain",        # Superfetch
@@ -223,16 +254,65 @@ $services = @(
   "WMPNetworkSvc",  # Media sharing
   "MapsBroker",
   "Fax",
-  "RemoteRegistry"
+  "RemoteRegistry",
+  # printing: no printer is reachable from this guest
+  "Spooler", "PrintNotify",
+  # error reporting and diagnostics
+  "WerSvc", "wercplsupport", "DPS", "WdiServiceHost", "WdiSystemHost", "PcaSvc",
+  "dmwappushservice",
+  # hardware this QEMU guest does not have
+  "lfsvc", "WbioSrvc", "bthserv", "BTAGService", "stisvc", "WiaRpc",
+  "SCardSvr", "ScDeviceEnum", "SEMgrSvc",
+  # consumer/entertainment surfaces
+  "XblAuthManager", "XblGameSave", "XboxNetApiSvc", "XboxGipSvc",
+  "PhoneSvc", "WalletService", "RetailDemo", "WpcMonSvc",
+  # networking features unused behind dockur's NAT
+  "icssvc", "SSDPSRV", "upnphost", "DusmSvc"
 )
 foreach ($s in $services) {
   Stop-Service $s -Force -ErrorAction SilentlyContinue
   Set-Service  $s -StartupType Disabled -ErrorAction SilentlyContinue
 }
 
+# --- Maintenance tasks that scan or rewrite the whole volume ---
+# ScheduledDefrag is deliberately NOT here: on an SSD-presented volume it performs
+# retrim, which is exactly what hands blocks freed by the D26 reclamation sweep
+# back to the sparse qcow2 image. UpdateOrchestrator\* (protected, and D12 keeps
+# Update alive) and MicrosoftEdgeUpdate* (services WebView2, which iCloud sign-in
+# uses) are left alone for the same reason.
+$tasks = @(
+  '\Microsoft\Windows\Application Experience\ProgramDataUpdater',
+  '\Microsoft\Windows\Application Experience\StartupAppTask',
+  '\Microsoft\Windows\Application Experience\MareBackup',
+  '\Microsoft\Windows\Application Experience\PcaPatchDbTask',
+  '\Microsoft\Windows\Customer Experience Improvement Program\Consolidator',
+  '\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip',
+  '\Microsoft\Windows\Windows Error Reporting\QueueReporting',
+  '\Microsoft\Windows\Maintenance\WinSAT',
+  '\Microsoft\Windows\Maps\MapsUpdateTask',
+  '\Microsoft\Windows\Maps\MapsToastTask',
+  '\Microsoft\XblGameSave\XblGameSaveTask',
+  '\Microsoft\Windows\Power Efficiency Diagnostics\AnalyzeSystem',
+  '\Microsoft\Windows\Speech\SpeechModelDownloadTask',
+  '\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector'
+)
+foreach ($t in $tasks) {
+  Disable-ScheduledTask -TaskName (Split-Path $t -Leaf) `
+    -TaskPath ((Split-Path $t) + '\') -ErrorAction SilentlyContinue | Out-Null
+}
+
 # --- Defender: exclude the sync root; kill scheduled scans (D11) ---
+# Real-time protection stays ON: the guest holds a live Apple session, and a full
+# disable fights Tamper Protection anyway. Only paths this project itself churns
+# are excluded — never powershell.exe as a process.
 $icloudPath = "$env:USERPROFILE\iCloudDrive"
 Add-MpPreference -ExclusionPath $icloudPath
+# The bridge control directory: the agent rewrites status.json every 15 s and the
+# host writes requests into it over SMB, so every one of those writes would
+# otherwise be scanned. It is JSON-only by construction and the executable agent
+# and its private state live outside it (D27). Created later by 04-bridge-agent.ps1;
+# excluding a not-yet-existing path is fine and keeps the Defender policy in one file.
+Add-MpPreference -ExclusionPath "C:\ProgramData\icloud-bridge\io"
 Add-MpPreference -ExclusionProcess "iCloudServices.exe","iCloudDrive.exe","secd.exe"
 Set-MpPreference -ScanScheduleDay 8            # 8 = never
 Set-MpPreference -DisableCatchupFullScan  $true
@@ -244,32 +324,148 @@ New-Item -Path $au -Force | Out-Null
 Set-ItemProperty $au -Name AUOptions -Value 2 -Type DWord                       # notify before download
 Set-ItemProperty $au -Name NoAutoRebootWithLoggedOnUsers -Value 1 -Type DWord
 
+# Delivery Optimization: HTTP only (mode 0). This kills peer caching and its
+# cache-scan I/O while leaving the DoSvc *service* running — disabling the service
+# would break Store/winget downloads and therefore iCloud updates (hard rule 5).
+$do = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization"
+New-Item -Path $do -Force | Out-Null
+Set-ItemProperty $do -Name DODownloadMode -Value 0 -Type DWord
+
+# Telemetry: 1 = Required/Basic, the lowest value Pro honours. DiagTrack is
+# already disabled above; this stops the queueing side from doing work at all.
+$dc = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection"
+New-Item -Path $dc -Force | Out-Null
+Set-ItemProperty $dc -Name AllowTelemetry -Value 1 -Type DWord
+
 # --- Disable VBS/HVCI (RAM + perf win under KVM) ---
+# If any VBS scenario re-arms, Windows runs its own hypervisor nested under KVM:
+# every syscall and page-table operation pays nested-virtualization cost and the
+# Secure Kernel pins a few hundred MB. Close all the re-enable paths, not just the
+# top-level switch. Verify after a reboot with msinfo32 or Get-CimInstance
+# Win32_DeviceGuard. iCloud has no dependency on VBS or Credential Guard.
+# These are live system keys, so create only what is missing rather than using
+# New-Item -Force, which would take the whole key with it.
 $dg = "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard"
+if (-not (Test-Path $dg)) { New-Item -Path $dg -Force | Out-Null }
 Set-ItemProperty $dg -Name EnableVirtualizationBasedSecurity -Value 0 -Type DWord -ErrorAction SilentlyContinue
+foreach ($scenario in @("HypervisorEnforcedCodeIntegrity", "CredentialGuard")) {
+  $key = Join-Path $dg "Scenarios\$scenario"
+  if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+  Set-ItemProperty $key -Name Enabled -Value 0 -Type DWord -ErrorAction SilentlyContinue
+}
+Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name LsaCfgFlags -Value 0 -Type DWord -ErrorAction SilentlyContinue
+bcdedit /set hypervisorlaunchtype off | Out-Null
 
 # --- Power: never sleep, never hibernate, display off is fine ---
+# The monitor timeout matters here: the `icloud` user is logged on forever, so
+# without it DWM composites for a screen nobody is watching and QEMU keeps an
+# active display device. Sync services are session services, not UI-bound.
 powercfg /change standby-timeout-ac 0
 powercfg /change hibernate-timeout-ac 0
+powercfg /change monitor-timeout-ac 5
 powercfg /hibernate off
+
+# --- Storage: stop the guest inflating the sparse qcow2 image ---
+# Fixed pagefile. System-managed sizing grows and shrinks pagefile.sys, and blocks
+# the qcow2 has once allocated never come back without host-side compaction. Do
+# NOT remove the pagefile: 3 GB of RAM plus Defender plus iCloud's initial metadata
+# sync genuinely needs commit headroom (the D10 floor is 2.5 GB for a reason), and
+# memory compression stays on (default) so the guest mostly stays off it anyway.
+$PagefileMB = 4096
+try {
+  $cs = Get-CimInstance Win32_ComputerSystem
+  if ($cs.AutomaticManagedPagefile) {
+    $cs | Set-CimInstance -Property @{ AutomaticManagedPagefile = $false }
+  }
+  $pf = Get-CimInstance Win32_PageFileSetting -ErrorAction SilentlyContinue
+  if ($null -eq $pf) {
+    # Set-WmiInstance rather than New-CimInstance: creating a Win32_PageFileSetting
+    # instance is one of the cases the CIM cmdlet does not support on 5.1.
+    Set-WmiInstance -Class Win32_PageFileSetting `
+      -Arguments @{ Name = "C:\pagefile.sys"; InitialSize = $PagefileMB; MaximumSize = $PagefileMB } | Out-Null
+  } elseif ($pf.InitialSize -ne $PagefileMB -or $pf.MaximumSize -ne $PagefileMB) {
+    $pf | Set-CimInstance -Property @{ InitialSize = $PagefileMB; MaximumSize = $PagefileMB }
+  }
+} catch {
+  Write-Warning "pagefile sizing skipped: $($_.Exception.Message)"
+}
+
+# Reserved Storage: Windows 11 holds back ~7 GB for update staging. The D26 sweep
+# already guarantees a 20 GB free floor on this volume, so updates have scratch
+# space without the reservation, and the reclaimed space raises the distance to
+# that floor — directly fewer sweep episodes. This is Microsoft's supported knob
+# and does not touch the servicing stack. It fails while servicing is in flight;
+# re-running the script later applies it.
+try {
+  if ((DISM /Online /Get-ReservedStorageState) -match "Enabled") {
+    DISM /Online /Set-ReservedStorageState /State:Disabled | Out-Null
+  }
+} catch {
+  Write-Warning "reserved storage state unchanged: $($_.Exception.Message)"
+}
 
 # --- Misc quieting ---
 # Edge preload
 $edge = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
 New-Item -Path $edge -Force | Out-Null
 Set-ItemProperty $edge -Name "StartupBoostEnabled" -Value 0 -Type DWord
-# Content delivery / suggested apps
+# Widgets board (its WebView2 hosts are the largest reclaimable RAM block in the
+# always-logged-on session). This is the Widgets *app* and its policy — the
+# Evergreen WebView2 runtime that iCloud sign-in uses is a separate component and
+# stays installed (hard rule 5).
+$dsh = "HKLM:\SOFTWARE\Policies\Microsoft\Dsh"
+New-Item -Path $dsh -Force | Out-Null
+Set-ItemProperty $dsh -Name "AllowNewsAndInterests" -Value 0 -Type DWord
+# Copilot: policy plus the AppX removals below, because which one applies depends
+# on the build.
+$copilot = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot"
+New-Item -Path $copilot -Force | Out-Null
+Set-ItemProperty $copilot -Name "TurnOffWindowsCopilot" -Value 1 -Type DWord
+# Content delivery / suggested apps, and best-performance visual effects for a
+# desktop nobody looks at. These are HKCU writes: dockur runs install.bat from the
+# unattend first-logon command in the auto-logon `icloud` session, so they land in
+# that profile. Re-running the script as `icloud` restores them if a feature update
+# resets the profile.
 $cdm = "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
 Set-ItemProperty $cdm -Name "SilentInstalledAppsEnabled" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+$vfx = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"
+if (-not (Test-Path $vfx)) { New-Item -Path $vfx -Force | Out-Null }
+Set-ItemProperty $vfx -Name "VisualFXSetting" -Value 2 -Type DWord -ErrorAction SilentlyContinue
 
 # --- Remove obvious inbox bloat (safe list only; do NOT touch Store/AppX infra, D3) ---
 $bloat = @("Microsoft.XboxApp","Microsoft.XboxGamingOverlay","Microsoft.ZuneMusic",
            "Microsoft.ZuneVideo","Microsoft.BingNews","Microsoft.BingWeather",
            "Microsoft.GamingApp","Microsoft.People","Microsoft.Todos",
-           "MicrosoftTeams","Microsoft.549981C3F5F10")   # last = Cortana
+           "MicrosoftTeams","MSTeams",                      # old and current package names
+           "Microsoft.Copilot","Microsoft.Windows.Ai.Copilot.Provider",
+           "MicrosoftWindows.Client.WebExperience",         # Widgets
+           "Microsoft.549981C3F5F10")   # last = Cortana
 foreach ($b in $bloat) {
   Get-AppxPackage -AllUsers $b | Remove-AppxPackage -ErrorAction SilentlyContinue
 }
+
+# --- OneDrive: a second Files On-Demand engine competing with iCloud ---
+# Removing the OneDrive *app* does not remove cldflt.sys; the Cloud Files filter is
+# an inbox driver that iCloud's placeholders keep using. Never disable CldFlt itself.
+$onedrive = "$env:SystemRoot\SysWOW64\OneDriveSetup.exe"
+if (-not (Test-Path $onedrive)) { $onedrive = "$env:SystemRoot\System32\OneDriveSetup.exe" }
+if (Get-Process OneDrive -ErrorAction SilentlyContinue) {
+  Stop-Process -Name OneDrive -Force -ErrorAction SilentlyContinue
+}
+if (Test-Path $onedrive) {
+  Start-Process $onedrive -ArgumentList "/uninstall" -Wait -ErrorAction SilentlyContinue
+}
+
+# --- Deliberately left alone (do not "optimise" these later) ---
+#   * WpnService / WpnUserService: iCloud is a Store/MSIX app and WNS is the
+#     platform notification path. ~20 MB is not worth risking Store plumbing.
+#   * NTFS last-access updates: the agent's D26 reclamation sweep sorts LRU by
+#     LastAccessTime and checks NtfsDisableLastAccessUpdate. Setting
+#     `fsutil behavior set disablelastaccess 1` would silently degrade eviction
+#     ordering to LastWriteTime.
+#   * Memory compression (Disable-MMAgent -MemoryCompression): in a 3 GB guest it
+#     trades cheap CPU for avoided pagefile I/O — the right trade on qcow2.
+#   * Defender real-time protection: stays on (D11).
 
 Write-Host "`nDebloat complete. Reboot now with: Restart-Computer" -ForegroundColor Green
 # ================================================================
@@ -358,8 +554,15 @@ powershell -ExecutionPolicy Bypass -NoProfile -File C:\OEM\03-create-share.ps1
 Script body:
 
 ```powershell
-# ============ 03-create-share.ps1 ============
-# Replace STRONG_PASSWORD_HERE with the value of SHARE_PASS from .env — must match exactly.
+# ============ 03-create-share.ps1 — run as Administrator ============
+# Run this AFTER Apple ID sign-in and the initial iCloud Drive sync, so that the
+# sync root C:\Users\icloud\iCloudDrive already exists.
+#
+# Set $pass below to the SHARE_PASS value from your host .env — must match the
+# host credentials file exactly. This script is idempotent; safe to re-run after
+# a Windows feature update (plan section 10).
+
+# --- SET THIS: must equal SHARE_PASS in the host .env ---
 $pass = ConvertTo-SecureString "STRONG_PASSWORD_HERE" -AsPlainText -Force
 
 # D8: dedicated password-protected account, SMB use only, hidden from logon
@@ -392,6 +595,20 @@ if (-not (Get-SmbShare -Name "icloud" -ErrorAction SilentlyContinue)) {
 Set-Service -Name LanmanServer -StartupType Automatic
 Start-Service LanmanServer
 Enable-NetFirewallRule -DisplayGroup "File and Printer Sharing"
+
+# Wire protection off on this transport (v2 plan D32). The whole path is
+# host loopback -> docker-proxy -> container NAT -> QEMU tap: anyone positioned on
+# it already has root on the host, so signing and sealing buy nothing and cost a
+# per-byte HMAC/GMAC (and AES-GCM) pass on both ends of every hydration read.
+# Since 24H2 a stock Windows 11 Pro *requires* signing by default, so this must be
+# turned off explicitly; cifs.ko then negotiates an unsigned session on its own and
+# the host mount needs no `sign`/`seal` option. Authentication (D8) and the
+# exclusion model (D15, ACLs + ABE) are untouched, and SMB 3.1.1 pre-auth integrity
+# still protects negotiation. The encryption line is an assertion, not a change:
+# it is already the default, and re-running this script after a feature update
+# (plan section 10) is what corrects a future Microsoft default-flip.
+Set-SmbServerConfiguration -RequireSecuritySignature $false -Force
+Set-SmbServerConfiguration -EncryptData $false -RejectUnencryptedAccess $false -Force
 
 Write-Host "Share ready: \\<guest>\icloud as user syncshare" -ForegroundColor Green
 # ===============================================
@@ -426,14 +643,26 @@ ConditionPathExists=!/var/lib/icloud-bridge/powered-off
 What=//127.0.0.1/icloud
 Where=/mnt/icloud
 Type=cifs
-Options=credentials=/etc/credentials-icloud,port=10445,vers=3.1.1,uid=1000,gid=1000,file_mode=0664,dir_mode=0775,actimeo=1,echo_interval=15,_netdev
+Options=credentials=/etc/credentials-icloud,port=10445,vers=3.1.1,uid=1000,gid=1000,file_mode=0664,dir_mode=0775,actimeo=1,rasize=16777216,echo_interval=15,_netdev
 TimeoutSec=30
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-(`uid`/`gid` 1000 = the primary desktop user; adjust to the operator's `id -u`/`id -g`. `actimeo=1` keeps metadata fresh so remote-side changes appear within ~1 s of listing.)
+(`uid`/`gid` 1000 = the primary desktop user; adjust to the operator's `id -u`/`id -g`.)
+
+**The option list is load-bearing** (v2 plan D33 — the unit file carries the full
+comment; keep the two in step): `actimeo=1` keeps metadata fresh so remote-side
+changes appear within ~1 s of listing; the default `cache=strict` is what makes a
+read of a dataless placeholder always reach the guest and hydrate, so neither
+`cache=loose` nor `cache=none` may be substituted; `rasize=16777216` pipelines the
+long sequential read that a cold hydration is (needs a kernel whose cifs module
+knows `rasize` — 5.15+ assumed; on an older one the mount fails with *bad option*
+and it can simply be dropped); `rsize`/`wsize` stay unset because the negotiated
+maximum is already the ceiling; there is no `sign`/`seal` (the guest turns both
+off for this loopback transport, D32), no `mfsymlinks` (it would create files
+iCloud syncs as junk), and no `max_channels` (one NATed virtio NIC).
 
 `host/mnt-icloud.automount` → `/etc/systemd/system/mnt-icloud.automount`:
 
@@ -489,7 +718,8 @@ TimeoutIdleSec=0
 WantedBy=multi-user.target
 ```
 
-Both shares use the same `syncshare` credentials file.
+Both shares use the same `syncshare` credentials file. The bridge share keeps the
+data share's options minus `rasize`: it only ever carries small JSON documents.
 
 Enable (`host/setup-host.sh` does all of this; it places the files and then hands
 off to `icloud-bridge-configure`, which patches `uid`/`gid` from
@@ -599,6 +829,8 @@ the `sudoers` grant that lets the desktop operator run it; see v2 plan §5.1.
 | Bridge stays off after a reboot; `ls /mnt/icloud` empty, no automount | The GUI's **Quit and power off VM** left `/var/lib/icloud-bridge/powered-off`, and the unit `ConditionPathExists` gates keep everything down (v2 plan D29). Intended | Launch the GUI (autostart does this at login) — it runs `icloud-bridge-power on`. To reconcile by hand: `sudo /usr/local/bin/icloud-bridge-power on` |
 | **Quit and power off VM** aborts saying a file is in use | A mount is busy (open file, a shell `cwd` inside `/mnt/icloud[_bridge]`, or an active copy); teardown refuses a lazy unmount by design | Close the holder — `lsof /mnt/icloud` / `fuser -m` — then Quit again. The VM stayed running the whole time |
 | GUI is stuck on **Starting Windows VM…** or shows a start error | The VM did not boot, or its SMB never became ready within five minutes | Open the VM screen (`:8006`), confirm iCloud is signed in, then **Retry start**. The GUI never auto-retries or arms health against a dead mount |
+| `docker compose up` fails with an error about `/dev/vhost-net` | The host's `vhost_net` module is not loaded (§3 passes the device through for accelerated virtio networking, D33) | `sudo modprobe vhost_net`, and re-run `host/setup-prereqs.sh` so it persists via `/etc/modules-load.d`. If the kernel has no `vhost_net` at all, delete that one `devices:` line — networking falls back to userspace virtio, which works but copies every SMB byte |
+| `mount.cifs` reports **bad option** / the mount unit fails immediately after an upgrade | The host kernel's cifs module does not know `rasize` (D33; assumed 5.15+) | Remove `rasize=16777216` from the `Options=` line of `/etc/systemd/system/mnt-icloud.mount`, `systemctl daemon-reload`, and remount. Nothing else depends on it |
 
 **Desired-on vs desired-off reboot.** With the bridge **on** (no marker), the
 enabled units and `restart: unless-stopped` restore the container, both mounts,
@@ -684,7 +916,14 @@ real work.
   stay below the floor; the tray reports it and the fix is to wait or grow the
   disk (§10), not to delete anything.
 - SMB metadata operations are slower than local disk; bulk `find`-style workloads should rsync out first.
-- Windows base image is ~15–20 GB even debloated; that is the floor for the stock-ISO path (D3). Optional future optimization: rebuild on an LTSC IoT ISO — out of scope for v1.
+- **The health canary is itself synced.** §9 writes `/mnt/icloud/.linux-canary`
+  every ten minutes, and that path is inside the sync root, so iCloud uploads a
+  new version 144 times a day with server-side version history. That is the price
+  of proving the host→guest→NTFS path end to end, and it is accepted: the
+  alternative (a longer interval) slows dead-guest detection and would have to
+  move the timer, the script's own freshness check and the GUI's
+  `CANARY_MAX_AGE_SECONDS` in lockstep. See v2 plan §8.1.
+- Windows base image is ~15–20 GB even debloated; that is the floor for the stock-ISO path (D3). An LTSC/Enterprise `VERSION` was examined in v2 §8.1 and is closed: LTSC has no Microsoft Store, which is D4's locked install path.
 - Photos sync is deliberately out of scope (separate, larger problem; icloudpd covers it better).
 
 ---

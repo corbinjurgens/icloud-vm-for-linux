@@ -1,6 +1,33 @@
 # Copy to /etc/systemd/system/mnt-icloud.mount
 # uid/gid 1000 = the primary desktop user; adjust to `id -u` / `id -g`.
-# actimeo=1 keeps metadata fresh so remote-side changes appear within ~1s of listing.
+#
+# The option list is load-bearing, not incidental (v2 plan D33):
+#   * actimeo=1 keeps metadata fresh so remote-side changes appear within ~1s of
+#     listing, and is what makes hydration progress visible promptly. Its only
+#     cost is extra QUERY_INFO round trips on a sub-millisecond loopback RTT;
+#     bulk enumeration comes from tree.json, not from walking this mount (D21).
+#   * cache=strict is the default and is deliberately not spelled out or changed.
+#     It caches only under an SMB lease, so a read of a dataless placeholder
+#     always reaches the guest and triggers CfAPI hydration. cache=loose could
+#     serve stale attributes past a lease break and misreport hydration state;
+#     cache=none would round-trip every read.
+#   * rasize decouples readahead from the negotiated rsize so several large reads
+#     stay in flight while the guest is itself pulling bytes from Apple — cold
+#     hydration is one long sequential read that blocks the reader (a limitation
+#     recorded in plan section 12), so pipelining is what shortens it. Readahead
+#     never bypasses the server, so it cannot fabricate placeholder content.
+#     Needs a kernel whose cifs module knows `rasize`; this repo assumes 5.15+.
+#     On an older kernel the mount fails with "bad option" — drop the option.
+#   * rsize/wsize stay unset: the negotiated maximum is already optimal and
+#     hardcoding one can only lower it.
+#   * No `sign` and no `seal`: the guest server has both turned off for this
+#     loopback-only transport (D32), and asking for them here would only re-add
+#     the per-byte cost.
+#   * No mfsymlinks: it would fabricate Minshall-French special files that iCloud
+#     would dutifully sync to the cloud as junk regular files.
+#   * No max_channels: the guest has one virtio NIC behind dockur's NAT and
+#     advertises an address the host cannot reach, so multichannel is
+#     structurally inapplicable here.
 [Unit]
 Description=iCloud Drive via Windows VM (CIFS)
 Requires=docker.service
@@ -14,7 +41,7 @@ ConditionPathExists=!/var/lib/icloud-bridge/powered-off
 What=//127.0.0.1/icloud
 Where=/mnt/icloud
 Type=cifs
-Options=credentials=/etc/credentials-icloud,port=10445,vers=3.1.1,uid=1000,gid=1000,file_mode=0664,dir_mode=0775,actimeo=1,echo_interval=15,_netdev
+Options=credentials=/etc/credentials-icloud,port=10445,vers=3.1.1,uid=1000,gid=1000,file_mode=0664,dir_mode=0775,actimeo=1,rasize=16777216,echo_interval=15,_netdev
 TimeoutSec=30
 
 [Install]

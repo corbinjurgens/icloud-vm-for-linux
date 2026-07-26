@@ -136,7 +136,7 @@ docker compose up -d                   # boot the guest
 docker compose logs -f                 # follow the build (Ctrl-C stops the log tail, not the container)
 ```
 
-The **first** `up` downloads a Windows 11 ISO (~5 GB) and runs an unattended
+The **first** `up` downloads a multi-gigabyte Windows 11 ISO and runs an unattended
 install — typically **20–40 minutes**. Watch it live at
 **http://127.0.0.1:8006** (noVNC). The debloat step (`provision/01-debloat.ps1`)
 runs automatically via the `/oem` mount, and a `NEXT-STEPS.txt` is left on the
@@ -200,6 +200,16 @@ The tray icon shows overall health at a glance (green/yellow/red) and its menu
 opens the iCloud folder, the status window, and the VM screen. The status window
 hosts the selective-sync UI.
 
+**If you install the GUI first, it can walk you through the rest.** With no
+Windows VM yet, the window opens on a **Setup** tab that checks what this host
+needs — `/dev/kvm`, `/dev/net/tun`, the native Docker socket reachable by *this
+login session*, the Compose plugin, the installed compose/provision files, and
+your `.env` — and shows the exact command to fix anything that fails. It never
+runs those commands for you. Once the checks pass it offers **Create Windows
+VM**, then waits while Windows installs and lists the in-guest steps above plus
+the host command to run, before connecting the mounts for the first time. It
+reads nothing from `/mnt/icloud` until the bridge is genuinely up.
+
 **GNOME users:** install the *AppIndicator and KStatusNotifierItem Support*
 extension, or the tray icon will not be visible.
 
@@ -217,6 +227,22 @@ The tray's **Quit** offers three choices:
 - **Quit GUI only** — leaves the bridge running; use it when you just want to
   restart or upgrade the GUI.
 - **Cancel.**
+
+**Turning the bridge off without quitting.** The tray menu and the Status tab
+also carry a single power action for the current state:
+
+- **Power off bridge (keep this app running)** — the same clean teardown as
+  *Quit and power off VM*, including the same refusal to unmount a busy share,
+  but the app stays in the tray showing a grey *powered off* icon. Nothing is
+  read from the mounts while it is off.
+- **Start bridge** — brings it all back. It also appears if the container turns
+  out to be stopped mid-session (for instance because you ran `docker stop`),
+  which is the in-app way to recover without restarting the GUI.
+
+The button never appears merely because health went red: a red icon can equally
+mean a running VM with a stale canary or an unreadable file, so the app asks
+Docker directly before offering to start anything. Quitting while already
+powered off simply exits — the bridge stays off, including across a reboot.
 
 Closing the window with its **X** only hides it when a tray is present; the
 bridge keeps running. A checkable **Start when the computer starts** item

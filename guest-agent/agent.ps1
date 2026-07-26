@@ -48,6 +48,14 @@
 #    * Full-tree ACL reconciliation carries a per-pass time budget and a
 #      persisted cursor, so a very large library resumes instead of overrunning
 #      the ten-minute interval.
+#    * Steady-state work elision (v2 plan D34): the per-entry DACL reads of that
+#      reconciliation are skipped while an orphan deny is provably impossible;
+#      the re-verification walk of an already-applied exclusion is decimated; and
+#      a low-disk episode reuses its candidate list for a few passes. Every one of
+#      those is reporting or discovery work. Nothing that enforces access is
+#      elided: the deny and parent-guard ACEs are still asserted on every 60 s
+#      pass, and every dehydration candidate is still re-checked with
+#      CfGetPlaceholderInfo immediately before its request.
 # ============================================================================
 
 Set-StrictMode -Version 2.0
@@ -92,6 +100,14 @@ $MaxPlaceholderQueriesPerPass = 5000    # exclusion measurement
 $MaxStage2QueriesPerPass      = 2000    # reclamation stage 2 batch
 $AclReconcileBudgetSeconds    = 120     # full-tree ACL reconciliation slice
 $SweepCooldownSeconds         = 600     # after an episode ends with nothing eligible
+
+# Steady-state work elision (v2 plan D34). These only decimate *reporting* work:
+# the deny/parent-guard ACEs are still asserted on every 60 s enforcement pass,
+# and every dehydration candidate is still re-checked immediately before its
+# request, so no safety property depends on any of these intervals.
+$AppliedVerifyFastPasses  = 3     # re-verify a newly applied root every pass this often
+$AppliedVerifyEveryPasses = 10    # ...and every Nth pass after that
+$SweepRewalkEveryPasses   = 5     # re-walk sweep candidates this rarely inside an episode
 
 # Cadence (seconds); the loop ticks every 2 s
 $TickSeconds        = 2
@@ -299,6 +315,11 @@ $script:LastAccessUsable = $false
 $script:TreeDirty        = $true
 $script:EnforcePassNo    = 0
 $script:DehydrateAttempts = @{}     # rel path -> @{ count; lastPass } (in memory only)
+$script:AppliedVerify    = @{}      # rel path -> @{ pass; verifications; logicalBytes } (D34)
+$script:SweepStage1      = $null    # cached sweep candidates for the active episode (D34)
+$script:SweepStage1Pass  = -999
+$script:SweepStage2      = $null
+$script:SweepStage2Pass  = -999
 
 # =========================================================== small utilities =
 
@@ -710,6 +731,10 @@ function Get-DefaultState {
         sweep            = @{ episodeActive = $false; episodeStartFreeBytes = 0;
                               stage2Cursor = $null; stage2Exhausted = $false; cooldownUntilTicks = 0 }
         aclCursor        = $null
+        # D34: set only by a reconciliation pass that proved there is nothing to
+        # reconcile. Defaulting to $false is what makes a missing or corrupt state
+        # file force a real full-tree pass before any reads may be skipped again.
+        aclCleanEmpty    = $false
     }
 }
 
@@ -724,6 +749,7 @@ function Read-PrivateState {
         if (Test-HasProperty $doc 'appliedRevision') { $s.appliedRevision = Get-IntegerOrNull $doc.appliedRevision }
         if (Test-HasProperty $doc 'wantedHash')      { $s.wantedHash = [string]$doc.wantedHash }
         if (Test-HasProperty $doc 'aclCursor')       { $s.aclCursor = $doc.aclCursor }
+        if (Test-HasProperty $doc 'aclCleanEmpty')   { $s.aclCleanEmpty = [bool]$doc.aclCleanEmpty }
         if (Test-HasProperty $doc 'sweep') {
             foreach ($k in @('episodeActive','episodeStartFreeBytes','stage2Cursor','stage2Exhausted','cooldownUntilTicks')) {
                 if (Test-HasProperty $doc.sweep $k) { $s.sweep[$k] = $doc.sweep.$k }
@@ -747,6 +773,7 @@ function Write-PrivateState {
         appliedRevision = $s.appliedRevision
         wantedHash      = $s.wantedHash
         aclCursor       = $s.aclCursor
+        aclCleanEmpty   = [bool]$s.aclCleanEmpty
         sweep           = [ordered]@{
             episodeActive         = [bool]$s.sweep.episodeActive
             episodeStartFreeBytes = [Int64]$s.sweep.episodeStartFreeBytes
@@ -945,6 +972,22 @@ function Invoke-EnforcementPass {
     Clear-SubtaskError 'config'
 
     $wanted = @($cfg.wanted)
+
+    # A changed configuration re-arms every decimated re-verification below: a new
+    # exclusion elsewhere can move content around an already-applied root (D34).
+    if ($cfg.hash -ne $script:State.wantedHash) { $script:AppliedVerify = @{} }
+
+    # Disarm the D34 ACL-reconciliation fast path *before* the first ACL write,
+    # not after. The flag licenses the ten-minute pass to skip per-entry DACL
+    # reads, so a crash between adding a deny and persisting state must not be
+    # able to leave an orphan ACE that no later pass ever looks for. Nothing below
+    # mutates an ACL when the wanted set is empty and private state is already
+    # empty -- and the flag is only ever set true in exactly that situation.
+    if ($script:State.aclCleanEmpty -and $wanted.Count -gt 0) {
+        $script:State.aclCleanEmpty = $false
+        Write-PrivateState
+    }
+
     $records = New-Object System.Collections.Generic.List[object]
     $skipped = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $changed = $false
@@ -1069,7 +1112,31 @@ function Invoke-EnforcementPass {
         }
 
         if ($wasApplied) {
-            # Cheap re-verification: stay applied unless content came back.
+            # Cheap re-verification: stay applied unless content came back. The
+            # walk opens no handles, but it is still recursive, and running it over
+            # every applied root every 60 s is the agent's largest steady-state
+            # cost once a few large folders are excluded. It is purely reporting:
+            # the target deny and parent guard above are re-asserted every pass
+            # regardless, so `syncshare` access never depends on this measurement
+            # (D15/D34). Verify every pass for the first few after a root becomes
+            # applied -- when content is most likely still settling -- then every
+            # tenth, and immediately whenever the configuration changes. Content
+            # can only come back here through the iCloud client, so a label that
+            # lags by up to ten minutes matches the tree.json cadence users
+            # already see.
+            $seen = $script:AppliedVerify[$rel]
+            $due = $true
+            if ($null -ne $seen) {
+                $due = ([int]$seen.verifications -lt $AppliedVerifyFastPasses) -or
+                       (($script:EnforcePassNo - [int]$seen.pass) -ge $AppliedVerifyEveryPasses)
+            }
+            if (-not $due) {
+                $records.Add([ordered]@{
+                    path = $rel; state = 'applied'; detail = ''
+                    logicalBytes = [Int64]$seen.logicalBytes; localAllocatedBytes = [Int64]0
+                })
+                continue
+            }
             $acc = New-CheapAccumulator
             if ($isDir) { Measure-SubtreeCheap $full $acc }
             else {
@@ -1080,12 +1147,20 @@ function Invoke-EnforcementPass {
                 if (($attrs -band $ATTR_RECALL) -eq 0 -and $acc.logicalBytes -gt 0) { $acc.nonRecallFiles = 1 }
             }
             if ($acc.nonRecallFiles -eq 0) {
+                $verifications = 1
+                if ($null -ne $seen) { $verifications = [int]$seen.verifications + 1 }
+                $script:AppliedVerify[$rel] = @{ pass = $script:EnforcePassNo
+                                                 verifications = $verifications
+                                                 logicalBytes = [Int64]$acc.logicalBytes }
                 $records.Add([ordered]@{
                     path = $rel; state = 'applied'; detail = ''
                     logicalBytes = [Int64]$acc.logicalBytes; localAllocatedBytes = [Int64]0
                 })
                 continue
             }
+            # Content is back under an applied root: fall through to re-request it,
+            # and measure every pass again until it settles.
+            $script:AppliedVerify.Remove($rel)
         }
 
         # On first protection, and a bounded retry while still pending: the
@@ -1112,11 +1187,16 @@ function Invoke-EnforcementPass {
         Measure-ExclusionAllocation $full $isDir $acc
         if ($acc.allocatedBytes -eq 0 -and -not $acc.capped -and $acc.unreadable -eq 0) {
             $script:DehydrateAttempts.Remove($rel)
+            # Seed the D34 re-verification schedule: zero verifications so far, so
+            # the next few passes measure this root on every cycle.
+            $script:AppliedVerify[$rel] = @{ pass = $script:EnforcePassNo; verifications = 0
+                                             logicalBytes = [Int64]$acc.logicalBytes }
             $records.Add([ordered]@{
                 path = $rel; state = 'applied'; detail = ''
                 logicalBytes = [Int64]$acc.logicalBytes; localAllocatedBytes = [Int64]0
             })
         } else {
+            $script:AppliedVerify.Remove($rel)
             $bits = New-Object System.Collections.Generic.List[string]
             $bits.Add('online-only requested; content is still allocated locally')
             if ($acc.notInSync -gt 0)      { $bits.Add("$($acc.notInSync) file(s) modified or not yet in sync") }
@@ -1133,6 +1213,9 @@ function Invoke-EnforcementPass {
     # --- persist ---
     foreach ($stale in @($script:DehydrateAttempts.Keys)) {
         if ($wanted -notcontains $stale) { $script:DehydrateAttempts.Remove($stale) }
+    }
+    foreach ($stale in @($script:AppliedVerify.Keys)) {
+        if ($wanted -notcontains $stale) { $script:AppliedVerify.Remove($stale) }
     }
     $script:State.roots = @($newRoots.ToArray())
     $script:State.guardedParents = @($newGuards)
@@ -1151,7 +1234,12 @@ function Invoke-EnforcementPass {
     if ($null -ne $enforcementError) { Set-SubtaskError 'enforcement' $enforcementError }
     else { Clear-SubtaskError 'enforcement' }
 
-    if ($changed) { $script:TreeDirty = $true }
+    if ($changed) {
+        $script:TreeDirty = $true
+        # The pruned set the sweep walks is derived from the exclusion set, so a
+        # protection change invalidates any cached candidate list (D34).
+        Reset-SweepCandidateCache
+    }
     return $changed
 }
 
@@ -1189,6 +1277,58 @@ function Get-SweepCandidates {
     }
 }
 
+function Reset-SweepCandidateCache {
+    $script:SweepStage1 = $null
+    $script:SweepStage1Pass = -999
+    $script:SweepStage2 = $null
+    $script:SweepStage2Pass = -999
+}
+
+# Rebuilding a candidate list means a full attribute-only walk of every included
+# area, and a low-disk episode spans many 60 s passes -- exactly when the guest is
+# also busy uploading. Reuse the list for a few passes instead (v2 plan D34).
+# Freshness is not what makes this safe: every candidate's placeholder state is
+# re-read immediately before its dehydration request, so pinned, modified,
+# not-in-sync, already-dehydrated and vanished files are all re-detected there
+# (D26). A file hydrated mid-episode simply waits for the next walk, and the
+# episode may not *end* on a stale list -- see Invoke-ReclamationSweep.
+
+function Get-SweepStage1 {
+    # Fully local files (no RECALL), coldest first.
+    param([string[]]$ExcludedRoots)
+    if ($null -ne $script:SweepStage1 -and
+        ($script:EnforcePassNo - $script:SweepStage1Pass) -lt $SweepRewalkEveryPasses) {
+        return $script:SweepStage1
+    }
+    $acc = @{ items = (New-Object System.Collections.Generic.List[object]); stopped = $false }
+    Get-SweepCandidates $script:SyncRootFull '' $ExcludedRoots $acc $false
+    $script:SweepStage1 = @($acc.items | Sort-Object -Property @{ Expression = { $_.age } })
+    $script:SweepStage1Pass = $script:EnforcePassNo
+    return $script:SweepStage1
+}
+
+function Get-SweepStage2 {
+    # Partially hydrated placeholders (RECALL), ordered for the persisted cursor.
+    param([string[]]$ExcludedRoots)
+    if ($null -ne $script:SweepStage2 -and
+        ($script:EnforcePassNo - $script:SweepStage2Pass) -lt $SweepRewalkEveryPasses) {
+        return $script:SweepStage2
+    }
+    $acc = @{ items = (New-Object System.Collections.Generic.List[object]); stopped = $false }
+    Get-SweepCandidates $script:SyncRootFull '' $ExcludedRoots $acc $true
+    # Ordinal-ignore-case so the persisted cursor comparison below cannot
+    # skip or repeat entries the way a culture-sensitive sort would.
+    $acc.items.Sort([System.Comparison[object]]{
+        param($a, $b)
+        $r = [string]::Compare($a.rel, $b.rel, [StringComparison]::OrdinalIgnoreCase)
+        if ($r -ne 0) { return $r }
+        return [string]::CompareOrdinal($a.rel, $b.rel)
+    })
+    $script:SweepStage2 = $acc.items
+    $script:SweepStage2Pass = $script:EnforcePassNo
+    return $script:SweepStage2
+}
+
 function Invoke-ReclamationSweep {
     param([string[]]$ExcludedRoots)
 
@@ -1215,6 +1355,7 @@ function Invoke-ReclamationSweep {
         $sw.episodeStartFreeBytes = [Int64]$space.free
         $sw.stage2Cursor = $null
         $sw.stage2Exhausted = $false
+        Reset-SweepCandidateCache
     }
 
     $script:SweepInfo.freedBytes = [Int64][Math]::Max(0, $space.free - [Int64]$sw.episodeStartFreeBytes)
@@ -1223,6 +1364,7 @@ function Invoke-ReclamationSweep {
         $sw.episodeActive = $false
         $sw.stage2Cursor = $null
         $script:SweepInfo.inProgress = $false
+        Reset-SweepCandidateCache
         Write-PrivateState
         return
     }
@@ -1234,9 +1376,11 @@ function Invoke-ReclamationSweep {
     $eligible = 0
 
     # --- stage 1: fully local files (no RECALL) -- the hydrated working set ---
-    $acc = @{ items = (New-Object System.Collections.Generic.List[object]); stopped = $false }
-    Get-SweepCandidates $script:SyncRootFull '' $ExcludedRoots $acc $false
-    $stage1 = @($acc.items | Sort-Object -Property @{ Expression = { $_.age } })
+    # Iteration deliberately restarts from the coldest entry every pass rather than
+    # consuming the list: dehydration is asynchronous, so a file requested last
+    # pass still reports OnDiskDataSize > 0 and counts towards the deficit again.
+    # That is what keeps the sweep from over-requesting while Windows catches up.
+    $stage1 = Get-SweepStage1 $ExcludedRoots
     foreach ($c in $stage1) {
         if ($requested -ge $deficit) { break }
         $info = Get-PlaceholderState $c.full $false
@@ -1260,17 +1404,7 @@ function Invoke-ReclamationSweep {
 
     # --- stage 2: partially hydrated placeholders (RECALL and OnDiskDataSize>0) ---
     if ($requested -lt $deficit -and -not $sw.stage2Exhausted) {
-        $acc2 = @{ items = (New-Object System.Collections.Generic.List[object]); stopped = $false }
-        Get-SweepCandidates $script:SyncRootFull '' $ExcludedRoots $acc2 $true
-        # Ordinal-ignore-case so the persisted cursor comparison below cannot
-        # skip or repeat entries the way a culture-sensitive sort would.
-        $ordered = $acc2.items
-        $ordered.Sort([System.Comparison[object]]{
-            param($a, $b)
-            $r = [string]::Compare($a.rel, $b.rel, [StringComparison]::OrdinalIgnoreCase)
-            if ($r -ne 0) { return $r }
-            return [string]::CompareOrdinal($a.rel, $b.rel)
-        })
+        $ordered = Get-SweepStage2 $ExcludedRoots
         $cursor = $sw.stage2Cursor
         $examined = 0
         $last = $null
@@ -1300,18 +1434,36 @@ function Invoke-ReclamationSweep {
             if ($requested -ge $deficit) { $reachedEnd = $false; break }
         }
         if ($null -ne $last) { $sw.stage2Cursor = $last }
-        if ($reachedEnd) { $sw.stage2Exhausted = $true; $sw.stage2Cursor = $null }
+        if ($reachedEnd) {
+            if ($script:SweepStage2Pass -eq $script:EnforcePassNo) {
+                $sw.stage2Exhausted = $true; $sw.stage2Cursor = $null
+            } else {
+                # Reached the end of a *cached* list. Exhaustion ends the episode,
+                # so it may only be declared from a walk taken this pass (D34).
+                Reset-SweepCandidateCache
+            }
+        }
     }
 
     $script:SweepInfo.requestedBytes = $requested
     $script:SweepInfo.blockedBytes = $blocked
     $script:SweepInfo.blockedCount = $blockedCount
 
+    # Same rule for stage 1: never conclude "nothing eligible" from a cached list.
+    # Drop it, keep the episode open, and let the next pass decide on a fresh walk.
+    if ($eligible -eq 0 -and $script:SweepStage1Pass -ne $script:EnforcePassNo) {
+        Reset-SweepCandidateCache
+        $script:SweepInfo.inProgress = $true
+        Write-PrivateState
+        return
+    }
+
     # Dehydration is asynchronous: keep the episode open and re-measure next pass.
     if ($eligible -eq 0 -and $sw.stage2Exhausted) {
         $sw.episodeActive = $false
         $sw.cooldownUntilTicks = [Int64]([DateTime]::UtcNow.AddSeconds($SweepCooldownSeconds).Ticks)
         $script:SweepInfo.inProgress = $false
+        Reset-SweepCandidateCache
     } else {
         $script:SweepInfo.inProgress = $true
     }
@@ -1363,9 +1515,25 @@ function Invoke-FullScan {
     $totals = @{ entries = 0; fullyLocal = [Int64]0 }
     $aclDeadline = [DateTime]::UtcNow.AddSeconds($AclReconcileBudgetSeconds)
     $aclCursor = [string]$script:State.aclCursor
-    $aclState = @{ cursor = $aclCursor; resume = ($null -ne $aclCursor -and $aclCursor -ne ''); done = $true; last = $null; errored = $false }
+    $aclState = @{ cursor = $aclCursor; resume = ($null -ne $aclCursor -and $aclCursor -ne ''); done = $true
+                   last = $null; errored = $false; removed = $false }
     $wantedGuards = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($r in $ExcludedRoots) { [void]$wantedGuards.Add((Get-ParentRelative $r)) }
+
+    # D34 fast path. Reconciliation reads a DACL per library entry -- a handle open
+    # plus a security-descriptor read for every file and folder, budgeted at
+    # $AclReconcileBudgetSeconds every ten minutes, forever. When nothing is
+    # excluded, private state holds no roots or guarded parents, and the previous
+    # pass completed with nothing to remove and no error, an orphan agent-owned
+    # deny cannot exist, so the reads are pure cost. Skip them and keep only the
+    # attribute-only walk that builds tree.json. Any exclusion, any ACL mutation
+    # (the enforcement pass disarms the flag before its first write), a corrupt
+    # private state file, or a reconciliation error all bring the full pass back.
+    $emptyState = (@($ExcludedRoots).Count -eq 0 -and @($script:State.roots).Count -eq 0 -and
+                   @($script:State.guardedParents).Count -eq 0)
+    $aclSkip = ($ConfigValid -and $emptyState -and [bool]$script:State.aclCleanEmpty -and
+                [string]::IsNullOrEmpty($aclCursor))
+    $aclActive = ($ConfigValid -and -not $aclSkip)
 
     function Build-Node {
         param([string]$Full, [string]$Rel, [string]$Name)
@@ -1391,7 +1559,7 @@ function Invoke-FullScan {
             $childFull = Join-Path $Full $e.Name
 
             # --- bounded, resumable ACL reconciliation -----------------------
-            if ($ConfigValid -and [DateTime]::UtcNow -lt $aclDeadline) {
+            if ($aclActive -and [DateTime]::UtcNow -lt $aclDeadline) {
                 $skip = $false
                 if ($aclState.resume) {
                     if ((Compare-RelPathDfs $childRel $aclState.cursor) -le 0) { $skip = $true }
@@ -1403,10 +1571,12 @@ function Invoke-FullScan {
                         $kind = Get-AgentDenyKind $childFull $e.IsDirectory
                         if ($kind.target -and -not (Test-IsUnderAny $childRel $ExcludedRoots)) {
                             [void](Remove-ExactRule $childFull $e.IsDirectory (New-TargetDenyRule $e.IsDirectory))
+                            $aclState.removed = $true
                             $script:TreeDirty = $true
                         }
                         if ($kind.guard -and -not $wantedGuards.Contains($childRel)) {
                             [void](Remove-ExactRule $childFull $e.IsDirectory (New-ParentGuardRule))
+                            $aclState.removed = $true
                             $script:TreeDirty = $true
                         }
                     } catch {
@@ -1414,7 +1584,7 @@ function Invoke-FullScan {
                         Set-SubtaskError 'acl' "ACL reconciliation failed on '$childRel': $($_.Exception.Message)"
                     }
                 }
-            } elseif ($ConfigValid) {
+            } elseif ($aclActive) {
                 $aclState.done = $false
             }
 
@@ -1450,6 +1620,11 @@ function Invoke-FullScan {
         } else {
             $script:State.aclCursor = $aclState.last
         }
+        # Licence the next pass to skip the DACL reads only when this one proved
+        # there is nothing to reconcile: an empty wanted set and empty private
+        # state, plus a complete pass that removed nothing and hit no error (D34).
+        $clean = $aclSkip -or ($aclState.done -and -not $aclState.errored -and -not $aclState.removed)
+        $script:State.aclCleanEmpty = ($clean -and $emptyState)
         Write-PrivateState
     }
 
@@ -1605,6 +1780,11 @@ function Initialize-Agent {
 
     $script:LastAccessUsable = Test-LastAccessUsable
     $script:State = Read-PrivateState
+    # D34: whatever the previous run concluded, every agent start does one real
+    # full-tree reconciliation. The fast path may only be re-armed by a pass this
+    # process ran itself, so anything that changed while the agent was stopped is
+    # still caught -- which keeps section 3's startup-reconciliation rule intact.
+    $script:State.aclCleanEmpty = $false
     $script:AppliedRevision = $script:State.appliedRevision
     # Best knowledge before the first enforcement pass reads exclusions.json.
     $script:WantedRoots = @($script:State.roots)

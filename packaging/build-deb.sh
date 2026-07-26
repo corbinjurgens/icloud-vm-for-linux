@@ -87,6 +87,12 @@ for unit in mnt-icloud.mount mnt-icloud.automount \
 done
 
 # --- guest-side and operator material ----------------------------------------
+# This is also the D31 resource bundle: the first-run assistant resolves
+# /usr/share/icloud-bridge for the compose file, the provisioning scripts and
+# the env example, so it never has to guess from a working directory. Keep the
+# three of them together, and keep the env example named `env.example` — the
+# per-user installer copies an identical layout under its app data directory.
+#
 # Not executable here by design: these run inside the Windows guest.
 for f in "$repo_root"/provision/*; do
   install -D -m 0644 "$f" "$STAGE/usr/share/icloud-bridge/provision/$(basename "$f")"

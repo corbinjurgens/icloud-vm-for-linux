@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
-from . import bridge
+from . import bridge, power
 
 GREEN = "green"
 YELLOW = "yellow"
@@ -26,6 +27,9 @@ _ORDER = {GREEN: 0, YELLOW: 1, RED: 2}
 
 CONTAINER_NAME = "icloud-windows"
 DOCKER_TIMEOUT_SECONDS = 5
+#: How often the container check may actually run, independent of the refresh
+#: cadence.  See ``ContainerProbe``.
+CONTAINER_POLL_INTERVAL_SECONDS = 15
 
 # The v1 health timer refreshes the canary every ten minutes; 15 gives that
 # schedule five minutes of slack before we call the guest dead.
@@ -238,10 +242,15 @@ def build_checks(*, container_running: Any, container_detail: str = "",
 # ------------------------------------------------------------------- gathering --
 
 def container_running() -> tuple[Any, str]:
+    # Pinned to the native Engine socket for the same reason power.py is: Docker
+    # Desktop can leave the desktop user's active context on `desktop-linux`,
+    # whose daemon has never heard of `icloud-windows`, and this check would then
+    # report a healthy running VM as red (item 3).
     try:
         completed = subprocess.run(
             ["docker", "inspect", "-f", "{{.State.Running}}", CONTAINER_NAME],
             capture_output=True, text=True, timeout=DOCKER_TIMEOUT_SECONDS, check=False,
+            env=power.docker_env(),
         )
     except FileNotFoundError:
         return None, "docker is not installed or not on PATH"
@@ -254,6 +263,96 @@ def container_running() -> tuple[Any, str]:
     return completed.stdout.strip() == "true", ""
 
 
+class ContainerProbe:
+    """Rate-limit ``docker inspect`` independently of the refresh cadence.
+
+    The refresh loop runs every five seconds because a lost mount or a stale
+    canary should surface quickly — but those are file stats.  The container
+    check is a subprocess plus a Docker API round trip for a state that only
+    changes on an explicit power action (v2 plan D30) or a daemon crash, so
+    polling it at the same rate is ~17,000 process spawns a day for nothing.
+    Fifteen seconds matches the agent's own status cadence and is dwarfed by the
+    freshness thresholds above.  ``invalidate()`` is what keeps the states users
+    actually cause immediate: every power transition and the Refresh button
+    call it, so a check runs on the very next pass.
+
+    The cached value is whatever ``probe`` returns: the health row uses the
+    default ``container_running`` tuple, and the D30 power-control
+    classification — the other ``docker inspect`` consumer — reuses this class
+    with ``probe=power.inspect_container``.  ``clock`` and ``probe`` are
+    injectable so the tests need no docker.
+    """
+
+    def __init__(self, *, interval: float = CONTAINER_POLL_INTERVAL_SECONDS,
+                 clock: Callable[[], float] = time.monotonic,
+                 probe: Callable[[], Any] | None = None) -> None:
+        self._interval = interval
+        self._clock = clock
+        self._probe = probe or container_running
+        self._at: float | None = None
+        self._value: Any = (None, "")
+
+    def invalidate(self) -> None:
+        """Force the next ``read()`` to actually run the check."""
+        self._at = None
+
+    def read(self) -> tuple[Any, str]:
+        now = self._clock()
+        if self._at is None or (now - self._at) >= self._interval:
+            self._value = self._probe()
+            self._at = now
+        return self._value
+
+
+class DocumentCache:
+    """Re-read a bridge document only when it has actually changed.
+
+    ``tree.json`` is regenerated every ten minutes and ``status.json`` every
+    fifteen seconds, but the GUI polls every five, so the common case is a full
+    SMB read and JSON parse of bytes already known to be identical — and
+    ``tree.json`` carries one node per directory of the whole library.  Keying on
+    ``(st_mtime_ns, st_size)`` turns the unchanged case into a single QUERY_INFO
+    round trip.  The signature is taken before *and* after the read and the value
+    is only cached when the two agree, so a document rewritten mid-read is never
+    stored under the older file's identity.  The agent replaces both files
+    atomically, so any content change moves the signature.
+
+    Cached documents are handed out by reference; treat them as read-only.
+    ``stat`` is injectable so the tests never need a real mount.
+    """
+
+    def __init__(self, *, stat: Callable[[str], os.stat_result] = os.stat) -> None:
+        self._stat = stat
+        self._entries: dict[str, tuple[tuple[int, int], Any]] = {}
+
+    def _signature(self, path: str) -> tuple[int, int] | None:
+        try:
+            info = self._stat(path)
+        except OSError:
+            return None
+        return (info.st_mtime_ns, info.st_size)
+
+    def read(self, path: str, reader: Callable[[], Any]) -> Any:
+        before = self._signature(path)
+        if before is not None:
+            cached = self._entries.get(path)
+            if cached is not None and cached[0] == before:
+                return cached[1]
+        try:
+            value = reader()
+        except Exception:
+            # An unreadable or malformed document must not leave a stale copy
+            # behind that a later identical signature would serve.
+            self._entries.pop(path, None)
+            raise
+        after = self._signature(path)
+        if after is not None and after == before:
+            self._entries[path] = (after, value)
+        else:
+            self._entries.pop(path, None)
+        return value
+
+
 @dataclass
 class Snapshot:
     checks: list[Check]
@@ -262,9 +361,17 @@ class Snapshot:
     tree: dict | None
 
 
-def gather(*, last_written_revision: Any = None, last_write_at: datetime | None = None) -> Snapshot:
-    """Collect every host-side fact and evaluate it. Call from a worker thread."""
-    running, detail = container_running()
+def gather(*, last_written_revision: Any = None, last_write_at: datetime | None = None,
+           documents: DocumentCache | None = None,
+           container: ContainerProbe | None = None) -> Snapshot:
+    """Collect every host-side fact and evaluate it. Call from a worker thread.
+
+    ``documents`` and ``container`` are the caller's long-lived caches; passing
+    neither gathers everything afresh, which is what the tests want.
+    """
+    if documents is None:
+        documents = DocumentCache()
+    running, detail = (container.read() if container is not None else container_running())
 
     icloud_mounted = os.path.ismount(bridge.mount_dir())
     bridge_mounted = os.path.ismount(bridge.bridge_dir())
@@ -281,14 +388,14 @@ def gather(*, last_written_revision: Any = None, last_write_at: datetime | None 
     status: dict | None = None
     status_error: str | None = None
     try:
-        status = bridge.read_status()
+        status = documents.read(bridge.status_path(), bridge.read_status)
     except bridge.BridgeError as exc:
         status_error = str(exc)
 
     tree: dict | None = None
     tree_error: str | None = None
     try:
-        tree = bridge.read_tree()
+        tree = documents.read(bridge.tree_path(), bridge.read_tree)
     except bridge.BridgeError as exc:
         tree_error = str(exc)
 

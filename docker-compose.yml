@@ -17,6 +17,15 @@ services:
     devices:
       - /dev/kvm
       - /dev/net/tun
+      # dockur enables vhost=on for the virtio NIC only if it can *open*
+      # /dev/vhost-net. It mknods the node itself, but the default device cgroup
+      # then denies the open and it silently falls back to userspace virtio, so
+      # QEMU copies every SMB byte through its main loop. Passing the device moves
+      # virtio packet processing into a host kernel thread (v2 plan D33).
+      # Needs the host's vhost_net module — host/setup-prereqs.sh loads it and
+      # host/acceptance-tests.sh checks for it; without it the container will not
+      # start and this line can simply be removed.
+      - /dev/vhost-net
     cap_add:
       - NET_ADMIN
     ports:

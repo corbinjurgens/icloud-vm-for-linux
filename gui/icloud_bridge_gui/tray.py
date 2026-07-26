@@ -16,25 +16,31 @@ from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
-from . import autostart, bridge, health
+from . import autostart, bridge, health, power
+from . import notify as notify_model
 
 VM_VIEWER_URL = "http://127.0.0.1:8006"
 
 #: A transition state that is neither of the three health colours (v2 plan D29):
 #: a Windows boot must not look like a fault.
 STARTING = "starting"
+#: Deliberately powered off (D30): grey, because an intentional off state is not
+#: a fault either — and the app is still running, so the icon must not vanish.
+OFF = "off"
 
 _ICON_FILES = {
     health.GREEN: "icloud-green.svg",
     health.YELLOW: "icloud-yellow.svg",
     health.RED: "icloud-red.svg",
     STARTING: "icloud-starting.svg",
+    OFF: "icloud-off.svg",
 }
 _FALLBACK_COLORS = {
     health.GREEN: "#2e9e4f",
     health.YELLOW: "#d99b1a",
     health.RED: "#c8402c",
     STARTING: "#3a7bd5",
+    OFF: "#8b8e91",
 }
 
 
@@ -80,9 +86,14 @@ class TrayIcon(QObject):
     show_window_requested = Signal()
     quit_requested = Signal()
     retry_start_requested = Signal()
+    #: D30: power the whole bridge off/on without quitting the app.
+    power_off_requested = Signal()
+    start_requested = Signal()
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
+        self._busy = False
+        self._bridge_available = True
         self._icon = QSystemTrayIcon(load_icon(STARTING), self)
         self._icon.setToolTip("iCloud bridge: starting…")
 
@@ -104,6 +115,25 @@ class TrayIcon(QObject):
         self._action_retry.triggered.connect(self.retry_start_requested.emit)
         self._action_retry.setVisible(False)
         menu.addAction(self._action_retry)
+
+        # Exactly one of these is ever visible, and only when the lifecycle
+        # state says so — never because health went red (D30).
+        self._action_power_off = QAction("Power off bridge (keep this app running)", menu)
+        self._action_power_off.triggered.connect(self.power_off_requested.emit)
+        self._action_power_off.setVisible(False)
+        menu.addAction(self._action_power_off)
+
+        self._action_start = QAction("Start bridge", menu)
+        self._action_start.triggered.connect(self.start_requested.emit)
+        self._action_start.setVisible(False)
+        menu.addAction(self._action_start)
+
+        # First run: the assistant is a tab, so the tray's job is only to lead
+        # there — never to offer Start for a VM that does not exist (D31).
+        self._action_setup = QAction("Finish setting up…", menu)
+        self._action_setup.triggered.connect(self.show_window_requested.emit)
+        self._action_setup.setVisible(False)
+        menu.addAction(self._action_setup)
 
         # Start-at-login is a user setting, not an installer constant: this toggles
         # the XDG autostart entry's Hidden flag (v2 plan D29).
@@ -153,9 +183,15 @@ class TrayIcon(QObject):
     def hide(self) -> None:
         self._icon.hide()
 
-    def notify(self, title: str, message: str) -> None:
-        """Surface a message via a tray notification (used for a minimized launch)."""
-        self._icon.showMessage(title, message, QSystemTrayIcon.MessageIcon.Warning)
+    def notify(self, title: str, message: str, *, level: str = notify_model.FAILURE) -> None:
+        """Surface a message via a desktop notification.
+
+        A recovery message must not carry a warning icon — it would read as a
+        second fault — so the level selects Information instead.
+        """
+        icon = (QSystemTrayIcon.MessageIcon.Information if level == notify_model.RECOVERY
+                else QSystemTrayIcon.MessageIcon.Warning)
+        self._icon.showMessage(title, message, icon)
 
     def update_state(self, state: str, checks) -> None:
         self._icon.setIcon(load_icon(state))
@@ -166,17 +202,36 @@ class TrayIcon(QObject):
         self._icon.setIcon(load_icon(state))
         self._icon.setToolTip(tooltip)
 
+    def set_power_action(self, action: str) -> None:
+        """Show the one lifecycle action the current state allows (D30)."""
+        self._action_power_off.setVisible(action == power.ACTION_POWER_OFF)
+        self._action_start.setVisible(action == power.ACTION_START)
+        self._action_retry.setVisible(action == power.ACTION_RETRY)
+        self._action_setup.setVisible(action == power.ACTION_SETUP)
+
     def set_lifecycle_busy(self, busy: bool, *, allow_quit: bool = False) -> None:
         """Disable the actions that must not run mid-transition; keep VM screen.
 
         ``allow_quit`` keeps Quit usable during the (interruptible) startup
         transition while a power-off transition disables it outright.
         """
-        self._action_open_files.setEnabled(not busy)
+        self._busy = busy
         self._action_autostart.setEnabled(not busy)
         self._action_quit.setEnabled(not busy or allow_quit)
+        self._sync_mount_actions()
         if busy:
-            self._action_retry.setVisible(False)
+            # A transition owns the bridge; offer no way to start another.
+            self.set_power_action(power.ACTION_NONE)
 
-    def show_retry(self, visible: bool) -> None:
-        self._action_retry.setVisible(visible)
+    def set_bridge_available(self, available: bool) -> None:
+        """Whether the mounts are up: gates the actions that touch CIFS (D30).
+
+        Distinct from :meth:`set_lifecycle_busy` because an intentionally
+        powered-off bridge is not busy — Quit, autostart and **Start bridge**
+        all stay usable — but "Open iCloud folder" would open a bare mount point.
+        """
+        self._bridge_available = available
+        self._sync_mount_actions()
+
+    def _sync_mount_actions(self) -> None:
+        self._action_open_files.setEnabled(self._bridge_available and not self._busy)

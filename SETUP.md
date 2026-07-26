@@ -112,6 +112,12 @@ This is idempotent and does all of:
 - verifies KVM (`kvm-ok`),
 - installs native Docker Engine if `dockerd` is missing (see §2),
 - selects the `default` context for your user if Docker Desktop is detected,
+- loads the `vhost_net` kernel module and records it in
+  `/etc/modules-load.d/` — `docker-compose.yml` passes `/dev/vhost-net` into the
+  container so QEMU runs the guest's virtio NIC with `vhost=on` instead of
+  copying every SMB byte through its userspace loop (v2 plan D33). If your kernel
+  has no `vhost_net`, the script warns and you must delete that one `devices:`
+  line or the container will not start,
 - installs `cifs-utils` (host-side SMB mount),
 - adds your user to the `docker` group,
 - creates `/srv/icloud-vm/storage` for the guest disk image.
@@ -191,7 +197,21 @@ docker compose up -d
 docker compose logs -f     # Ctrl-C stops the log tail, not the container
 ```
 
-The **first** `up` downloads a Windows 11 ISO (~5 GB) and runs an unattended
+> **Do this now if you might ever rebuild the guest.** dockur deletes the ISO it
+> downloaded partway through the install, so the only chance to keep it is
+> *while the download is still running* — by the time this install finishes it
+> is already gone. Run the hard-link rescue in §7 now; the reasoning can wait:
+>
+> ```bash
+> docker exec icloud-windows ln -f /storage/tmp/win11x64.iso /storage/win11x64-keep.iso
+> ```
+>
+> If it reports *no such file*, the download has not started yet — wait a moment
+> and repeat. Repeating is safe, and §7 explains why you may need to: a restarted
+> download lands on a new inode and leaves your link holding a stale partial.
+> Skip all this only if you accept re-downloading the whole ISO.
+
+The **first** `up` downloads a multi-gigabyte Windows 11 ISO and runs an unattended
 install — typically **20–40 min**. Watch live at **http://127.0.0.1:8006**
 (noVNC). The debloat step runs automatically via the `/oem` mount and drops a
 `NEXT-STEPS.txt` on the guest desktop. Wait for the Windows desktop to appear.
@@ -214,7 +234,7 @@ existing disk — no reinstall, no download. A re-download only happens if you
 **The catch:** dockur *deletes the ISO it downloaded* as soon as it has prepared
 the install media — `removeImage()` is called at `install.sh:1353`, which runs
 **before** `buildImage` and long before Windows finishes installing. So if you
-later wipe storage to retest, you pay the ~5 GB download again.
+later wipe storage to retest, you pay the whole download again.
 
 **The escape hatch** is in `removeImage()` itself:
 
@@ -347,18 +367,48 @@ as Administrator** and follow plan §5–§7:
 ## 9. Mount on the host and verify
 
 ```bash
-sudo ./host/setup-host.sh    # builds /etc/credentials-icloud from .env, installs both mounts + health timer
+sudo ./host/setup-host.sh    # places the units, helpers and marker dir, then configures this machine
 ./host/acceptance-tests.sh   # host-side acceptance checks
 ls /mnt/icloud               # your iCloud files
 ls /mnt/icloud_bridge        # status.json, tree.json, exclusions.json
 ```
 
-Run `setup-host.sh` with `sudo` from your desktop account: it derives the mount
-owner and the GUI power-helper permission from that account (`SUDO_USER`). From a
-root shell instead, set `TARGET_USER=<name>`. Override the mount owner with
-`MOUNT_UID`/`MOUNT_GID` if it should differ. Alongside the mounts and health
-timer, this installs `/usr/local/bin/icloud-bridge-power` and a `sudoers` grant
-so the GUI can power the bridge on and off (v2 plan D29).
+`setup-host.sh` runs in two halves. It **places** the mount/automount units, the
+health script and timer, `/usr/local/bin/icloud-bridge-power` and the marker
+directory; then it hands off to **`icloud-bridge-configure`**, which applies
+everything specific to this machine: `/etc/credentials-icloud` from your `.env`,
+the mount `uid`/`gid`, and the `sudoers` grant that lets the GUI power the bridge
+on and off (v2 plan D29).
+
+Run it with `sudo` from your desktop account: the mount owner and that `sudoers`
+grant are both derived from it (`SUDO_USER`). From a root shell instead, set
+`TARGET_USER=<name>`. Override the mount owner with `MOUNT_UID`/`MOUNT_GID` if it
+should differ.
+
+`icloud-bridge-configure` is idempotent and can be re-run on its own whenever the
+desktop user or the share password changes — you do not need to re-run the whole
+setup script:
+
+```bash
+sudo icloud-bridge-configure --env-file "$PWD/.env"     # or --user <name>
+```
+
+### Installing from the package instead
+
+`make` builds a `.deb` that places exactly the same files at the same paths, so
+the two routes are interchangeable and `acceptance-tests.sh` passes against
+either:
+
+```bash
+make deb          # -> dist/icloud-bridge_<version>_all.deb
+make install      # apt install ./dist/icloud-bridge_*.deb
+make configure    # the same icloud-bridge-configure step, which is NOT optional
+```
+
+The package cannot configure itself: the share password lives in the gitignored
+`.env`, and the mount ownership and `sudoers` grant name whichever desktop
+account will run the GUI. None of that is knowable at build time, which is why
+the configure step is separate rather than a `postinst`.
 
 **Run the E0 gate before trusting the mount with real work.** It checks that a
 cold, online-only file reads back correctly through the *kernel* CIFS client
@@ -370,6 +420,11 @@ iCloud. Steps and pass/fail criteria are in
 
 ## 10. Install the host GUI and tray icon
 
+**If you installed the package in §9, the GUI is already there** — it ships in
+the same `.deb`, at `/usr/bin/icloud-bridge-gui`. Skip to the GNOME note below.
+
+Otherwise, install it for your user:
+
 ```bash
 ./gui/install-gui.sh         # run as your desktop user, NOT root
 ```
@@ -379,17 +434,88 @@ Installs into `~/.local/share/icloud-bridge-gui/`, adds a launcher at
 that starts the tray minimised. PySide6 comes from the distro packages when they
 exist and from a dedicated venv otherwise (never `pip install --user`).
 
+Both may be installed at once: a per-user install shadows the system one by
+`PATH`, and `~/.local/share/applications` and `~/.config/autostart` override
+their `/usr/share` and `/etc/xdg` counterparts by basename, so the tray cannot
+end up launched twice. The per-user installer stays the right choice on a release
+whose archives lack the `python3-pyside6` packages, since only it falls back to a
+dedicated venv.
+
 **GNOME users:** install the *AppIndicator and KStatusNotifierItem Support*
 extension, or the tray icon will not be visible.
 
-The GUI is the bridge's on/off switch (v2 plan D29). Launching it powers the
+**On a host with no VM yet, the GUI opens a Setup assistant** (v2 plan D31)
+instead of the status view: it re-checks the §2/§4 prerequisites, shows which
+`docker-compose.yml` and `provision/` copy it resolved (package, per-user, or
+this checkout — never the working directory), validates your `.env` without ever
+reading the password out, and offers **Create Windows VM**, which runs
+
+```bash
+docker compose -p icloud-bridge -f <bundle>/docker-compose.yml --env-file <your .env> up -d
+```
+
+Use that same `-p icloud-bridge` project name for later terminal commands so
+they address the same project. The assistant then waits through the Windows
+install — it does not try to mount anything — lists the §8 in-guest steps, and
+hands back to the power helper when you choose **Check setup and connect**.
+
+The GUI is the bridge's on/off switch (v2 plan D29/D30). Launching it powers the
 Windows VM on and mounts the shares; the tray's **Quit → Quit and power off VM**
 cleanly disconnects both mounts and powers the VM off (leaving unuploaded changes
-to resume next start). **Quit GUI only** leaves the bridge running. The tray's
-**Start when the computer starts** toggles the autostart entry. A reboot while
+to resume next start). **Quit GUI only** leaves the bridge running. **Power off
+bridge (keep this app running)** does the same teardown without exiting, and
+**Start bridge** brings it back — that action also appears when the container is
+found stopped mid-session, so a manual `docker stop` is recoverable from the app.
+The tray's **Start when the computer starts** toggles the autostart entry. A reboot while
 powered off stays off (a marker plus systemd conditions suppress the mounts and
 health timer) until you log in with autostart enabled, or run
 `sudo /usr/local/bin/icloud-bridge-power on`.
+
+---
+
+## Optional host tuning (measure first, none of this is installed for you)
+
+Everything the project needs is already configured by the scripts above. The
+knobs below were examined in the 2026-07-26 performance review (v2 plan §8.1) and
+deliberately left to you, because each is **host-global** — it affects every
+container or VM on this machine, not just the bridge — and none was benchmarked
+on real hardware. Skip them unless you have a measurement that says otherwise.
+
+**KVM halt polling.** KVM spins the host CPU briefly every time a vCPU halts,
+betting a wakeup is imminent. A mostly-idle Windows guest halts constantly, so
+this can show as steady host CPU against the `qemu` process even when the guest
+reports idle:
+
+```bash
+docker stats icloud-windows            # measure BEFORE changing anything
+echo 0 | sudo tee /sys/module/kvm/parameters/halt_poll_ns     # revertible at runtime
+# to persist: echo 'options kvm halt_poll_ns=0' | sudo tee /etc/modprobe.d/kvm.conf
+```
+
+The cost is microseconds of extra wakeup latency, irrelevant at loopback-SMB
+timescales. The gain may well be nil — KVM's polling is adaptive and the guest
+already gets Hyper-V timer enlightenments — so measure both ways.
+
+**Docker's userland proxy.** Ports published on `127.0.0.1` are serviced by a
+`docker-proxy` process that copies every byte between host userspace and the
+container. If `pidstat -p $(pgrep -f 'docker-proxy.*10445') 1` shows it consuming
+real CPU during a large cold read, `"userland-proxy": false` in
+`/etc/docker/daemon.json` makes Docker use iptables instead. Two warnings: it is
+daemon-wide and can break other containers' localhost publishes on some Docker
+versions, and applying it needs a daemon restart — **power the bridge off first**
+(GUI, or `sudo icloud-bridge-power off`) so the CIFS mounts come down cleanly.
+Do not "fix" this by mounting the container's IP directly; that abandons the
+loopback-published-port topology the acceptance tests assert.
+
+**Transparent hugepages.** QEMU asks for 2 MB mappings, so `madvise` (the default
+almost everywhere) is already what you want:
+
+```bash
+cat /sys/kernel/mm/transparent_hugepage/enabled     # expect [madvise] or [always]
+```
+
+Do not go further to preallocated hugetlbfs: it pins the guest's whole RAM
+allocation on the host permanently.
 
 ---
 
@@ -398,6 +524,8 @@ health timer) until you log in with autostart enabled, or run
 | Symptom | Cause | Fix |
 |---|---|---|
 | `error gathering device information … "/dev/kvm": no such file or directory` on `docker run` | Docker Desktop context active | §2 — install native Engine, `docker context use default` |
+| `error gathering device information … "/dev/vhost-net"` on `docker compose up` | The `vhost_net` module is not loaded; the compose file passes that device through (D33) | `sudo modprobe vhost_net` and re-run `host/setup-prereqs.sh` so it persists. No `vhost_net` in your kernel? Delete the `/dev/vhost-net` line from `docker-compose.yml` |
+| `mount error(22)` / *bad option* from `mount.cifs` after an upgrade | The kernel's cifs module does not know `rasize` (D33 assumes 5.15+) | Drop `rasize=16777216` from `Options=` in `/etc/systemd/system/mnt-icloud.mount`, `systemctl daemon-reload`, remount |
 | `Failed to enable unit: Unit docker.service does not exist` from `setup-prereqs.sh` | Desktop's CLI present so Engine install was skipped; no host daemon | Use the fixed script (tests `dockerd`, not `docker`); or install Engine via `get.docker.com` then re-run |
 | `permission denied … unix:///var/run/docker.sock` | Not in `docker` group in this session | §4 — relogin (or `newgrp docker` for one shell) |
 | `newgrp: command not found` | `newgrp` not installed (minimal Ubuntu) | `sudo apt install util-linux-extra` |
@@ -409,7 +537,13 @@ health timer) until you log in with autostart enabled, or run
 | An exclusion is stuck at `pending-dehydrate` | Cloud Files refuses to dehydrate content that is open, modified, or not yet uploaded | Wait for the upload; the item is already hidden and inaccessible from the host. See `docs/selective-sync.md` |
 | An exclusion reports `acl-write-denied` | Provisioning step 4 (the agent's `RC,WDAC` grant) did not take, or that object has a protected DACL | Re-run `04-bridge-agent.ps1` as Administrator and read its protected-DACL report |
 | No tray icon on GNOME | GNOME has no built-in tray | Install the *AppIndicator and KStatusNotifierItem Support* extension |
-| **Quit and power off VM** aborts: *"a file operation … is still in progress"* | A mount is busy — an open file, a shell `cwd` inside `/mnt/icloud[_bridge]`, or a running copy; teardown refuses a lazy unmount | Close the holder (`lsof /mnt/icloud`, `fuser -m /mnt/icloud`) and Quit again; the VM stayed up the whole time |
+| **Quit and power off VM** (or **Power off bridge**) aborts: *"a file operation … is still in progress"* | A mount is busy — an open file, a shell `cwd` inside `/mnt/icloud[_bridge]`, or a running copy; teardown refuses a lazy unmount | Close the holder (`lsof /mnt/icloud`, `fuser -m /mnt/icloud`) and try again; the VM stayed up the whole time |
+| Health went red and no **Start bridge** action appeared | Red is not evidence the bridge is off — it also covers a stale canary, a missing mount, or unreadable JSON. Start is offered only when `docker inspect` definitively reports the container exited/created/dead | Read the failing check on the Status tab. If the VM really is stopped, the action appears within a refresh cycle |
 | GUI stuck on *Starting Windows VM…* or shows a start error | The VM did not boot or its SMB was not ready within five minutes | Open `:8006`, confirm iCloud is signed in, then **Retry start**. The GUI never auto-retries or arms health against a dead mount |
 | After a reboot the bridge is off and `/mnt/icloud` is empty | The GUI powered it off; the marker + unit conditions keep it down (intended, D29) | Launch the GUI (autostart does this at login), or `sudo /usr/local/bin/icloud-bridge-power on` |
-| GUI: *"sudo: a password is required"* when starting/quitting | `setup-host.sh` was not run for this account, so the power-helper `sudoers` grant is missing | Re-run `sudo ./host/setup-host.sh` from your desktop account (or with `TARGET_USER=<name>`) |
+| GUI: *"sudo: a password is required"* when starting/quitting | The power-helper `sudoers` grant names a different account, or was never installed | `sudo icloud-bridge-configure --user <your account>` — this works whether you installed from the repo or the package, and needs no `.env` if credentials already exist |
+| GUI: *"Cannot inspect the Windows VM: … no such object …"* instead of the create-the-VM message | Pre-fix `power.py` matched Docker's error casing literally, so Docker 29's lowercase text was read as an inspect failure rather than "no container yet" | Update to a build containing the case-insensitive match; the guest itself is fine — run `docker compose up -d` if you have not created it yet |
+| Setup assistant: *"could not find docker-compose.yml and provision/"* | The GUI cannot see an installation bundle — it never guesses from the working directory, because a desktop launcher has none | Re-run `./gui/install-gui.sh` (it copies the bundle to `~/.local/share/icloud-bridge-gui/resources`) or install the `.deb`, which ships `/usr/share/icloud-bridge` |
+| Setup assistant: *"this GUI was installed from … which no longer contains host/setup-host.sh"* | The checkout recorded at install time was moved or deleted, so the printed `setup-host.sh` path would be wrong | Run the host setup from wherever the repository is now, or re-run `./gui/install-gui.sh` from there |
+| Setup assistant: **Create Windows VM** stays greyed out | A check is failing, or a container named `icloud-windows` already exists — the assistant never creates one beside an existing container | Fix the red rows and press **Re-check**; if the container exists, close the assistant and let the app start it |
+| The GUI says the VM does not exist (or health is red) while `docker ps` clearly shows `icloud-windows` running | Docker Desktop reset your active context to `desktop-linux`, and that daemon has never heard of this container | Fixed in the app: every GUI `docker` call now pins `DOCKER_HOST=unix:///var/run/docker.sock`. For your own shell, `docker context use default` |

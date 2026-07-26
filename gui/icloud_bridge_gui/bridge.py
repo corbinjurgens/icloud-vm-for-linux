@@ -141,9 +141,17 @@ def _read_json(path: str, max_bytes: int) -> Any:
         raise BridgeError(f"{os.path.basename(path)} is not valid JSON: {exc}") from exc
 
 
+def status_path() -> str:
+    return os.path.join(bridge_dir(), "status.json")
+
+
+def tree_path() -> str:
+    return os.path.join(bridge_dir(), "tree.json")
+
+
 def read_status() -> dict:
     """The agent's 15-second health/enforcement report."""
-    data = _read_json(os.path.join(bridge_dir(), "status.json"), MAX_STATUS_BYTES)
+    data = _read_json(status_path(), MAX_STATUS_BYTES)
     if not isinstance(data, dict):
         raise BridgeError("status.json is not a JSON object")
     return data
@@ -151,7 +159,7 @@ def read_status() -> dict:
 
 def read_tree() -> dict:
     """The agent's ten-minute folder tree (folders only; files via §2.4)."""
-    data = _read_json(os.path.join(bridge_dir(), "tree.json"), MAX_TREE_BYTES)
+    data = _read_json(tree_path(), MAX_TREE_BYTES)
     if not isinstance(data, dict):
         raise BridgeError("tree.json is not a JSON object")
     return data

@@ -40,5 +40,19 @@ Set-Service -Name LanmanServer -StartupType Automatic
 Start-Service LanmanServer
 Enable-NetFirewallRule -DisplayGroup "File and Printer Sharing"
 
+# Wire protection off on this transport (v2 plan D32). The whole path is
+# host loopback -> docker-proxy -> container NAT -> QEMU tap: anyone positioned on
+# it already has root on the host, so signing and sealing buy nothing and cost a
+# per-byte HMAC/GMAC (and AES-GCM) pass on both ends of every hydration read.
+# Since 24H2 a stock Windows 11 Pro *requires* signing by default, so this must be
+# turned off explicitly; cifs.ko then negotiates an unsigned session on its own and
+# the host mount needs no `sign`/`seal` option. Authentication (D8) and the
+# exclusion model (D15, ACLs + ABE) are untouched, and SMB 3.1.1 pre-auth integrity
+# still protects negotiation. The encryption line is an assertion, not a change:
+# it is already the default, and re-running this script after a feature update
+# (plan section 10) is what corrects a future Microsoft default-flip.
+Set-SmbServerConfiguration -RequireSecuritySignature $false -Force
+Set-SmbServerConfiguration -EncryptData $false -RejectUnencryptedAccess $false -Force
+
 Write-Host "Share ready: \\<guest>\icloud as user syncshare" -ForegroundColor Green
 # ===============================================

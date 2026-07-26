@@ -36,6 +36,27 @@ rm -rf "$APP_DIR/icloud_bridge_gui"
 cp -r "$here/icloud_bridge_gui" "$APP_DIR/icloud_bridge_gui"
 find "$APP_DIR/icloud_bridge_gui" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 
+# --- 1b. resource bundle for the first-run assistant --------------------------
+# The GUI must be able to find the compose file and the provisioning scripts
+# without guessing from its working directory (v2 plan D31): a desktop launcher
+# or autostart entry has no meaningful cwd. The package puts the same material
+# in /usr/share/icloud-bridge; this is the per-user equivalent.
+#
+# The env example is installed under the non-dot name `env.example`, matching the
+# package, so the assistant's resolver sees one layout either way. The operator's
+# real `.env` is NOT copied — it holds the share password and stays where it is.
+RESOURCES="$APP_DIR/resources"
+repo_root="$(cd "$here/.." && pwd)"
+echo "==> Installing the setup resources into $RESOURCES"
+mkdir -p "$RESOURCES"
+rm -rf "$RESOURCES/provision"
+cp -r "$repo_root/provision" "$RESOURCES/provision"
+cp "$repo_root/docker-compose.yml" "$RESOURCES/docker-compose.yml"
+cp "$repo_root/.env.example" "$RESOURCES/env.example"
+# Record where this install came from, so the assistant can name the checkout
+# whose host/setup-host.sh matches it — and say so if it has since moved.
+printf '%s\n' "$repo_root" > "$RESOURCES/source-checkout"
+
 # --- 2. make sure PySide6 is importable --------------------------------------
 PYTHON="python3"
 if python3 -c 'import PySide6' >/dev/null 2>&1; then

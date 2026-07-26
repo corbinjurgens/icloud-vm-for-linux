@@ -3,6 +3,9 @@
 # the unit name is systemd's encoding of the /mnt/... slash -- no literal-hyphen
 # escaping is needed (v2 plan D16).
 # uid/gid 1000 = the primary desktop user; adjust to `id -u` / `id -g`.
+# See mnt-icloud.mount for why cache=strict/actimeo=1 are load-bearing and why
+# there is no sign/seal/mfsymlinks (v2 plan D32/D33). No `rasize` here: this share
+# only ever carries small JSON documents, so readahead tuning buys nothing.
 [Unit]
 Description=iCloud bridge control share (CIFS)
 Requires=docker.service

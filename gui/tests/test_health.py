@@ -211,3 +211,184 @@ def test_human_bytes():
     assert health.human_bytes(20 * 1024 ** 3) == "20.0 GB"
     assert health.human_bytes(None) == "-"
     assert health.human_bytes(-1) == "-"
+
+
+# --------------------------------------------------- the docker adapter ------
+
+def test_container_running_pins_the_native_socket(monkeypatch):
+    """The container check must not follow a Docker Desktop context (item 3)."""
+    monkeypatch.setenv("DOCKER_HOST", "unix:///home/alice/.docker/desktop/docker.sock")
+    monkeypatch.setenv("ICLOUD_TEST_SENTINEL", "kept")
+    seen = {}
+
+    class Completed:
+        returncode = 0
+        stdout = "true\n"
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        seen["env"] = kwargs.get("env")
+        return Completed()
+
+    monkeypatch.setattr(health.subprocess, "run", fake_run)
+    assert health.container_running() == (True, "")
+    assert seen["argv"][:2] == ["docker", "inspect"]
+    assert seen["env"]["DOCKER_HOST"] == "unix:///var/run/docker.sock"
+    # A copy of the environment, not a replacement.
+    assert seen["env"]["ICLOUD_TEST_SENTINEL"] == "kept"
+
+
+# ----------------------------------------- polling caches (v2 plan D34) ------
+
+class FakeStat:
+    def __init__(self, mtime_ns: int, size: int) -> None:
+        self.st_mtime_ns = mtime_ns
+        self.st_size = size
+
+
+class Stats:
+    """A settable stat table plus a call counter, so no mount is needed."""
+
+    def __init__(self) -> None:
+        self.table: dict[str, FakeStat] = {}
+        self.calls = 0
+
+    def __call__(self, path: str) -> FakeStat:
+        self.calls += 1
+        try:
+            return self.table[path]
+        except KeyError:
+            raise OSError(2, "No such file or directory", path) from None
+
+
+def test_document_cache_reparses_only_when_the_signature_moves():
+    stats = Stats()
+    stats.table["/b/tree.json"] = FakeStat(100, 10)
+    reads = []
+
+    def reader():
+        reads.append(1)
+        return {"generatedAt": len(reads)}
+
+    cache = health.DocumentCache(stat=stats)
+    assert cache.read("/b/tree.json", reader) == {"generatedAt": 1}
+    # Unchanged file: served from the cache, reader never runs again.
+    for _ in range(5):
+        assert cache.read("/b/tree.json", reader) == {"generatedAt": 1}
+    assert len(reads) == 1
+
+    stats.table["/b/tree.json"] = FakeStat(200, 10)      # same size, new mtime
+    assert cache.read("/b/tree.json", reader) == {"generatedAt": 2}
+    stats.table["/b/tree.json"] = FakeStat(200, 11)      # same mtime, new size
+    assert cache.read("/b/tree.json", reader) == {"generatedAt": 3}
+    assert len(reads) == 3
+
+
+def test_document_cache_does_not_store_a_document_rewritten_mid_read():
+    stats = Stats()
+    stats.table["/b/status.json"] = FakeStat(100, 10)
+
+    def reader():
+        # Simulate the agent replacing the file while we were reading it.
+        stats.table["/b/status.json"] = FakeStat(101, 12)
+        return {"n": 1}
+
+    cache = health.DocumentCache(stat=stats)
+    assert cache.read("/b/status.json", reader) == {"n": 1}
+
+    calls = []
+
+    def reader2():
+        calls.append(1)
+        return {"n": 2}
+
+    assert cache.read("/b/status.json", reader2) == {"n": 2}
+    assert calls == [1]
+
+
+def test_document_cache_drops_the_entry_when_a_read_fails():
+    stats = Stats()
+    stats.table["/b/status.json"] = FakeStat(100, 10)
+    cache = health.DocumentCache(stat=stats)
+    assert cache.read("/b/status.json", lambda: {"n": 1}) == {"n": 1}
+
+    def boom():
+        raise health.bridge.BridgeError("status.json is not valid JSON")
+
+    # The reader only runs when the signature moved, so move it: the agent wrote
+    # a document this end cannot parse.
+    stats.table["/b/status.json"] = FakeStat(300, 40)
+    try:
+        cache.read("/b/status.json", boom)
+    except health.bridge.BridgeError:
+        pass
+    else:                                                # pragma: no cover
+        raise AssertionError("the reader error must propagate")
+    # Back to the failing document's own signature: nothing stale may be served,
+    # and the failure must be re-reported rather than papered over.
+    calls = []
+
+    def again():
+        calls.append(1)
+        raise health.bridge.BridgeError("still bad")
+
+    for _ in range(2):
+        try:
+            cache.read("/b/status.json", again)
+        except health.bridge.BridgeError:
+            pass
+    assert calls == [1, 1]
+
+
+def test_document_cache_missing_file_always_calls_the_reader():
+    stats = Stats()
+    cache = health.DocumentCache(stat=stats)
+    calls = []
+
+    def boom():
+        calls.append(1)
+        raise health.bridge.BridgeError("cannot stat")
+
+    for _ in range(3):
+        try:
+            cache.read("/b/gone.json", boom)
+        except health.bridge.BridgeError:
+            pass
+    assert calls == [1, 1, 1]
+
+
+def test_container_probe_rate_limits_and_invalidates():
+    now = {"t": 1000.0}
+    calls = []
+
+    def probe():
+        calls.append(1)
+        return (True, "")
+
+    p = health.ContainerProbe(interval=15, clock=lambda: now["t"], probe=probe)
+    assert p.read() == (True, "")
+    now["t"] += 5
+    assert p.read() == (True, "")
+    now["t"] += 5
+    p.read()
+    assert len(calls) == 1                    # still inside the window
+
+    now["t"] += 6                             # 16 s since the last real check
+    p.read()
+    assert len(calls) == 2
+
+    p.invalidate()                            # a power action or Refresh
+    p.read()
+    assert len(calls) == 3
+
+
+def test_gather_without_caches_probes_every_time(monkeypatch, tmp_path):
+    """The default (no caches passed) keeps the old always-fresh behaviour."""
+    monkeypatch.setenv("ICLOUD_BRIDGE_DIR", str(tmp_path))
+    monkeypatch.setenv("ICLOUD_MOUNT_DIR", str(tmp_path))
+    calls = []
+    monkeypatch.setattr(health, "container_running", lambda: (calls.append(1), (True, ""))[1])
+    health.gather()
+    health.gather()
+    assert len(calls) == 2

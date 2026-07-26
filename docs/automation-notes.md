@@ -84,7 +84,7 @@ newgrp docker               # fixes one shell only
 `sg`/`newgrp` live in **`util-linux-extra`** on recent Ubuntu and are not
 installed by default. **Automate: add `util-linux-extra` to `setup-prereqs.sh`.**
 
-### 2.3 The Windows ISO gets deleted (cost: a 5 GB re-download per rebuild)
+### 2.3 The Windows ISO gets deleted (cost: a full re-download per rebuild)
 
 `removeImage()` (`install.sh:1353`) deletes the downloaded ISO **before**
 `buildImage`, i.e. minutes after the download finishes and long before Windows

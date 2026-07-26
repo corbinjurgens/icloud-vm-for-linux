@@ -32,6 +32,14 @@ set -euo pipefail
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
+# Address the native Engine explicitly, for the same reason the GUI does — but as
+# consistency, not a bug fix. sudo resets the environment, so this helper already
+# uses root's Docker configuration, which ordinarily has no `desktop-linux`
+# context; switching the *desktop user's* context does not break the unpinned
+# form. The pin protects against a future root-side context or environment.
+DOCKER_HOST=unix:///var/run/docker.sock
+export DOCKER_HOST
+
 # --- documented exit statuses (the GUI shows stderr; it does not parse these) --
 EXIT_USAGE=1        # bad arguments
 EXIT_NOTROOT=2      # not run as root
@@ -94,6 +102,24 @@ create_marker() {
 
 remove_marker() { rm -f "$MARKER"; }
 
+# Classify a *failed* `docker inspect` by its message: `absent` when no such
+# container exists, else `error:<message>`. Split out from container_state so it
+# is a pure function of one string and can be exercised without a daemon
+# (gui/tests/test_power_helper.py extracts and runs it under bash).
+#
+# The match is case-insensitive on purpose: the CLI lowercased this message
+# between major versions ("Error: No such object:" up to 28, "error: no such
+# object:" on 29). Matching the old capitalization literally would make an
+# absent container look like a daemon failure, breaking `off`'s documented
+# "a missing container is already off" idempotency on Docker 29.
+classify_inspect_output() {
+  local lowered="${1,,}"
+  case "$lowered" in
+    *"no such object"*|*"no such container"*) printf 'absent\n' ;;
+    *) printf 'error:%s\n' "$1" ;;
+  esac
+}
+
 # Print the container's State.Status, or the sentinel `absent` when no such
 # container exists, or `error:<message>` for a daemon/inspect failure we must
 # not mistake for "stopped".
@@ -103,10 +129,7 @@ container_state() {
     printf '%s\n' "${out:-unknown}"
     return 0
   fi
-  case "$out" in
-    *"No such object"*|*"No such container"*) printf 'absent\n' ;;
-    *) printf 'error:%s\n' "$out" ;;
-  esac
+  classify_inspect_output "$out"
 }
 
 # =============================================================================
@@ -263,11 +286,19 @@ do_on() {
     scq reset-failed "${MOUNTS[@]}" "${AUTOMOUNTS[@]}" || true
     remove_marker
     if scq start "${AUTOMOUNTS[@]}"; then
-      local i
+      # Each access must *succeed*, not merely trigger the automount. After a
+      # manual `docker stop` (D30 recovery) the previous mount is often still
+      # active and still a mountpoint while its server is gone: `ls -d` on the
+      # directory entry can answer from cache, so it would declare readiness and
+      # arm the health timer against a dead share. Reading the directory forces
+      # a real round trip, which fails until CIFS has genuinely reconnected.
+      local i accessible=true
       for i in "${!MOUNT_POINTS[@]}"; do
-        timeout "$ACCESS_TIMEOUT" ls -d "${MOUNT_POINTS[$i]}" >/dev/null 2>&1 || true
+        timeout "$ACCESS_TIMEOUT" ls -A "${MOUNT_POINTS[$i]}" >/dev/null 2>&1 \
+          || accessible=false
       done
-      if unit_active mnt-icloud.mount && unit_active mnt-icloud_bridge.mount \
+      if [ "$accessible" = true ] \
+          && unit_active mnt-icloud.mount && unit_active mnt-icloud_bridge.mount \
           && mountpoint -q /mnt/icloud && mountpoint -q /mnt/icloud_bridge; then
         ready=true
         break
