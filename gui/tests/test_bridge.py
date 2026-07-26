@@ -377,3 +377,19 @@ def test_read_exclusions_still_uses_its_own_version_check(share):
         json.dumps({"version": 2, "revision": 0, "exclusions": []}), encoding="utf-8")
     with pytest.raises(bridge.BridgeError):
         bridge.read_exclusions()
+
+
+def test_minimum_revision_lifts_the_written_revision(share):
+    """A restore of an old snapshot still writes something strictly newer."""
+    revision = bridge.write_exclusions(["Docs"], expect_revision=0,
+                                       applied_revision=2, last_written=3,
+                                       minimum_revision=30)
+    assert revision == 31
+    assert bridge.read_exclusions()["revision"] == 31
+
+
+def test_minimum_revision_never_lowers_the_result(share):
+    (share / "exclusions.json").write_text(
+        json.dumps({"version": 1, "revision": 50, "exclusions": []}), encoding="utf-8")
+    revision = bridge.write_exclusions(["Docs"], expect_revision=50, minimum_revision=2)
+    assert revision == 51

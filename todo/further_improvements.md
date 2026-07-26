@@ -321,6 +321,11 @@ Files: `guest-agent/agent.ps1`, `provision/agent.ps1`,
 
 ## 4. Back up and explicitly restore selective-sync choices (D36, I-004)
 
+> **Status: done.** `backup.py` holds the snapshot rules, `write_exclusions`
+> gained `minimum_revision`, and the Selective Sync tab gained the previewed
+> **Restore from backup…** action plus the "not backed up" warning. D36 and E13
+> are recorded; the live half is E13 on the real host.
+
 `exclusions.json` is the one piece of unique configuration living inside the
 disposable VM, and the fail-closed provisioning rule (correctly) refuses to
 manufacture an empty one after loss. Give the operator a host-side copy and an

@@ -121,6 +121,36 @@ because it re-includes the whole subtree at once.
 
 ---
 
+## If the Windows VM is rebuilt
+
+The VM is disposable — the files live in iCloud — with one exception: your
+exclusion list. `exclusions.json` lives inside the guest, so a rebuilt VM comes
+back with nothing excluded, and the provisioning script deliberately refuses to
+invent an empty one for you (that would silently re-include everything at once).
+
+The app keeps a copy for exactly this. Every time it reads or applies your
+choices it saves them to
+`~/.local/state/icloud-bridge-gui/exclusions-backup.json` (or under
+`$XDG_STATE_HOME` if you set one), readable only by you. That copy is never
+restored automatically, and a *newer* saved copy is never overwritten by the
+empty configuration a rebuilt VM reports.
+
+To recover:
+
+1. Rebuild the VM and re-run the guest provisioning steps, ending with
+   `04-bridge-agent.ps1` (see `SETUP.md`).
+2. Start the app and wait for it to reach normal monitoring.
+3. On the **Selective Sync** tab, press **Restore from backup…**. It shows
+   exactly what will be excluded and re-included before it writes anything.
+4. Press **Apply** first if you have unapplied changes staged — restoring will
+   not silently discard them.
+
+If the tab warns that your choices are *not backed up*, the bridge is still
+working normally; only the local copy failed to write. Check the permissions on
+`~/.local/state/icloud-bridge-gui/` and the free space on your home filesystem.
+
+---
+
 ## Known limitations (accepted; do not file these as bugs)
 
 - **Renames of an excluded item are not followed.** Depending on how iCloud
@@ -262,6 +292,7 @@ destructive.
 | Desired-off marker (host) | `/var/lib/icloud-bridge/powered-off` — present ⇒ the GUI powered the bridge off (v2 plan D29) |
 | Power helper (host) | `/usr/local/bin/icloud-bridge-power on\|off`, root, run by the GUI via `sudo -n` |
 | Autostart entry (host) | `~/.config/autostart/icloud-bridge-tray.desktop` — the **Start when the computer starts** toggle flips its `Hidden=` |
+| Exclusion backup (host) | `$XDG_STATE_HOME/icloud-bridge-gui/exclusions-backup.json`, default `~/.local/state/…`, mode 0600 — the host-side copy **Restore from backup…** reads (v2 plan D36) |
 
 All three JSON files are plain UTF-8 and safe to `cat` when something looks
 wrong. Editing `exclusions.json` by hand works, but the revision number must

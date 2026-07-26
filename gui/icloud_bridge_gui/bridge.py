@@ -362,11 +362,19 @@ def next_revision(*candidates: Any) -> int:
 
 
 def write_exclusions(paths: Iterable[str], *, expect_revision: int | None = None,
-                     applied_revision: Any = None, last_written: Any = None) -> int:
+                     applied_revision: Any = None, last_written: Any = None,
+                     minimum_revision: Any = None) -> int:
     """Publish a new exclusion set; returns the revision actually written.
 
     ``expect_revision`` is the revision the UI loaded.  If the file has moved on
     since then, someone else edited it and we raise instead of clobbering.
+
+    ``minimum_revision`` is one more revision the result must exceed. A restore
+    (D36) passes the *backup's own* revision here, so restoring a snapshot taken
+    at a higher revision than the current config still writes something strictly
+    newer than everything anyone has seen. It is a separate parameter rather
+    than another ``last_written`` because those two mean different things and
+    overloading one of them is how a future reader gets it wrong.
     """
     wanted = canonicalize(paths)
     if len(wanted) > MAX_CONFIG_ENTRIES:
@@ -386,7 +394,8 @@ def write_exclusions(paths: Iterable[str], *, expect_revision: int | None = None
             f"exclusions.json moved from revision {expect_revision} to {current_revision}; reload first"
         )
 
-    revision = next_revision(current_revision, applied_revision, last_written)
+    revision = next_revision(current_revision, applied_revision, last_written,
+                             minimum_revision)
     payload = {"version": 1, "revision": revision, "exclusions": wanted}
     _write_json_atomic(os.path.join(bridge_dir(), "exclusions.json"), payload)
     return revision

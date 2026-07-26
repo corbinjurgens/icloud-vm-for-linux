@@ -20,7 +20,8 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget,
 )
 
-from . import __version__, bridge, filtering, firstrun, health, listing, power, sizes
+from . import (__version__, backup, bridge, filtering, firstrun, health, listing,
+               power, sizes)
 from .tray import VM_VIEWER_URL, open_externally
 
 ROLE_PATH = Qt.ItemDataRole.UserRole
@@ -59,6 +60,30 @@ def _fmt_count(value: Any) -> str:
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return f"{value:,}"
     return "-"
+
+
+def _save_backup(exclusions, revision, source) -> str:
+    """Write the D36 snapshot and describe the outcome, never raising.
+
+    The bridge operation and the local snapshot are two results. This returns a
+    message when the operator should be told something, and an empty string when
+    the snapshot is fine — so a caller can never accidentally turn a backup
+    problem into a bridge failure.
+    """
+    try:
+        outcome = backup.save(exclusions, revision, source)
+    except backup.BackupError as exc:
+        return (f"Your selective-sync choices are not backed up on this computer: "
+                f"{exc}")
+    if outcome == backup.KEPT_NEWER:
+        return ("The saved copy of your selective-sync choices is newer than the "
+                "configuration in the VM, so it was kept. If the VM was rebuilt, "
+                "use Restore from backup.")
+    if outcome == backup.CONFLICT:
+        return ("The saved copy of your selective-sync choices differs from the "
+                "VM's at the same revision, so it was kept. Reload, then Apply or "
+                "Restore from backup to settle which one is right.")
+    return ""
 
 
 class MainWindow(QMainWindow):
@@ -459,6 +484,15 @@ class MainWindow(QMainWindow):
         self._sync_error.hide()
         layout.addWidget(self._sync_error)
 
+        # The D36 backup is a *second* result: a bridge read or Apply that
+        # succeeded is still a success when only the local snapshot write
+        # failed, so this warns persistently rather than failing the operation.
+        self._backup_warning = QLabel("")
+        self._backup_warning.setWordWrap(True)
+        self._backup_warning.setStyleSheet(f"color: {DOT_COLORS[health.YELLOW]};")
+        self._backup_warning.hide()
+        layout.addWidget(self._backup_warning)
+
         self._tree_widget = QTreeWidget()
         self._tree_widget.setColumnCount(5)
         self._tree_widget.setHeaderLabels(["Name", "Size", "Items", "Included", "State"])
@@ -481,10 +515,17 @@ class MainWindow(QMainWindow):
         self._remove_button.setToolTip("Clear a configured exclusion whose item no longer exists")
         self._remove_button.setEnabled(False)
         self._remove_button.clicked.connect(self._remove_selected_missing)
+        self._restore_button = QPushButton("Restore from backup…")
+        self._restore_button.setToolTip(
+            "Preview and re-apply the selective-sync choices saved on this "
+            "computer. Use this after rebuilding the Windows VM.")
+        self._restore_button.setEnabled(False)
+        self._restore_button.clicked.connect(self._restore_from_backup)
         self._apply_button = QPushButton("Apply")
         self._apply_button.clicked.connect(self._apply)
         buttons.addWidget(self._reload_button)
         buttons.addWidget(self._remove_button)
+        buttons.addWidget(self._restore_button)
         buttons.addStretch(1)
         buttons.addWidget(self._apply_button)
         layout.addLayout(buttons)
@@ -707,14 +748,23 @@ class MainWindow(QMainWindow):
         """Re-read exclusions.json and rebuild the tree from the last tree.json."""
         if self._io_paused:
             return
-        def work():
-            return bridge.read_exclusions()
 
-        def done(config):
+        def work():
+            # The D36 snapshot is written on this worker thread, immediately
+            # after the read that produced it: it is local disk, not CIFS, and
+            # keeping the two together is what stops a stale selection being
+            # backed up later on the GUI thread.
+            config = bridge.read_exclusions()
+            return config, _save_backup(config["exclusions"], config["revision"],
+                                        backup.SOURCE_READ)
+
+        def done(result):
+            config, backup_note = result
             self._config_error = None
             self._loaded_revision = config["revision"]
             self._loaded_wanted = list(config["exclusions"])
             self._wanted = list(config["exclusions"])
+            self._set_backup_warning(backup_note)
             self._rebuild_tree()
 
         def failed(message: str):
@@ -1271,15 +1321,127 @@ class MainWindow(QMainWindow):
         self._refresh_state_column()
         self._update_excluded_summary()
 
+    # ----------------------------------------------- the D36 backup/restore --
+
+    def _set_backup_warning(self, message: str) -> None:
+        """Persistently warn about the local snapshot; empty text clears it."""
+        if message:
+            self._backup_warning.setText(message)
+            self._backup_warning.show()
+        else:
+            self._backup_warning.hide()
+
+    def _can_restore(self) -> bool:
+        """Restore needs a settled, writable, fully loaded selective-sync tab.
+
+        A staged but unapplied selection is deliberately a blocker rather than
+        something to discard silently: the operator asked for those changes.
+        """
+        if self._io_paused or self._apply_writing:
+            return False
+        if self._loaded_revision is None or self._config_error is not None:
+            return False
+        if not self._compatibility.writable:
+            return False
+        return not self._selection_is_dirty()
+
+    def _selection_is_dirty(self) -> bool:
+        return (sorted(w.lower() for w in self._wanted)
+                != sorted(w.lower() for w in self._loaded_wanted))
+
+    def _restore_from_backup(self) -> None:
+        """Explicit, previewed restore. Never automatic (D36)."""
+        if not self._can_restore():
+            if self._selection_is_dirty():
+                QMessageBox.information(
+                    self, "Apply or reload first",
+                    "You have selective-sync changes that have not been applied. "
+                    "Apply them, or press Reload to discard them, before "
+                    "restoring the saved copy.")
+            return
+
+        def work():
+            return backup.load()
+
+        def done(saved):
+            self._confirm_and_restore(saved)
+
+        def failed(message: str):
+            QMessageBox.critical(
+                self, "Cannot restore",
+                f"{message}\n\nNothing was changed.")
+
+        self._run_async(work, done, failed)
+
+    def _confirm_and_restore(self, saved) -> None:
+        result = backup.preview(saved, self._loaded_wanted)
+        if not result.changes_anything:
+            QMessageBox.information(
+                self, "Nothing to restore",
+                "The saved copy matches what is configured in the VM already.")
+            return
+
+        parts = [f"Saved {saved.saved_at or 'at an unknown time'} "
+                 f"(revision {saved.revision})."]
+        if result.additions:
+            parts.append("Exclude:\n" + "\n".join(f"  {p}" for p in result.additions)
+                         + "\n\n" + EXCLUDE_WARNING)
+        if result.removals:
+            parts.append("Re-include:\n" + "\n".join(f"  {p}" for p in result.removals)
+                         + "\n\n" + INCLUDE_WARNING)
+        answer = QMessageBox.question(
+            self, "Restore selective-sync choices?", "\n\n".join(parts),
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if answer != QMessageBox.StandardButton.Ok:
+            return
+
+        wanted = list(saved.exclusions)
+        expect = self._loaded_revision
+        applied = (self._status or {}).get("appliedRevision")
+        last_written = self._last_written_revision
+        # Strictly above every revision anyone has seen, including the backup's
+        # own — restoring an old snapshot must still move the config forwards.
+        minimum = saved.revision
+
+        def work():
+            revision = bridge.write_exclusions(
+                wanted, expect_revision=expect, applied_revision=applied,
+                last_written=last_written, minimum_revision=minimum)
+            return revision, _save_backup(wanted, revision, backup.SOURCE_APPLY)
+
+        def done(outcome):
+            revision, backup_note = outcome
+            self._apply_writing = False
+            self._last_written_revision = revision
+            self._last_write_at = datetime.now(timezone.utc)
+            self._loaded_wanted = list(wanted)
+            self._loaded_revision = revision
+            self._wanted = list(wanted)
+            self._set_backup_warning(backup_note)
+            self._rebuild_tree()
+
+        def failed(message: str):
+            self._apply_writing = False
+            QMessageBox.warning(
+                self, "Could not restore",
+                f"{message}\n\nNothing was changed. Reloading the current "
+                "configuration.")
+            self.reload_selective_sync()
+
+        self._apply_writing = True
+        self._run_async(work, done, failed)
+
     # ------------------------------------------------------------------ apply --
 
     def _update_buttons(self) -> None:
         selected = self._tree_widget.selectedItems()
         is_missing = bool(selected) and selected[0].data(0, ROLE_KIND) == "missing"
         self._remove_button.setEnabled(is_missing)
-        dirty = sorted(w.lower() for w in self._wanted) != sorted(w.lower() for w in self._loaded_wanted)
+        dirty = self._selection_is_dirty()
         self._apply_button.setEnabled(
             dirty and self._config_error is None and self._compatibility.writable)
+        self._restore_button.setEnabled(self._can_restore())
 
     def _remove_selected_missing(self) -> None:
         selected = self._tree_widget.selectedItems()
@@ -1335,16 +1497,23 @@ class MainWindow(QMainWindow):
         last_written = self._last_written_revision
 
         def work():
-            return bridge.write_exclusions(wanted, expect_revision=expect,
-                                           applied_revision=applied, last_written=last_written)
+            revision = bridge.write_exclusions(
+                wanted, expect_revision=expect, applied_revision=applied,
+                last_written=last_written)
+            # Apply has already succeeded at this point. A failed snapshot below
+            # is reported as a warning and must never route through the "Nothing
+            # was changed" dialog (D36).
+            return revision, _save_backup(wanted, revision, backup.SOURCE_APPLY)
 
-        def done(revision: int):
+        def done(result):
+            revision, backup_note = result
             self._apply_writing = False
             self._last_written_revision = revision
             self._last_write_at = datetime.now(timezone.utc)
             self._loaded_wanted = list(wanted)
             self._loaded_revision = revision
             self._wanted = list(wanted)
+            self._set_backup_warning(backup_note)
             self._refresh_check_states()
             self._refresh_state_column()
             self._update_buttons()

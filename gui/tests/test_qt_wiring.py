@@ -32,7 +32,11 @@ from PySide6.QtCore import QDeadlineTimer, QThreadPool, QTimer   # noqa: E402
 from PySide6.QtWidgets import QApplication                       # noqa: E402
 
 from icloud_bridge_gui import __main__ as app_module              # noqa: E402
-from icloud_bridge_gui import bridge, health, lifecycle, listing, power  # noqa: E402
+from icloud_bridge_gui import window as window_module             # noqa: E402
+
+_RealMessageBox = window_module.QMessageBox
+from icloud_bridge_gui import (backup, bridge, health, lifecycle, listing,  # noqa: E402
+                               power)
 
 
 # ------------------------------------------------------------------ fakes --
@@ -101,6 +105,59 @@ def green_snapshot():
                            overall=health.GREEN, status=None, tree=None)
 
 
+class FakeMessageBox:
+    """Stands in for `QMessageBox` so no modal dialog can ever open.
+
+    Offscreen Qt still runs a real modal event loop, so one unstubbed
+    `QMessageBox.question` hangs the whole suite. Replacing the name in the
+    window module's namespace removes that possibility by construction rather
+    than by remembering to patch each call site.
+    """
+
+    StandardButton = _RealMessageBox.StandardButton
+    Icon = _RealMessageBox.Icon
+    ButtonRole = _RealMessageBox.ButtonRole
+
+    #: What the next `question` returns; tests set this.
+    answer = _RealMessageBox.StandardButton.Cancel
+    calls: list[tuple[str, tuple]] = []
+
+    @classmethod
+    def reset(cls):
+        cls.answer = _RealMessageBox.StandardButton.Cancel
+        cls.calls = []
+
+    @classmethod
+    def count(cls, kind: str) -> int:
+        return sum(1 for name, _ in cls.calls if name == kind)
+
+    @classmethod
+    def question(cls, *args, **kwargs):
+        cls.calls.append(("question", args))
+        return cls.answer
+
+    @classmethod
+    def information(cls, *args, **kwargs):
+        cls.calls.append(("information", args))
+
+    @classmethod
+    def warning(cls, *args, **kwargs):
+        cls.calls.append(("warning", args))
+
+    @classmethod
+    def critical(cls, *args, **kwargs):
+        cls.calls.append(("critical", args))
+
+
+@pytest.fixture(autouse=True)
+def dialogs(monkeypatch):
+    """Every test in this file gets the fake; none can block on a modal."""
+    FakeMessageBox.reset()
+    monkeypatch.setattr(window_module, "QMessageBox", FakeMessageBox)
+    monkeypatch.setattr(app_module, "QMessageBox", FakeMessageBox)
+    return FakeMessageBox
+
+
 # --------------------------------------------------------------- fixtures --
 
 @pytest.fixture(scope="module")
@@ -113,9 +170,13 @@ def qapp():
 
 
 @pytest.fixture
-def fakes(monkeypatch):
+def fakes(monkeypatch, tmp_path):
     """Replace every subprocess, mount and dialog the controller can reach."""
+    # The D36 backup is real local-disk work inside the read/Apply workers, so
+    # point XDG state at a tmpdir before anything can touch the real one.
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     state = type("Fakes", (), {})()
+    state.state_home = tmp_path / "state"
     state.inspect = Recorder(power.DockerStatus("running", raw="running"))
     state.marker = Recorder(False)
     state.power_on = Recorder(power.HelperResult(True, 0, "bridge on"))
@@ -456,14 +517,25 @@ def snapshot_with(compat):
 
 
 def running_controller(controller, fakes):
+    """A controller in normal monitoring, with its startup work fully drained.
+
+    Draining matters: entering `running` schedules a selective-sync reload, and
+    a test that stubs something out while that reload is still in flight would
+    be racing its own fixture.
+    """
     app = controller()
     pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.RUNNING)
+    pump(1.0, until=lambda: app._active == 0)
     window = app._window
+    # A verified protocol, so the D35 gate is not the thing under test here.
+    window.apply_snapshot(
+        snapshot_with(bridge.Compatibility(bridge.COMPAT_CURRENT, bridge.AGENT_BUILD)))
     # A loaded selection with a staged change, so Apply would otherwise be live.
     window._loaded_wanted = []
     window._loaded_revision = 3
     window._config_error = None
     window._wanted = ["Docs"]
+    window._set_backup_warning("")
     return app, window
 
 
@@ -533,3 +605,135 @@ def test_powering_off_reverts_the_gate_to_unknown(controller, fakes):
     assert window._compatibility.state == bridge.COMPAT_UNKNOWN
     assert not window._compatibility.writable
     assert not window._protocol.isVisible()
+
+
+# ------------------------------------------ the D36 backup/restore (controller) --
+
+def test_a_validated_read_writes_the_backup_on_the_worker(controller, fakes):
+    fakes.read_exclusions.result = {"revision": 5, "exclusions": ["Docs/Big"]}
+    app, window = running_controller(controller, fakes)
+    window.reload_selective_sync()
+    pump(2.0, until=lambda: window._loaded_revision == 5)
+
+    saved = backup.load(str(fakes.state_home))
+    assert saved.revision == 5
+    assert saved.exclusions == ("Docs/Big",)
+    assert saved.source == backup.SOURCE_READ
+    assert window._backup_warning.isHidden()
+
+
+def test_a_read_whose_backup_fails_still_loads_the_selection(controller, fakes,
+                                                             monkeypatch):
+    """Two results: the bridge read succeeded, only the local snapshot did not."""
+    fakes.read_exclusions.result = {"revision": 5, "exclusions": ["Docs/Big"]}
+    app, window = running_controller(controller, fakes)
+    monkeypatch.setattr(backup, "save",
+                        Recorder(error=backup.BackupError("disk full")))
+
+    window.reload_selective_sync()
+    pump(2.0, until=lambda: window._loaded_revision == 5)
+    assert window._loaded_wanted == ["Docs/Big"]        # the selection loaded
+    assert not window._backup_warning.isHidden()
+    assert "not backed up" in window._backup_warning.text()
+
+
+def test_an_apply_whose_backup_fails_is_still_an_apply(controller, fakes, monkeypatch, dialogs):
+    """It must never route through the "Nothing was changed" failure dialog."""
+    app, window = running_controller(controller, fakes)
+    monkeypatch.setattr(bridge, "write_exclusions", Recorder(9))
+    monkeypatch.setattr(backup, "save",
+                        Recorder(error=backup.BackupError("disk full")))
+    dialogs.answer = dialogs.StandardButton.Ok
+
+    window._apply()
+    pump(2.0, until=lambda: window._loaded_revision == 9)
+    assert window._loaded_revision == 9
+    assert window._loaded_wanted == ["Docs"]
+    assert dialogs.count("warning") == 0
+    assert not window._backup_warning.isHidden()
+
+
+def test_a_dirty_staged_selection_blocks_restore(controller, fakes, monkeypatch, dialogs):
+    app, window = running_controller(controller, fakes)
+    window.apply_snapshot(
+        snapshot_with(bridge.Compatibility(bridge.COMPAT_CURRENT, bridge.AGENT_BUILD)))
+    assert window._selection_is_dirty()
+    assert not window._can_restore()
+    assert not window._restore_button.isEnabled()
+
+    loaded = Recorder(None)
+    monkeypatch.setattr(backup, "load", loaded)
+
+    window._restore_from_backup()
+    pump(0.3)
+    assert loaded.count == 0            # the backup was not even read
+    assert dialogs.count("information") == 1
+
+
+def test_restore_is_offered_once_the_selection_is_settled(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    window._wanted = list(window._loaded_wanted)         # settle it
+    window.apply_snapshot(
+        snapshot_with(bridge.Compatibility(bridge.COMPAT_CURRENT, bridge.AGENT_BUILD)))
+    assert window._can_restore()
+    assert window._restore_button.isEnabled()
+
+
+def test_restore_is_refused_while_the_protocol_is_incompatible(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    window._wanted = list(window._loaded_wanted)
+    window.apply_snapshot(
+        snapshot_with(bridge.Compatibility(bridge.COMPAT_INCOMPATIBLE, None, "version 2")))
+    assert not window._can_restore()
+    assert not window._restore_button.isEnabled()
+
+
+def test_restore_writes_above_every_observed_revision(controller, fakes, monkeypatch, dialogs):
+    app, window = running_controller(controller, fakes)
+    window._wanted = list(window._loaded_wanted)
+    window._loaded_revision = 3
+    window._last_written_revision = 4
+    window._status = {"appliedRevision": 2}
+
+    written = Recorder(31)
+    monkeypatch.setattr(bridge, "write_exclusions", written)
+    dialogs.answer = dialogs.StandardButton.Ok
+
+    window._confirm_and_restore(backup.Backup(revision=30, exclusions=("Docs/Big",),
+                                              saved_at="2026-07-26T12:00:00Z"))
+    pump(2.0, until=lambda: written.count == 1)
+    args, kwargs = written.calls[0]
+    assert args[0] == ["Docs/Big"]
+    assert kwargs["expect_revision"] == 3
+    assert kwargs["applied_revision"] == 2
+    assert kwargs["last_written"] == 4
+    assert kwargs["minimum_revision"] == 30
+
+
+def test_a_restore_that_would_change_nothing_says_so(controller, fakes, monkeypatch,
+                                                    dialogs):
+    app, window = running_controller(controller, fakes)
+    window._loaded_wanted = ["Docs/Big"]
+    window._wanted = ["Docs/Big"]
+    written = Recorder(5)
+    monkeypatch.setattr(bridge, "write_exclusions", written)
+    window._confirm_and_restore(backup.Backup(revision=2, exclusions=("Docs/Big",)))
+    pump(0.3)
+    assert written.count == 0
+    assert dialogs.count("information") == 1
+
+
+def test_a_missing_backup_is_an_error_dialog_and_changes_nothing(controller, fakes,
+                                                                 monkeypatch, dialogs):
+    app, window = running_controller(controller, fakes)
+    window._wanted = list(window._loaded_wanted)
+    written = Recorder(5)
+    monkeypatch.setattr(bridge, "write_exclusions", written)
+    # The startup reload already wrote one; a missing backup is the case here.
+    os.unlink(backup.backup_path(str(fakes.state_home)))
+
+    window._restore_from_backup()
+    pump(2.0, until=lambda: dialogs.count("critical") == 1)
+    assert dialogs.count("critical") == 1
+    assert written.count == 0
+    assert window._loaded_wanted == []
