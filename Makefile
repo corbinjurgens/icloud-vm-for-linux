@@ -136,8 +136,11 @@ lint-ps: $(PWSH) ## Parse the .ps1 files with PowerShell 7 (downloads ~70 MB)
 test-ps: $(PWSH) ## Run the guest-agent checks that a Linux host can actually run
 	@echo "==> Bridge JSON serializer byte-identity"
 	@$(PWSH) -NoProfile -NonInteractive -File tools/test-bridge-json.ps1
-	@echo "NOTE: this proves the serializer's output contract only. Nothing here"
-	@echo "      exercises CfAPI, ACLs, or Windows PowerShell 5.1 itself."
+	@echo "==> Walk emission order and DFS cursor comparator"
+	@$(PWSH) -NoProfile -NonInteractive -File tools/test-agent-walk.ps1
+	@echo "NOTE: this proves the serializer's output contract and the walk's"
+	@echo "      ordering contract only. Nothing here exercises CfAPI, ACLs, or"
+	@echo "      Windows PowerShell 5.1 itself."
 
 check: lint test ## Everything verifiable without a VM: lint + tests
 

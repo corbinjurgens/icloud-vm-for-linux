@@ -76,7 +76,7 @@ $ShareUser = "syncshare"
 # behavior, so a GUI shipped alongside a newer agent can say so. The GUI carries
 # the same number in bridge.py and a test compares the two literals.
 $ProtocolVersion = 1
-$AgentBuild      = 2
+$AgentBuild      = 3
 
 # Cloud Files / FILE_ATTRIBUTE values.
 # DIRECTORY and UNPINNED are listed for reference and are deliberately unused:
@@ -240,6 +240,28 @@ public static class IcloudBridgeNative {
             } while (FindNextFileW(h, out fd));
         } finally { FindClose(h); }
         return list.ToArray();
+    }
+
+    /// Sorts entries into the walk's emission order: OrdinalIgnoreCase with an
+    /// Ordinal tiebreak. Compiled, because the PowerShell walks previously
+    /// re-created a scriptblock comparator per directory and paid a delegate
+    /// dispatch per comparison. Every ordered walk must use exactly this order
+    /// or Compare-RelPathDfs disagrees with it and the ACL resume cursor can
+    /// skip never-visited subtrees; tools/test-agent-walk.ps1 is the fixture.
+    ///
+    /// Returns its argument so PowerShell callers can rebind: assignment from
+    /// a function call has already collected Enumerate's array into Object[]
+    /// (or a bare scalar, or null for an empty directory), and the parameter
+    /// conversion here re-materializes the NativeEntry[] the caller must keep.
+    public static NativeEntry[] SortByName(NativeEntry[] entries) {
+        if (entries != null && entries.Length > 1) Array.Sort(entries, CompareByName);
+        return entries;
+    }
+
+    static int CompareByName(NativeEntry a, NativeEntry b) {
+        int r = string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
+        if (r != 0) return r;
+        return string.CompareOrdinal(a.Name, b.Name);
     }
 
     /// True when the object can be opened for READ_CONTROL | WRITE_DAC, i.e.
@@ -923,6 +945,12 @@ function Read-WantedConfig {
 # ============================================================ tree walking ===
 
 function Get-Entries {
+    # PowerShell collects this function's output, so callers receive Object[]
+    # for two or more entries, a bare NativeEntry for one, and $null for an
+    # empty directory. foreach tolerates all three; anything else (AddRange,
+    # .Count, indexing) does not. Ordered walks must pass the result through
+    # [IcloudBridgeNative]::SortByName and keep its return value, which also
+    # re-materializes a real NativeEntry[].
     param([string]$Full)
     return [IcloudBridgeNative]::Enumerate($Full)
 }
@@ -938,7 +966,7 @@ function Measure-SubtreeCheap {
         if ($e.IsDirectory) {
             if (-not (Test-CloudReparseTag $e.ReparseTag)) { continue }
             $Acc.dirCount++
-            Measure-SubtreeCheap (Join-Path $Full $e.Name) $Acc
+            Measure-SubtreeCheap ($Full + '\' + $e.Name) $Acc
         } else {
             $Acc.fileCount++
             $Acc.logicalBytes += $e.Length
@@ -980,7 +1008,7 @@ function Measure-ExclusionAllocation {
     $entries = @()
     try { $entries = Get-Entries $Full } catch { $Acc.unreadable++; return }
     foreach ($e in $entries) {
-        $child = Join-Path $Full $e.Name
+        $child = $Full + '\' + $e.Name
         if ($e.IsDirectory) {
             if (-not (Test-CloudReparseTag $e.ReparseTag)) { continue }
             Measure-ExclusionAllocation $child $true $Acc
@@ -1324,18 +1352,11 @@ function Get-SweepCandidates {
     param([string]$Full, [string]$Rel, [string[]]$ExcludedRoots, [hashtable]$Acc, [bool]$WantRecall)
     $entries = @()
     try { $entries = Get-Entries $Full } catch { return }
-    $sorted = New-Object System.Collections.Generic.List[object]
-    $sorted.AddRange($entries)
-    $sorted.Sort([System.Comparison[object]]{
-        param($a, $b)
-        $r = [string]::Compare($a.Name, $b.Name, [StringComparison]::OrdinalIgnoreCase)
-        if ($r -ne 0) { return $r }
-        return [string]::CompareOrdinal($a.Name, $b.Name)
-    })
-    foreach ($e in $sorted) {
+    $entries = [IcloudBridgeNative]::SortByName($entries)
+    foreach ($e in $entries) {
         $childRel = if ($Rel -eq '') { $e.Name } else { "$Rel/$($e.Name)" }
         if (Test-IsUnderAny $childRel $ExcludedRoots) { continue }
-        $child = Join-Path $Full $e.Name
+        $child = $Full + '\' + $e.Name
         if ($e.IsDirectory) {
             if (-not (Test-CloudReparseTag $e.ReparseTag)) { continue }
             Get-SweepCandidates $child $childRel $ExcludedRoots $Acc $WantRecall
@@ -1618,19 +1639,12 @@ function Invoke-FullScan {
         }
         $entries = @()
         try { $entries = Get-Entries $Full } catch { return $node }
-        $sorted = New-Object System.Collections.Generic.List[object]
-        $sorted.AddRange($entries)
-        $sorted.Sort([System.Comparison[object]]{
-            param($a, $b)
-            $r = [string]::Compare($a.Name, $b.Name, [StringComparison]::OrdinalIgnoreCase)
-            if ($r -ne 0) { return $r }
-            return [string]::CompareOrdinal($a.Name, $b.Name)
-        })
+        $entries = [IcloudBridgeNative]::SortByName($entries)
         $childDirs = New-Object System.Collections.Generic.List[object]
-        foreach ($e in $sorted) {
+        foreach ($e in $entries) {
             $totals.entries++
             $childRel = if ($Rel -eq '') { $e.Name } else { "$Rel/$($e.Name)" }
-            $childFull = Join-Path $Full $e.Name
+            $childFull = $Full + '\' + $e.Name
 
             # --- bounded, resumable ACL reconciliation -----------------------
             if ($aclActive -and [DateTime]::UtcNow -lt $aclDeadline) {
@@ -1843,6 +1857,10 @@ function Write-Status {
 
 function Initialize-Agent {
     if (-not [IO.Directory]::Exists($SyncRoot)) { throw "sync root not found: $SyncRoot" }
+    # No trailing separator: the recursive walks build every child path by plain
+    # concatenation ($Full + '\' + $e.Name), which is only equivalent to
+    # Join-Path while this invariant holds. It cannot make a drive root bare
+    # ("C:") because the sync root is always a directory below one.
     $script:SyncRootFull = ([IO.Path]::GetFullPath($SyncRoot)).TrimEnd('\')
     foreach ($d in @($BridgeDir, $StateDir, (Join-Path $BridgeDir 'requests'), (Join-Path $BridgeDir 'responses'))) {
         if (-not [IO.Directory]::Exists($d)) { throw "bridge directory missing (run 04-bridge-agent.ps1): $d" }

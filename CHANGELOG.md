@@ -122,19 +122,20 @@ needs `SHARE_PASS`, so it is the operator's to run.
 
 ### I-009 — Reduce the guest agent's per-entry walk cost
 
-**Status:** Candidate, measured under PowerShell 7 on Linux  
+**Status:** Main item shipped 2026-07-26 (see the shipped entry); remainder below  
 **Evidence:** Follows the same review that produced the serializer work already
-shipped below, and is the remainder of it. All four recursive walks call
-`Join-Path` per entry (`agent.ps1` `Measure-SubtreeCheap`,
-`Measure-ExclusionAllocation`, `Get-SweepCandidates`, `Build-Node`) — a
-provider-aware cmdlet, measured at 31.4 us/call against 1.16 us for string
-concatenation — and two of them additionally build a `List[object]` and sort it
-with a **scriptblock** comparator per directory, ~54 us/entry at 20 entries per
-directory. Aggregate ~84 us/entry, so ~8.4 s per pass at 100k entries.
+shipped below, and is the remainder of it. The per-entry `Join-Path` calls and
+the per-directory scriptblock sorts are gone — measured 61.5 us -> 0.84 us of
+overhead per entry under PowerShell 7, and the rewrite also fixed a real crash;
+both are described in the shipped entry. What a Linux checkout cannot prove
+remains open: `Join-Path`-equivalence of the concatenated paths on the guest
+(argued from the startup `TrimEnd('\')` invariant, not demonstrated), Windows
+PowerShell 5.1 timings, and the actual pass-duration change on the operator's
+library.
 
 Two further items from the same review, both **worth nothing on a guest with no
 exclusions configured** and both requiring a locked row to be amended first, so
-they rank behind the above:
+they stayed out of the shipped change:
 
 - Skip the per-entry DACL read inside a validated excluded root during
   `Invoke-FullScan` reconciliation, where the target-deny removal condition is
@@ -159,9 +160,10 @@ is reopened here.
 
 **Completion gate:** emission order stays exactly OrdinalIgnoreCase-then-Ordinal
 — `Compare-RelPathDfs` must match the walk's comparator or the ACL resume cursor
-can skip never-visited subtrees — proven by a fixture under `make test-ps`; and
-path-concatenation equivalence to `Join-Path` is confirmed **on the guest**,
-because a Linux host cannot prove it.
+can skip never-visited subtrees — now proven by `tools/test-agent-walk.ps1`
+under `make test-ps`. Still open: path-concatenation equivalence to `Join-Path`
+is confirmed **on the guest**, because a Linux host cannot prove it, and the
+next agent restart there shows a `tree` pass completing on the real library.
 
 ### I-010 — Attribute the guest's idle CPU burn
 
@@ -237,6 +239,49 @@ Bumping the minor digit is a one-line change; `Makefile` and
 happens after that, never before.
 
 ## Shipped improvements
+
+### 2026-07-26 — The agent's walks: 73x less overhead, and a crash found under them
+
+The main item of I-009, plus a bug the rewrite surfaced that turned out to
+matter more than the speed.
+
+- **Every ordered walk now sorts in the compiled helper and builds child paths
+  by concatenation.** `Get-SweepCandidates` and `Build-Node` re-created a
+  scriptblock comparator per directory and paid a delegate dispatch per
+  comparison; all four recursive walks (`Measure-SubtreeCheap`,
+  `Measure-ExclusionAllocation` included) called provider-aware `Join-Path` per
+  entry. The comparator moved into `IcloudBridgeNative.SortByName` — same
+  OrdinalIgnoreCase-then-Ordinal order, now asserted by the new
+  `tools/test-agent-walk.ps1` under `make test-ps`, whose expectations were
+  captured from the retired scriptblock comparator first — and child paths are
+  `$Full + '\' + $e.Name`, valid because `$SyncRootFull` is `TrimEnd('\')`-ed at
+  startup. Modeled at 20 entries/directory under PowerShell 7: 61.5 us -> 0.84 us
+  overhead per entry, ~6.2 s -> ~0.08 s per 100k-entry pass. The fixture also
+  pins the trap the DFS cursor comparator exists for: siblings with characters
+  below `/` sort differently as flat strings than the walk emits them.
+- **The old code crashed on directories with zero or one entry — every pass.**
+  Discovered while proving the rewrite safe, not by a report. PowerShell
+  collects `Get-Entries`' output, so a single-entry directory yields a bare
+  scalar and an empty one yields `$null`; `List[object].AddRange` throws on
+  both, and the agent runs under `$ErrorActionPreference = 'Stop'`. Any such
+  directory anywhere in the library aborted the entire ten-minute `tree.json`
+  pass (caught and reported only as a `tree` subtask error) and the reclamation
+  sweep's candidate walk the same way. Real libraries contain single-entry
+  directories almost by definition, so the ten-minute pass has plausibly never
+  completed on the operator's guest — nothing host-side can see that without a
+  mount, which is itself I-001/I-008 territory. `SortByName` accepts and
+  returns all three shapes (`tools/test-agent-walk.ps1` asserts the null,
+  scalar and `Object[]` cases), and the accumulator-only walks were already
+  `foreach`-safe.
+- `$AgentBuild` 2 -> 3 with the matching bump in `bridge.py`, so a guest still
+  running the old agent shows the D35 re-run banner rather than being silently
+  slower (and silently broken on such directories). The operator step is the
+  usual one: re-run `C:\OEM\04-bridge-agent.ps1` elevated.
+
+**Verified here:** `make check` (452 tests without Qt), `make test-all`,
+`make lint-ps`, `make test-ps` including the new fixture. **Not verified here:**
+Windows PowerShell 5.1 execution, `Join-Path` equivalence on a real `C:` path,
+and the crash fix against a real library — the checkout has no guest (I-001).
 
 ### 2026-07-26 — First measurements from a real guest, and what they changed
 
