@@ -491,9 +491,11 @@ neither can reach a container or a guest that already exists:
   before that line keeps running without it, and dockur silently falls back to
   userspace virtio, so QEMU copies every SMB byte through its own main loop.
 - `03-create-share.ps1` gained `RequireSecuritySignature $false`, but that runs
-  inside the guest. Until you re-run it, Windows keeps signing every byte on both
-  ends of a path where there is nothing to protect (the host is the security
-  boundary, D9, and the ports are loopback-only).
+  inside the guest, so re-running it is the only way an existing guest gets it.
+  While signing is on, Windows HMACs every byte on both ends of a path where
+  there is nothing to protect (the host is the security boundary, D9, and the
+  ports are loopback-only). Whether your guest currently has signing on is worth
+  checking rather than assuming — see the note below the commands.
 
 Do it in this order. Do **not** `docker rm` or `docker kill` a live bridge —
 that is what the ordered teardown exists to prevent:
@@ -511,12 +513,23 @@ idempotent, which is why this is safe:
 C:\OEM\03-create-share.ps1
 ```
 
-`make acceptance` proves the first half from the host. The second half has no
-host-side check: an automated probe was attempted and withdrawn (see the
-2026-07-26 entry in `CHANGELOG.md` for why), so re-running the script is the
-mechanism. If you want the throughput number, run `tools/test-smb-read.sh` before
-and after — that is the only honest measurement of what these two are worth, and
-it needs `SHARE_PASS`.
+`make acceptance` proves the D33 half from the host, and it is the half that is
+definitely worth doing: a container that predates the compose line provably
+cannot have the device, because Docker sets devices only at create time.
+
+The D32 half has **no host-side check**, and the honest state of it is that a
+raw-packet probe was attempted, produced a signing-required reading four times,
+then stopped reproducing entirely — see the 2026-07-26 entry in `CHANGELOG.md`.
+So do not take "your guest requires signing" on faith. Ask the guest itself:
+
+```powershell
+Get-SmbServerConfiguration | Select-Object RequireSecuritySignature, EncryptData, RejectUnencryptedAccess
+```
+
+All three should read `False` (D32: off, deliberately — do not "harden" them).
+If any is `True`, `03-create-share.ps1` sets them. If you want the throughput
+number these two are worth, run `tools/test-smb-read.sh` before and after; it
+needs `SHARE_PASS`, so it is yours to run.
 
 ## Optional host tuning (measure first, none of this is installed for you)
 

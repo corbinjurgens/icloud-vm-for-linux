@@ -79,22 +79,30 @@ has a dated result in
 [`docs/acceptance-results.md`](docs/acceptance-results.md), with failures turned
 into fixes or explicit accepted limitations.
 
-### I-008 — Apply D32 and D33 to the running guest
+### I-008 — Apply D33 to the running guest, and re-confirm D32
 
 **Status:** Ready; operator action only, no code  
 **Evidence:** Measured on the author's live host on 2026-07-26. The container had
 been running since 2026-07-25, and commit `26d29ac` — which added
 `/dev/vhost-net` to `docker-compose.yml` for D33 and the signing assertions to
-`03-create-share.ps1` for D32 — landed on 2026-07-26. Both were therefore
-unapplied to the guest that was actually running, and **neither was detectable by
-any check in the repository**:
+`03-create-share.ps1` for D32 — landed on 2026-07-26. Neither could reach a
+container or guest that already existed, and **neither was detectable by any
+check in the repository**. The two halves now stand on very different footing:
 
-- `docker inspect` listed only `/dev/kvm` and `/dev/net/tun`, and the guest
-  QEMU command line carried a plain `tap,...` netdev with no `vhost=on`. Every
-  SMB byte was being copied through QEMU's userspace main loop.
-- An unauthenticated SMB2 NEGOTIATE to `127.0.0.1:10445` returned security mode
-  `0x0003` — signing **required** — so `03-create-share.ps1` had not been re-run
-  since that assertion was added.
+- **D33 — confirmed, and re-confirmed after a host restart.** `docker inspect`
+  lists only `/dev/kvm` and `/dev/net/tun`, and the guest QEMU command line
+  carries a plain `tap,...` netdev with no `vhost=on`, so every SMB byte is
+  copied through QEMU's userspace main loop. Docker applies a device list only
+  when it **creates** a container, so restarting — even across a host reboot —
+  provably cannot fix this. Reproduce with `make acceptance`.
+- **D32 — observed, then not reproducible. Treat as unconfirmed.** An
+  unauthenticated SMB2 NEGOTIATE returned security mode `0x0003` (signing
+  required) four consecutive times, then stopped being answered at all, and has
+  not been answered since — including after a cold boot of the guest. The follow-up
+  showed the guest's SMB server is healthy and was correctly rejecting a malformed
+  probe packet; see the withdrawal note in the shipped entry below. Do not spend
+  anything on this until it is re-confirmed **from inside the guest**, where
+  `Get-SmbServerConfiguration` answers it directly and without guesswork.
 
 `host/acceptance-tests.sh` tested `[ -e /dev/vhost-net ]`, a *host* fact, and
 printed PASS while the container lacked the device. That gap is now closed (see
@@ -103,7 +111,8 @@ the shipped entry below); the remediation itself is still outstanding.
 **What the operator runs**, in this order: power the bridge down through the D29
 helper (never `docker rm`/`docker kill` a live bridge); `docker compose up -d` to
 recreate the container with the device; then re-run `C:\OEM\03-create-share.ps1`
-elevated in the guest. `make acceptance` then confirms the first half.
+elevated in the guest. That script is idempotent, so running it settles the D32
+question rather than requiring it to be diagnosed first.
 
 **Completion gate:** `make acceptance` reports the container device and
 `vhost=on` checks green, and a before/after of `tools/test-smb-read.sh` is
@@ -292,20 +301,41 @@ which bounds every host-side knob at roughly 5% of one core. Writes run
 **Two things were attempted and withdrawn**, recorded so they are not retried
 blind:
 
-- An automated SMB posture probe. The D32 finding above is real and was
-  reproduced several times, but a checked-in tool that runs a raw
-  unauthenticated NEGOTIATE proved unshippable. The layout every specification
-  and implementation agrees on — 36 bytes of fixed fields, matching the Linux
-  kernel's own `smb2_negotiate_req` — is answered by this guest only when the
-  dialect array is written at offset 40 instead; and after roughly 25 abandoned
-  handshakes the guest's SMB server began closing *every* connection for minutes
-  at a time, including framings that had worked moments earlier. An acceptance
-  check that can produce false failures, and that has to poke a live guest to
-  run, is worse than none. The guest was verified healthy afterwards (container
-  up, no restarts, CPU normal, web viewer and TCP fine). Explaining the framing
-  — ideally by capturing what the kernel `cifs` client puts on the wire during a
-  real mount and diffing — is open work. Until then the D32 check is the
-  operator's, via `03-create-share.ps1` being idempotent.
+- An automated SMB posture probe, and with it the confidence in this review's
+  **D32 finding**. A hand-rolled unauthenticated SMB2 NEGOTIATE returned security
+  mode `0x0003` — signing required — four consecutive times early in the session,
+  each a well-formed response with `STATUS_SUCCESS` and coherent capabilities and
+  I/O sizes. Later in the same session the identical packet stopped being
+  answered, and it has not been answered since, **including after a full host
+  restart that cold-booted the guest**.
+
+  What the follow-up established, so the next reader does not repeat it. The
+  guest's SMB server is healthy and behaving correctly: a connection that sends
+  nothing stays open for at least 6 s, deliberate garbage is closed, and the
+  guest answers ping on the QEMU network with the DNAT rules unchanged. So the
+  server is **rejecting this probe's packet as malformed, which is the correct
+  response to it** — the probe was wrong, the guest was not. Two claims made
+  earlier in this session were consequently withdrawn: that repeated handshakes
+  had put the server into a refusing state (a cold boot would have cleared that,
+  and did not), and that a 40-byte dialect offset was reliably accepted (it is
+  now rejected too).
+
+  **What this means for D32: treat "signing is required on this guest" as
+  unconfirmed.** Four coherent readings are not nothing, but a measurement that
+  cannot be reproduced is not evidence to act on, and the mechanism that produced
+  those four answers is not understood. Re-confirm before spending anything on
+  it. The honest check is not a raw packet at all: run `03-create-share.ps1`,
+  which is idempotent and asserts the setting directly, or read
+  `Get-SmbServerConfiguration` in the guest. A host-side check would need to
+  capture what the kernel `cifs` client actually puts on the wire during a real
+  mount and copy that, rather than being written from the specification.
+
+  The D33 half of I-008 is unaffected and was re-verified after the restart:
+  `docker inspect` still lists only `/dev/kvm` and `/dev/net/tun`, and the guest
+  QEMU command line still has no `vhost=on`. Docker applies a device list only
+  when it **creates** a container, so a restart — even across a host reboot —
+  cannot pick it up. That is exactly why the new checks ask the container and
+  QEMU rather than the host.
 - Nothing else. The remaining reviewed candidates are I-009 to I-011 above; the
   ideas rejected outright are R-025 onward below.
 
