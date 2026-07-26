@@ -27,12 +27,14 @@ Deliberate boundaries:
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Callable
 
-from .power import (CONTAINER_NAME, HELPER_PATH, RunResult, Runner,
-                    default_runner, docker_runner)
+from . import backup
+from .power import (CONTAINER_NAME, HELPER_PATH, RunResult, Runner, default_runner,
+                    docker_env, docker_runner, streaming_runner)
 
 # --------------------------------------------------------------- constants --
 
@@ -413,9 +415,18 @@ def compose_argv(bundle: Bundle, env_file: str, *, action: str = "up") -> list[s
 
 
 def create_vm(bundle: Bundle, env_file: str, *,
-              runner: Runner = docker_runner,
-              timeout: float = COMPOSE_TIMEOUT_SECONDS) -> tuple[bool, str]:
-    """Run ``docker compose up -d``; returns ``(ok, bounded diagnostic)``."""
+              runner: Runner | None = None,
+              timeout: float = COMPOSE_TIMEOUT_SECONDS,
+              on_line: Callable[[str], None] | None = None) -> tuple[bool, str]:
+    """Run ``docker compose up -d``; returns ``(ok, bounded diagnostic)``.
+
+    ``on_line`` streams Compose's own output (v2 plan D38). Note what `up -d`
+    covers: the image pull and container creation, **not** the 20-40 minute
+    Windows installation that follows — that has no subprocess to stream at all.
+    """
+    if runner is None:
+        runner = (docker_runner if on_line is None
+                  else streaming_runner(on_line, env=docker_env()))
     result = _run(runner, compose_argv(bundle, env_file), timeout)
     output = "\n".join(part for part in
                        ((result.stdout or "").strip(), (result.stderr or "").strip())
@@ -486,3 +497,123 @@ def check_host_setup(*, runner: Runner = default_runner,
                                 (result.stderr or "not permitted").strip(),
                                 "sudo icloud-bridge-configure --user $USER"))
     return checks
+
+
+# ------------------------------- the interrupted-provisioning record (D39) --
+# The GUI can be closed, crash, or be logged out during the 20-40 minutes a
+# Windows install takes. Without a record, the next launch sees a running
+# container with no configuration and has to guess; D31's no-CIFS Provisioning
+# state is exactly what must survive that gap.
+#
+# The record is private local state, never CIFS, and deliberately holds *no*
+# env-file path and no env-file content: it must be safe to read and must never
+# become a second place a share password can live.
+
+PROVISIONING_RECORD = "provisioning.json"
+PROVISIONING_VERSION = 1
+
+#: Classifications of a record against what Docker currently reports.
+RECORD_ABSENT = "absent"            # no record; ordinary startup rules apply
+RECORD_MATCHES = "matches"          # same container: resume Provisioning Windows
+RECORD_CONTAINER_GONE = "gone"      # the container is not there: back to Setup
+RECORD_DIFFERENT = "different"      # a different container owns the name
+RECORD_MALFORMED = "malformed"      # unreadable: report it, never silently drop
+
+
+@dataclass(frozen=True)
+class ProvisioningRecord:
+    started_at: str
+    phase: str = "creating"
+    container_id: str = ""
+
+
+def provisioning_path(base: str | None = None) -> str:
+    return os.path.join(backup.app_dir(base), PROVISIONING_RECORD)
+
+
+def write_provisioning_record(record: ProvisioningRecord,
+                              base: str | None = None) -> None:
+    """Record the intent **before** Compose runs, atomically and mode 0600."""
+    backup.ensure_app_dir(base)
+    path = provisioning_path(base)
+    backup.check_destination(path)
+    backup.write_json_atomic(path, {
+        "version": PROVISIONING_VERSION,
+        "startedAt": record.started_at,
+        "phase": record.phase,
+        "containerId": record.container_id,
+    })
+
+
+def read_provisioning_record(base: str | None = None) -> ProvisioningRecord | None:
+    """The saved record, or ``None`` when there is none.
+
+    Raises :class:`backup.BackupError` for a record that exists but cannot be
+    trusted — a malformed record enters Setup with a diagnostic and is never
+    silently deleted, nor treated as proof that a VM is configured.
+    """
+    path = provisioning_path(base)
+    if os.path.islink(path):
+        raise backup.BackupError(f"{path} is a symlink; refusing to read through it")
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(64 * 1024)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise backup.BackupError(f"cannot read {path}: {exc}") from exc
+    try:
+        document = json.loads(raw.decode("utf-8-sig", errors="strict"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise backup.BackupError(f"{path} is not readable: {exc}") from exc
+    if not isinstance(document, dict):
+        raise backup.BackupError(f"{path} is not a JSON object")
+    if document.get("version") != PROVISIONING_VERSION:
+        raise backup.BackupError(f"{path} has an unsupported version")
+    started = document.get("startedAt")
+    if not isinstance(started, str) or not started:
+        raise backup.BackupError(f'{path} has no usable "startedAt"')
+    phase = document.get("phase")
+    container_id = document.get("containerId")
+    return ProvisioningRecord(
+        started_at=started,
+        phase=phase if isinstance(phase, str) and phase else "creating",
+        container_id=container_id if isinstance(container_id, str) else "")
+
+
+def clear_provisioning_record(base: str | None = None) -> None:
+    """Remove the record. Only ever after a successful connect, or a confirmed
+    discard — never as a side effect of failing to understand it."""
+    try:
+        os.unlink(provisioning_path(base))
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise backup.BackupError(f"cannot remove the record: {exc}") from exc
+
+
+def classify_record(record: ProvisioningRecord | None, container_state: str,
+                    container_id: str) -> str:
+    """Match a record against what Docker reports right now.
+
+    A pre-Compose record has no container id yet, so the fixed container *name*
+    existing is the only evidence available and is accepted. Once the id is
+    recorded, it must match: a different container under the same name is a
+    stale record, and nothing may be read from its mounts.
+    """
+    if record is None:
+        return RECORD_ABSENT
+    if container_state == "absent":
+        return RECORD_CONTAINER_GONE
+    if not record.container_id:
+        return RECORD_MATCHES
+    if container_id and container_id != record.container_id:
+        return RECORD_DIFFERENT
+    return RECORD_MATCHES
+
+
+def inspect_container_id(runner: Runner = docker_runner,
+                         *, name: str = CONTAINER_NAME) -> str:
+    """The container's full id, or an empty string when it cannot be read."""
+    result = _run(runner, ["docker", "inspect", "-f", "{{.Id}}", name])
+    return (result.stdout or "").strip() if result.returncode == 0 else ""

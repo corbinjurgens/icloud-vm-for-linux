@@ -134,6 +134,8 @@ class MainWindow(QMainWindow):
     setup_recheck_requested = Signal()
     create_vm_requested = Signal()
     connect_requested = Signal()
+    #: D39: forget an interrupted-provisioning record Docker has disproved.
+    discard_record_requested = Signal()
     env_file_selected = Signal(str)
 
     def __init__(self, run_async: Callable[..., None]) -> None:
@@ -310,6 +312,16 @@ class MainWindow(QMainWindow):
         self._setup_connect.clicked.connect(self.connect_requested.emit)
         self._setup_connect.hide()
         buttons.addWidget(self._setup_connect)
+        # D39: only offered when Docker has proved the recorded container is
+        # absent or different. It removes a local record and nothing else — no
+        # container, no VM disk, no env file, no bundle.
+        self._setup_discard = QPushButton("Discard failed setup record")
+        self._setup_discard.setToolTip(
+            "Forget this app's note that a VM creation was in progress. "
+            "Nothing is deleted: no container, no disk image, no settings.")
+        self._setup_discard.clicked.connect(self.discard_record_requested.emit)
+        self._setup_discard.hide()
+        buttons.addWidget(self._setup_discard)
         buttons.addStretch(1)
         layout.addLayout(buttons)
         return page
@@ -334,7 +346,8 @@ class MainWindow(QMainWindow):
 
     def update_setup(self, *, title: str, intro: str, checks, paths: str,
                      env_path: str, can_create: bool, show_connect: bool,
-                     detail: str = "", busy: bool = False) -> None:
+                     detail: str = "", busy: bool = False,
+                     show_discard: bool = False) -> None:
         """Render one assistant state.  Pure presentation of firstrun's answers."""
         self._env_path = env_path
         self._setup_title.setText(title)
@@ -345,6 +358,8 @@ class MainWindow(QMainWindow):
         self._setup_recheck.setEnabled(not busy)
         self._setup_connect.setVisible(show_connect)
         self._setup_connect.setEnabled(not busy)
+        self._setup_discard.setVisible(show_discard)
+        self._setup_discard.setEnabled(not busy)
         self._env_button.setEnabled(not busy)
         if detail:
             self._setup_detail.setText(detail)

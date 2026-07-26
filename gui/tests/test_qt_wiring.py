@@ -18,6 +18,7 @@ import os
 import stat
 import sys
 import threading
+import time
 
 import pytest
 
@@ -36,8 +37,8 @@ from icloud_bridge_gui import __main__ as app_module              # noqa: E402
 from icloud_bridge_gui import window as window_module             # noqa: E402
 
 _RealMessageBox = window_module.QMessageBox
-from icloud_bridge_gui import (backup, bridge, diagnostics, health, lifecycle,  # noqa: E402
-                               listing, power)
+from icloud_bridge_gui import (backup, bridge, diagnostics, firstrun, health,  # noqa: E402
+                               lifecycle, listing, power)
 
 
 # ------------------------------------------------------------------ fakes --
@@ -137,6 +138,7 @@ class FakeMessageBox:
     @classmethod
     def reset(cls):
         cls.answer = _RealMessageBox.StandardButton.Cancel
+        cls.clicked_index = -1
         cls.calls = []
 
     @classmethod
@@ -159,6 +161,43 @@ class FakeMessageBox:
     @classmethod
     def critical(cls, *args, **kwargs):
         cls.calls.append(("critical", args))
+
+    # --- the instance form, used by the controller's own confirmations ---
+    #: Index of the button `exec` should report as clicked; tests set it.
+    clicked_index = -1                  # -1 means the last (usually Cancel)
+
+    def __init__(self, parent=None):
+        self._buttons: list[object] = []
+        type(self).calls.append(("dialog", ()))
+
+    def setWindowTitle(self, _title):
+        pass
+
+    def setIcon(self, _icon):
+        pass
+
+    def setText(self, _text):
+        pass
+
+    def setInformativeText(self, _text):
+        pass
+
+    def addButton(self, label, _role):
+        button = object()
+        self._buttons.append(button)
+        return button
+
+    def setDefaultButton(self, _button):
+        pass
+
+    def setEscapeButton(self, _button):
+        pass
+
+    def exec(self):
+        return 0
+
+    def clickedButton(self):
+        return self._buttons[type(self).clicked_index] if self._buttons else None
 
 
 @pytest.fixture(autouse=True)
@@ -200,6 +239,10 @@ def fakes(monkeypatch, tmp_path):
     state.request_listing = Recorder("req-1")
     state.poll_response = Recorder(None)
     state.cancel_request = Recorder(None)
+    #: D39 reads the container id to match a record. Faked like every other
+    #: Docker call: a checkout that happens to have a real `icloud-windows`
+    #: container must not change what these tests prove.
+    state.container_id = Recorder("abc123")
 
     monkeypatch.setattr(power, "inspect_container", state.inspect)
     monkeypatch.setattr(power, "marker_exists", state.marker)
@@ -213,6 +256,7 @@ def fakes(monkeypatch, tmp_path):
     monkeypatch.setattr(bridge, "request_listing", state.request_listing)
     monkeypatch.setattr(bridge, "poll_response", state.poll_response)
     monkeypatch.setattr(bridge, "cancel_request", state.cancel_request)
+    monkeypatch.setattr(firstrun, "inspect_container_id", state.container_id)
 
     # The modal confirmations: default to "yes, do it", overridable per test.
     state.answers = {"quit": "gui", "simple_quit": True, "power_off": True,
@@ -883,3 +927,234 @@ def test_the_export_buttons_work_in_every_lifecycle_state(controller, fakes):
     window = app._window
     assert window._diag_copy.isEnabled()
     assert window._diag_save.isEnabled()
+
+
+# ------------------------------- D38: the interrupted transaction (controller) --
+
+def test_a_power_off_timeout_quiesces_instead_of_resuming_polling(controller, fakes):
+    """Killing our own sudo is no proof the root helper stopped."""
+    app, window = running_controller(controller, fakes)
+    fakes.power_off.result = power.HelperResult(
+        False, None, "Timed out after 600s…", timed_out=True)
+
+    app._on_power_off_requested()
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.TRANSITION_UNKNOWN)
+    assert app._model.phase is lifecycle.Phase.TRANSITION_UNKNOWN
+    assert not app._timer.isActive()
+    assert app._container_state is None          # not "stopped": we do not know
+    assert app._last_snapshot is None            # caches dropped
+    assert app._model.desired_action == "off"
+
+
+def test_retry_repeats_the_interrupted_direction(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    fakes.power_off.result = power.HelperResult(
+        False, None, "Timed out…", timed_out=True)
+    app._on_power_off_requested()
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.TRANSITION_UNKNOWN)
+
+    before_on, before_off = fakes.power_on.count, fakes.power_off.count
+    fakes.power_off.result = power.HelperResult(True, 0, "bridge off")
+    app._on_retry_start_requested()
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.POWERED_OFF)
+    assert fakes.power_off.count == before_off + 1
+    assert fakes.power_on.count == before_on          # never the wrong direction
+
+
+def test_the_only_action_offered_after_an_unknown_transition_is_retry(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    fakes.power_off.result = power.HelperResult(
+        False, None, "Timed out…", timed_out=True)
+    app._on_power_off_requested()
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.TRANSITION_UNKNOWN)
+    assert power.available_action(app._model.phase.value, app._container_state) == \
+        power.ACTION_RETRY_TRANSITION
+
+
+def test_quitting_an_unknown_transition_does_not_call_the_helper(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    fakes.power_off.result = power.HelperResult(
+        False, None, "Timed out…", timed_out=True)
+    app._on_power_off_requested()
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.TRANSITION_UNKNOWN)
+    before = fakes.power_off.count
+
+    app._on_quit_requested()
+    pump(0.3)
+    assert fakes.power_off.count == before
+    assert fakes.quits == [True]
+
+
+def test_an_ordinary_power_off_failure_still_takes_the_abort_path(controller, fakes):
+    """Only a *timeout* is unknown; a helper that answered is not."""
+    app, window = running_controller(controller, fakes)
+    fakes.power_off.result = power.HelperResult(False, 1, "target is busy")
+    app._on_power_off_requested()
+    # Wait for the *result*, not merely for the call to have started.
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.RUNNING
+         and fakes.power_off.count == 1)
+    assert app._model.phase is lifecycle.Phase.RUNNING
+    assert app._timer.isActive()
+
+
+def test_a_streamed_phase_line_reaches_the_banner(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    app._begin_busy(app_module.BUSY_STARTING)
+    app._on_phase_line("==> Waiting for the guest SMB server")
+    assert app._phase_line == "Waiting for the guest SMB server"
+
+    # Non-phase output from the helper is not parsed into anything.
+    app._on_phase_line("some incidental warning")
+    assert app._phase_line == "Waiting for the guest SMB server"
+
+
+def test_the_busy_banner_shows_elapsed_time_without_a_percentage(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    app._begin_busy(app_module.BUSY_STARTING)
+    app._busy_since = time.monotonic() - 130
+    app._on_phase_line("==> Starting the Windows VM")
+    text = app._busy_text()
+    assert "2 m 10 s" in text
+    assert "Starting the Windows VM" in text
+    assert "%" not in text
+
+
+# ------------------------ D39: the interrupted-provisioning record (controller) --
+
+def test_a_matching_record_resumes_provisioning_without_any_cifs(controller, fakes):
+    firstrun.write_provisioning_record(
+        firstrun.ProvisioningRecord(started_at="2026-07-26T12:00:00Z",
+                                    phase="provisioning", container_id="abc123"))
+    fakes.gather.blocked = True
+    fakes.read_exclusions.blocked = True
+    app = controller()
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.PROVISIONING)
+    assert app._model.phase is lifecycle.Phase.PROVISIONING
+    assert fakes.power_on.count == 0
+    pump(0.3)
+    assert fakes.gather.count == 0
+    assert fakes.read_exclusions.count == 0
+
+
+def test_a_record_whose_container_vanished_returns_to_setup(controller, fakes):
+    firstrun.write_provisioning_record(
+        firstrun.ProvisioningRecord(started_at="2026-07-26T12:00:00Z"))
+    fakes.inspect.result = power.DockerStatus("absent", detail="no such object")
+    app = controller()
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.SETUP)
+    assert app._record_state == firstrun.RECORD_CONTAINER_GONE
+    assert "create it again" in app._setup_detail
+
+
+def test_a_different_container_is_a_stale_record_with_no_cifs(controller, fakes,
+                                                              monkeypatch):
+    firstrun.write_provisioning_record(
+        firstrun.ProvisioningRecord(started_at="2026-07-26T12:00:00Z",
+                                    container_id="original"))
+    monkeypatch.setattr(firstrun, "inspect_container_id", Recorder("someone-else"))
+    fakes.gather.blocked = True
+    app = controller()
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.SETUP)
+    assert app._record_state == firstrun.RECORD_DIFFERENT
+    pump(0.3)
+    assert fakes.gather.count == 0
+
+
+def test_a_malformed_record_enters_setup_and_is_not_deleted(controller, fakes,
+                                                            tmp_path):
+    backup.ensure_app_dir()
+    path = firstrun.provisioning_path()
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("{not json")
+    app = controller()
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.SETUP)
+    assert app._record_state == firstrun.RECORD_MALFORMED
+    assert os.path.exists(path)              # never silently dropped
+
+
+def test_a_running_container_with_no_record_keeps_existing_behavior(controller, fakes):
+    """Externally created, already-configured installs are not reclassified."""
+    app = controller()
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.RUNNING)
+    assert app._record_state == firstrun.RECORD_ABSENT
+
+
+def test_a_successful_connect_clears_the_record(controller, fakes, monkeypatch):
+    firstrun.write_provisioning_record(
+        firstrun.ProvisioningRecord(started_at="2026-07-26T12:00:00Z",
+                                    container_id="abc123"))
+    app = controller()
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.PROVISIONING)
+    assert firstrun.read_provisioning_record() is not None
+
+    monkeypatch.setattr(firstrun, "check_host_setup", Recorder([]))
+    monkeypatch.setattr(firstrun, "check_container", Recorder([]))
+    app._on_connect_requested()
+    pump(3.0, until=lambda: app._model.phase is lifecycle.Phase.RUNNING)
+    assert app._model.phase is lifecycle.Phase.RUNNING
+    assert firstrun.read_provisioning_record() is None
+
+
+def test_a_failed_connect_keeps_the_record(controller, fakes, monkeypatch):
+    firstrun.write_provisioning_record(
+        firstrun.ProvisioningRecord(started_at="2026-07-26T12:00:00Z",
+                                    container_id="abc123"))
+    app = controller()
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.PROVISIONING)
+    fakes.power_on.result = power.HelperResult(False, 1, "no sudo grant")
+    monkeypatch.setattr(firstrun, "check_host_setup", Recorder([]))
+    monkeypatch.setattr(firstrun, "check_container", Recorder([]))
+
+    app._on_connect_requested()
+    pump(3.0, until=lambda: app._model.phase is lifecycle.Phase.START_FAILED)
+    assert firstrun.read_provisioning_record() is not None
+
+
+def test_discard_is_confirmed_removes_only_the_record_and_is_scoped(
+        controller, fakes, monkeypatch, dialogs):
+    firstrun.write_provisioning_record(
+        firstrun.ProvisioningRecord(started_at="2026-07-26T12:00:00Z"))
+    fakes.inspect.result = power.DockerStatus("absent", detail="no such object")
+    app = controller()
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.SETUP)
+
+    # Refused without confirmation.
+    monkeypatch.setattr(app_module.Application, "_confirm_discard_record",
+                        lambda self: False)
+    app._on_discard_record()
+    assert firstrun.read_provisioning_record() is not None
+
+    monkeypatch.setattr(app_module.Application, "_confirm_discard_record",
+                        lambda self: True)
+    app._on_discard_record()
+    pump(1.0, until=lambda: firstrun.read_provisioning_record() is None)
+    assert firstrun.read_provisioning_record() is None
+    # It never removes a container.
+    assert all("rm" not in " ".join(call[0][:1]) for call in fakes.inspect.calls)
+
+
+def test_discard_is_not_offered_while_the_record_still_matches(controller, fakes):
+    firstrun.write_provisioning_record(
+        firstrun.ProvisioningRecord(started_at="2026-07-26T12:00:00Z",
+                                    container_id="abc123"))
+    app = controller()
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.PROVISIONING)
+    app._on_discard_record()
+    assert firstrun.read_provisioning_record() is not None
+
+
+def test_every_effect_handler_runs_without_raising(controller, fakes):
+    """The table having a key proves nothing; the handler has to work.
+
+    A handler that raises aborts the rest of its transition's effect list
+    halfway, leaving the model in a state the reducer never intended — and Qt
+    swallows the traceback, so nothing says so. This is the guard for that.
+    """
+    app, window = running_controller(controller, fakes)
+    for effect, handler in app._EFFECTS.items():
+        try:
+            handler(app)
+        except Exception as exc:                # noqa: BLE001 - that is the test
+            raise AssertionError(f"{effect.name} handler raised: {exc!r}") from exc
+    app._timer.stop()
+    app._end_busy()

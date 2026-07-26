@@ -117,8 +117,12 @@ def ensure_app_dir(base: str | None = None) -> str:
     return path
 
 
-def _check_destination(path: str) -> bool:
-    """Whether a usable regular backup already exists. Refuses anything else."""
+def check_destination(path: str) -> bool:
+    """Whether a usable regular file already exists there. Refuses anything else.
+
+    Shared with the D39 provisioning record, which lives in the same directory
+    and needs exactly the same symlink/non-regular refusal.
+    """
     if os.path.islink(path):
         raise BackupError(f"{path} is a symlink; refusing to write through it")
     try:
@@ -235,7 +239,7 @@ def save(exclusions: Iterable[str], revision: int, source: str, *,
 
     directory = ensure_app_dir(base)
     path = os.path.join(directory, BACKUP_NAME)
-    existing_present = _check_destination(path)
+    existing_present = check_destination(path)
     existing = _load_quietly(base) if existing_present else None
 
     outcome = SAVED
@@ -264,18 +268,22 @@ def save(exclusions: Iterable[str], revision: int, source: str, *,
 
     document = Backup(revision=revision, exclusions=canonical, source=source,
                       saved_at=now().strftime("%Y-%m-%dT%H:%M:%SZ")).as_document()
-    _write_atomic(path, document)
+    write_json_atomic(path, document)
     return SAVED
 
 
-def _write_atomic(path: str, document: dict) -> None:
-    """Unique temp file in the same directory, 0600, then ``os.replace``."""
+def write_json_atomic(path: str, document: dict) -> None:
+    """Unique temp file in the same directory, 0600, then ``os.replace``.
+
+    Shared with the D39 provisioning record; both are private local state in the
+    same 0700 directory and want the same guarantees.
+    """
     directory = os.path.dirname(path) or "."
     text = json.dumps(document, ensure_ascii=False, separators=(",", ":"))
     try:
         handle = tempfile.NamedTemporaryFile(
             mode="w", encoding="utf-8", dir=directory,
-            prefix="." + BACKUP_NAME + ".", suffix=".tmp", delete=False)
+            prefix="." + os.path.basename(path) + ".", suffix=".tmp", delete=False)
     except OSError as exc:
         raise BackupError(f"cannot write {path}: {exc}") from exc
     temp_name = handle.name

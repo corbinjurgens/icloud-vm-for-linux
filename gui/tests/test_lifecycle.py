@@ -41,11 +41,15 @@ def test_phase_values_match_the_power_constants():
     assert P.PROVISIONING.value == power.LIFECYCLE_PROVISIONING
 
 
-def test_the_phase_set_is_exactly_the_seven_canonical_ones():
+def test_the_phase_set_is_exactly_the_canonical_ones():
     assert {p.value for p in P} == {
         "starting", "running", "start_failed", "powered_off",
-        "shutting_down", "setup", "provisioning",
+        "shutting_down", "setup", "provisioning", "transition_unknown",
     }
+
+
+def test_transition_unknown_matches_its_power_constant():
+    assert P.TRANSITION_UNKNOWN.value == power.LIFECYCLE_TRANSITION_UNKNOWN
 
 
 def test_every_phase_has_transitions_defined():
@@ -64,6 +68,10 @@ EXPECTED: dict[tuple[P, E], tuple[P, tuple[F, ...]]] = {
     (P.STARTING, E.STARTUP_ALREADY_ON): (P.RUNNING, lifecycle._ENTER_MONITORING),
     (P.STARTING, E.STARTUP_PROVISION_NEEDED): (P.SETUP, lifecycle._ENTER_SETUP),
     (P.STARTING, E.STARTUP_INSPECT_FAILED): (P.SETUP, lifecycle._ENTER_SETUP),
+    (P.STARTING, E.STARTUP_RESUME_PROVISIONING): (P.PROVISIONING,
+                                                  lifecycle._ENTER_PROVISIONING),
+    (P.STARTING, E.POWER_TRANSITION_UNKNOWN): (P.TRANSITION_UNKNOWN,
+                                               lifecycle._ENTER_TRANSITION_UNKNOWN),
     (P.STARTING, E.POWER_ON_SUCCEEDED): (P.RUNNING, lifecycle._ENTER_RUNNING),
     (P.STARTING, E.POWER_ON_FAILED): (P.START_FAILED, lifecycle._ENTER_START_FAILED),
     (P.STARTING, E.QUIT_CONFIRMED_POWER_OFF): (P.SHUTTING_DOWN, lifecycle._BEGIN_POWER_OFF),
@@ -88,6 +96,11 @@ EXPECTED: dict[tuple[P, E], tuple[P, tuple[F, ...]]] = {
     (P.SHUTTING_DOWN, E.DRAIN_TIMED_OUT): (P.RUNNING,
                                            (F.STOP_DRAIN,) + lifecycle._ABORT_SHUTDOWN),
     (P.SHUTTING_DOWN, E.POWER_OFF_FAILED): (P.RUNNING, lifecycle._ABORT_SHUTDOWN),
+    (P.SHUTTING_DOWN, E.POWER_TRANSITION_UNKNOWN): (P.TRANSITION_UNKNOWN,
+                                                    lifecycle._ENTER_TRANSITION_UNKNOWN),
+
+    (P.TRANSITION_UNKNOWN, E.QUIT_CONFIRMED_GUI_ONLY): (P.TRANSITION_UNKNOWN,
+                                                        (F.EXIT_APP,)),
     # POWER_OFF_SUCCEEDED depends on the continuation; asserted separately.
 
     (P.SETUP, E.VM_CREATED): (P.PROVISIONING, lifecycle._ENTER_PROVISIONING),
@@ -100,8 +113,12 @@ EXPECTED: dict[tuple[P, E], tuple[P, tuple[F, ...]]] = {
     (P.PROVISIONING, E.QUIT_CONFIRMED_GUI_ONLY): (P.PROVISIONING, (F.EXIT_APP,)),
 }
 
-#: The continuation-dependent pair, kept out of the table above.
-_CONTINUATION_PAIRS = {(P.SHUTTING_DOWN, E.POWER_OFF_SUCCEEDED)}
+#: The continuation-dependent pairs, kept out of the table above.
+_CONTINUATION_PAIRS = {
+    (P.SHUTTING_DOWN, E.POWER_OFF_SUCCEEDED),
+    # D38's Retry repeats whichever direction was interrupted.
+    (P.TRANSITION_UNKNOWN, E.USER_RETRY_TRANSITION),
+}
 
 
 @pytest.mark.parametrize("pair", sorted(EXPECTED, key=lambda k: (k[0].value, k[1].value)))
@@ -183,6 +200,47 @@ def test_a_superseded_operation_is_no_longer_accepted():
 
 # -------------------------------------------------------- the D29-D31 rules --
 
+def test_the_interrupted_transaction_retries_the_direction_it_was_going():
+    """D38: Retry means "do that again", not "power on"."""
+    off = lifecycle.reduce(model(P.SHUTTING_DOWN, exit_after=False),
+                           E.POWER_TRANSITION_UNKNOWN).model
+    assert off.desired_action == "off"
+    retried = lifecycle.reduce(off, E.USER_RETRY_TRANSITION)
+    assert retried.model.phase is P.SHUTTING_DOWN
+    assert retried.effects == lifecycle._BEGIN_POWER_OFF
+
+    on = lifecycle.reduce(model(P.STARTING), E.POWER_TRANSITION_UNKNOWN).model
+    assert on.desired_action == "on"
+    assert lifecycle.reduce(on, E.USER_RETRY_TRANSITION).effects == lifecycle._BEGIN_STARTUP
+
+
+def test_an_unknown_transition_never_resumes_io_and_drops_its_caches():
+    """The whole point: a killed sudo is no proof the root helper stopped."""
+    effects = lifecycle._ENTER_TRANSITION_UNKNOWN
+    assert not (set(effects) & lifecycle.CIFS_EFFECTS)
+    assert not (set(effects) & lifecycle.MUTATING_EFFECTS)
+    assert F.INVALIDATE_CACHES in effects
+    assert F.MARK_CONTAINER_UNKNOWN in effects
+    assert F.STOP_DRAIN in effects
+
+
+def test_a_power_off_timeout_does_not_take_the_abort_path():
+    """Aborting resumes polling against shares that may already be gone."""
+    timed_out = lifecycle.reduce(model(P.SHUTTING_DOWN), E.POWER_TRANSITION_UNKNOWN)
+    assert timed_out.model.phase is P.TRANSITION_UNKNOWN
+    assert timed_out.effects != lifecycle._ABORT_SHUTDOWN
+    assert F.START_POLLING not in timed_out.effects
+
+
+def test_quitting_an_unknown_transition_never_calls_the_helper():
+    assert lifecycle.quit_kind(P.TRANSITION_UNKNOWN) == lifecycle.QUIT_UNKNOWN
+    transition = lifecycle.reduce(model(P.TRANSITION_UNKNOWN), E.QUIT_CONFIRMED_GUI_ONLY)
+    assert transition.effects == (F.EXIT_APP,)
+    assert lifecycle.reduce(model(P.TRANSITION_UNKNOWN),
+                            E.QUIT_CONFIRMED_POWER_OFF).effects == (
+        F.REPORT_INVALID_TRANSITION,)
+
+
 def test_no_cifs_phases_are_exactly_everything_but_running():
     assert lifecycle.NO_CIFS_PHASES == set(P) - {P.RUNNING}
     assert not lifecycle.is_no_cifs(P.RUNNING)
@@ -191,7 +249,7 @@ def test_no_cifs_phases_are_exactly_everything_but_running():
 
 
 @pytest.mark.parametrize("phase", [P.SETUP, P.PROVISIONING, P.POWERED_OFF,
-                                   P.START_FAILED])
+                                   P.START_FAILED, P.TRANSITION_UNKNOWN])
 def test_no_cifs_phase_never_reaches_polling_without_a_successful_power_on(phase):
     """The central D29 rule: nothing schedules bridge I/O from a no-CIFS state.
 

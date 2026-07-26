@@ -18,7 +18,10 @@ A container that a user stops by hand mid-session is reported red, not restarted
 from __future__ import annotations
 
 import os
+import re
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -90,6 +93,145 @@ def docker_env(environ: dict[str, str] | None = None) -> dict[str, str]:
 def docker_runner(argv: list[str], timeout: float) -> RunResult:
     """Run a ``docker`` command against the native Engine socket (item 3)."""
     return _run(argv, timeout, docker_env())
+
+
+# ------------------------------------------------------- streaming a command --
+# v2 plan D38. The helper already prints one `==> ` line per step; streamed live,
+# that stdout *is* the progress feed. There is no separate progress channel, no
+# file under /run, and no socket.
+
+#: Phase lines are presentation only. Their wording may change freely, so nothing
+#: may parse past this prefix into a control decision.
+PHASE_PREFIX = "==> "
+
+#: Bounds on what a child can push at us. The tail is what an error dialog and a
+#: diagnostic report get to quote.
+MAX_TAIL_LINES = 50
+MAX_TAIL_BYTES = 64 * 1024
+MAX_LINE_CHARS = 500
+
+#: ANSI CSI/OSC escapes, plus any remaining C0/C1 control character. A helper
+#: running under a pty-less pipe should not emit these, but `docker compose`
+#: certainly does, and they would render as mojibake in a Qt label.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def sanitize_line(text: str) -> str:
+    """One display-safe, bounded line: no escapes, no control characters."""
+    cleaned = _CONTROL_RE.sub("", _ANSI_RE.sub("", text)).strip()
+    if len(cleaned) > MAX_LINE_CHARS:
+        return cleaned[:MAX_LINE_CHARS] + "…"
+    return cleaned
+
+
+def phase_of(line: str) -> str | None:
+    """The human phase text of a `==> ` line, or ``None`` for anything else."""
+    if line.startswith(PHASE_PREFIX):
+        return line[len(PHASE_PREFIX):].strip() or None
+    return None
+
+
+def _trim(lines: list[str]) -> None:
+    """Keep the tail within both bounds, oldest first."""
+    while len(lines) > MAX_TAIL_LINES:
+        lines.pop(0)
+    total = sum(len(line) + 1 for line in lines)
+    while lines and total > MAX_TAIL_BYTES:
+        total -= len(lines.pop(0)) + 1
+
+
+def _iter_lines(stream):                     # pragma: no cover - thread body
+    """Yield decoded lines, breaking on newline **and** carriage return.
+
+    `docker compose` reports pull progress by rewriting one line with `\\r`;
+    splitting on `\\n` alone would buffer the whole download into one giant line.
+    """
+    buffer = bytearray()
+    while True:
+        chunk = stream.read(1)
+        if not chunk:
+            break
+        if chunk in (b"\n", b"\r"):
+            yield buffer.decode("utf-8", errors="replace")
+            buffer.clear()
+            continue
+        buffer.extend(chunk)
+        if len(buffer) > MAX_LINE_CHARS * 4:
+            yield buffer.decode("utf-8", errors="replace")
+            buffer.clear()
+    if buffer:
+        yield buffer.decode("utf-8", errors="replace")
+
+
+def stream_command(argv: list[str], timeout: float,
+                   on_line: Callable[[str], None] | None = None,
+                   *, env: dict[str, str] | None = None) -> RunResult:
+    """Run ``argv``, delivering each output line as it arrives.
+
+    Both pipes are drained by their own thread, because a child that fills one
+    while we read the other would deadlock. The monotonic deadline is enforced
+    on ``wait()``, so a child that prints nothing at all still times out. A
+    callback that raises cannot abort the transaction — the operator's power-off
+    must not fail because a label refused to update.
+    """
+    try:
+        process = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, env=env)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:                          # pragma: no cover - defensive
+        raise OSError(f"could not run {argv[0]}: {exc}") from exc
+
+    out: list[str] = []
+    err: list[str] = []
+
+    def drain(stream, sink: list[str], deliver: bool) -> None:   # pragma: no cover
+        try:
+            for raw in _iter_lines(stream):
+                line = sanitize_line(raw)
+                if not line:
+                    continue
+                sink.append(line)
+                _trim(sink)
+                if deliver and on_line is not None:
+                    try:
+                        on_line(line)
+                    except Exception:               # noqa: BLE001 - never fatal
+                        pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    readers = [
+        threading.Thread(target=drain, args=(process.stdout, out, True), daemon=True),
+        threading.Thread(target=drain, args=(process.stderr, err, True), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+
+    deadline = time.monotonic() + timeout
+    try:
+        process.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        for reader in readers:
+            reader.join(timeout=1.0)
+        raise TimeoutError(f"{argv[0]} timed out after {timeout}s")
+    for reader in readers:
+        reader.join(timeout=5.0)
+    return RunResult(process.returncode, "\n".join(out), "\n".join(err))
+
+
+def streaming_runner(on_line: Callable[[str], None] | None,
+                     *, env: dict[str, str] | None = None) -> Runner:
+    """A :data:`Runner` that streams its child's output to ``on_line``."""
+    def run(argv: list[str], timeout: float) -> RunResult:
+        return stream_command(argv, timeout, on_line, env=env)
+    return run
 
 
 # ------------------------------------------------------------ docker inspect --
@@ -204,12 +346,17 @@ LIFECYCLE_SETUP = "setup"                # no container yet, or inspection faile
 #: legitimately absent for far longer than the helper's five-minute readiness
 #: deadline, so this state waits for the operator rather than calling `on`.
 LIFECYCLE_PROVISIONING = "provisioning"
+#: D38: the outer subprocess timeout fired, so the helper's outcome is unknown.
+#: Killing an unprivileged `sudo` is no evidence the root helper stopped.
+LIFECYCLE_TRANSITION_UNKNOWN = "transition_unknown"
 
 #: What the tray/Status-tab lifecycle control offers, if anything.
 ACTION_NONE = "none"
 ACTION_POWER_OFF = "power_off"
 ACTION_START = "start"
 ACTION_RETRY = "retry"
+#: D38: repeat the interrupted transaction, whichever direction it was going.
+ACTION_RETRY_TRANSITION = "retry_transition"
 ACTION_SETUP = "setup"
 
 
@@ -225,6 +372,10 @@ def available_action(lifecycle: str, container: str | None) -> str:
         return ACTION_START
     if lifecycle == LIFECYCLE_START_FAILED:
         return ACTION_RETRY
+    if lifecycle == LIFECYCLE_TRANSITION_UNKNOWN:
+        # The only mutating control this state offers. Everything read-only
+        # (Open VM screen, the diagnostic export) stays available.
+        return ACTION_RETRY_TRANSITION
     if lifecycle in (LIFECYCLE_SETUP, LIFECYCLE_PROVISIONING):
         # No container to start, or we cannot tell: offer setup, never power.
         # The assistant itself is the surface here, not a one-click action.
@@ -245,10 +396,18 @@ def available_action(lifecycle: str, container: str | None) -> str:
 
 @dataclass(frozen=True)
 class HelperResult:
-    """Outcome of a helper invocation, ready for the controller to display."""
+    """Outcome of a helper invocation, ready for the controller to display.
+
+    ``timed_out`` is not just another failure: we killed our own unprivileged
+    `sudo`, which says nothing about whether the root helper stopped. The
+    controller routes it to D38's `transition_unknown` rather than to the
+    ordinary failure path, which would resume polling against shares the helper
+    may already have unmounted.
+    """
     success: bool
     exit_code: int | None
     message: str
+    timed_out: bool = False
 
 
 def _run_helper(action: str, runner: Runner, timeout: float) -> HelperResult:
@@ -260,7 +419,10 @@ def _run_helper(action: str, runner: Runner, timeout: float) -> HelperResult:
     except TimeoutError:
         return HelperResult(
             False, None,
-            f"Timed out after {int(timeout)}s waiting for the bridge to turn {action}.")
+            f"Timed out after {int(timeout)}s waiting for the bridge to turn {action}. "
+            "The privileged helper may still be running and reconciling the "
+            "mounts, so nothing here will be read or changed until you retry.",
+            timed_out=True)
     except OSError as exc:                          # pragma: no cover - defensive
         return HelperResult(False, None, f"could not run the power helper: {exc}")
 
@@ -275,13 +437,27 @@ def _run_helper(action: str, runner: Runner, timeout: float) -> HelperResult:
     return HelperResult(False, result.returncode, detail)
 
 
-def power_on(runner: Runner = default_runner,
-             *, timeout: float = POWER_TIMEOUT_SECONDS) -> HelperResult:
-    """Run ``sudo -n icloud-bridge-power on``."""
-    return _run_helper("on", runner, timeout)
+def _resolve_runner(runner: Runner | None,
+                    on_line: Callable[[str], None] | None) -> Runner:
+    """The caller's runner, or a streaming/plain default to match ``on_line``.
+
+    Passing an explicit runner still wins, so every existing fake keeps working
+    and the no-callback result and error precedence are unchanged.
+    """
+    if runner is not None:
+        return runner
+    return default_runner if on_line is None else streaming_runner(on_line)
 
 
-def power_off(runner: Runner = default_runner,
-              *, timeout: float = POWER_TIMEOUT_SECONDS) -> HelperResult:
-    """Run ``sudo -n icloud-bridge-power off``."""
-    return _run_helper("off", runner, timeout)
+def power_on(runner: Runner | None = None,
+             *, timeout: float = POWER_TIMEOUT_SECONDS,
+             on_line: Callable[[str], None] | None = None) -> HelperResult:
+    """Run ``sudo -n icloud-bridge-power on``, optionally streaming its output."""
+    return _run_helper("on", _resolve_runner(runner, on_line), timeout)
+
+
+def power_off(runner: Runner | None = None,
+              *, timeout: float = POWER_TIMEOUT_SECONDS,
+              on_line: Callable[[str], None] | None = None) -> HelperResult:
+    """Run ``sudo -n icloud-bridge-power off``, optionally streaming its output."""
+    return _run_helper("off", _resolve_runner(runner, on_line), timeout)

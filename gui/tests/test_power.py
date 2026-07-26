@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 import pytest
 
@@ -256,3 +257,138 @@ def test_docker_env_does_not_mutate_the_process_environment(monkeypatch):
 def test_default_runner_normalizes_a_timeout():
     with pytest.raises(TimeoutError):
         power.default_runner([sys.executable, "-c", "import time; time.sleep(5)"], 0.2)
+
+
+# --------------------------------------- the D38 streaming runner (real child) --
+# Deterministic short-lived Python children rather than fake pipes: what is worth
+# proving here is that the *real* Popen plumbing does not deadlock or leak.
+
+def python_child(script: str) -> list[str]:
+    return [sys.executable, "-c", script]
+
+
+def test_lines_arrive_in_order_as_they_are_produced():
+    seen = []
+    result = power.stream_command(
+        python_child("import sys\n"
+                     "for i in range(5):\n"
+                     "    print(f'==> step {i}'); sys.stdout.flush()\n"),
+        30, seen.append)
+    assert result.returncode == 0
+    assert seen == [f"==> step {i}" for i in range(5)]
+
+
+def test_both_pipes_are_drained_without_deadlock():
+    """A child that fills one pipe while we read the other must not wedge."""
+    script = ("import sys\n"
+              "for i in range(4000):\n"
+              "    print('o' * 200)\n"
+              "    print('e' * 200, file=sys.stderr)\n")
+    result = power.stream_command(python_child(script), 60)
+    assert result.returncode == 0
+    # Both tails survive, and both are bounded.
+    assert result.stdout and result.stderr
+    assert len(result.stdout.splitlines()) <= power.MAX_TAIL_LINES
+    assert len(result.stderr.splitlines()) <= power.MAX_TAIL_LINES
+
+
+def test_a_silent_child_still_times_out():
+    """The deadline is on wait(), not on output, so a mute hang is caught."""
+    with pytest.raises(TimeoutError):
+        power.stream_command(python_child("import time; time.sleep(30)"), 1.0)
+
+
+def test_a_timed_out_child_is_killed():
+    start = time.monotonic()
+    with pytest.raises(TimeoutError):
+        power.stream_command(python_child("import time; time.sleep(30)"), 1.0)
+    # It returned promptly rather than waiting out the child's own sleep.
+    assert time.monotonic() - start < 10
+
+
+def test_a_callback_that_raises_cannot_abort_the_transaction():
+    """A label refusing to update must not fail the operator's power-off."""
+    def explode(_line):
+        raise RuntimeError("widget is gone")
+
+    result = power.stream_command(
+        python_child("print('==> one'); print('==> two')"), 30, explode)
+    assert result.returncode == 0
+    assert "==> two" in result.stdout
+
+
+def test_carriage_return_progress_is_split_into_lines():
+    seen = []
+    power.stream_command(
+        python_child("import sys\n"
+                     "sys.stdout.write('pull 10%\\rpull 50%\\rpull 100%\\n')\n"),
+        30, seen.append)
+    assert seen == ["pull 10%", "pull 50%", "pull 100%"]
+
+
+def test_ansi_escapes_and_control_characters_are_stripped():
+    seen = []
+    power.stream_command(
+        python_child("print('\\x1b[32m==> coloured\\x1b[0m\\x07')"), 30, seen.append)
+    assert seen == ["==> coloured"]
+
+
+def test_a_very_long_line_is_capped():
+    seen = []
+    power.stream_command(python_child("print('z' * 5000)"), 30, seen.append)
+    assert all(len(line) <= power.MAX_LINE_CHARS + 1 for line in seen)
+
+
+def test_the_tail_is_bounded_by_lines_and_bytes():
+    lines = [f"line {i}" for i in range(500)]
+    power._trim(lines)
+    assert len(lines) == power.MAX_TAIL_LINES
+    assert lines[-1] == "line 499"          # the *tail*, not the head
+
+    fat = ["x" * 10_000 for _ in range(40)]
+    power._trim(fat)
+    assert sum(len(line) + 1 for line in fat) <= power.MAX_TAIL_BYTES
+
+
+def test_a_nonzero_exit_is_reported_with_its_stderr():
+    result = power.stream_command(
+        python_child("import sys; print('bad', file=sys.stderr); sys.exit(3)"), 30)
+    assert result.returncode == 3
+    assert "bad" in result.stderr
+
+
+def test_phase_lines_are_recognized_and_everything_else_is_not():
+    assert power.phase_of("==> Stopping health checks") == "Stopping health checks"
+    assert power.phase_of("==>   ") is None
+    assert power.phase_of("ordinary output") is None
+    assert power.phase_of("  ==> indented") is None
+
+
+def test_a_missing_command_still_raises_file_not_found():
+    with pytest.raises(FileNotFoundError):
+        power.stream_command(["definitely-not-a-real-command-xyz"], 5)
+
+
+# ------------------------------------ streaming through power_on / power_off --
+
+def test_power_on_without_a_callback_keeps_todays_semantics():
+    runner = FakeRunner(power.RunResult(0, "==> Bridge is on: both shares mounted\n", ""))
+    result = power.power_on(runner)
+    assert runner.calls[0][0] == ["sudo", "-n", power.HELPER_PATH, "on"]
+    assert result.success and result.exit_code == 0
+    assert result.timed_out is False
+    assert result.message == "==> Bridge is on: both shares mounted"
+
+
+def test_a_helper_timeout_is_marked_as_such():
+    """D38: not just a failure — we killed sudo, not necessarily the helper."""
+    result = power.power_off(FakeRunner(raises=TimeoutError("boom")), timeout=5)
+    assert result.success is False
+    assert result.timed_out is True
+    assert "may still be running" in result.message
+
+
+def test_an_ordinary_helper_failure_is_not_marked_timed_out():
+    result = power.power_off(FakeRunner(power.RunResult(1, "", "target is busy")))
+    assert result.success is False
+    assert result.timed_out is False

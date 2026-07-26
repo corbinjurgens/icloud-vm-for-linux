@@ -332,6 +332,15 @@ class DocumentCache:
             return None
         return (info.st_mtime_ns, info.st_size)
 
+    def invalidate(self) -> None:
+        """Forget every cached document.
+
+        Used when the app can no longer vouch for what it read — D38's
+        interrupted transaction, where the helper may have unmounted the share
+        the cached signature refers to.
+        """
+        self._entries.clear()
+
     def read(self, path: str, reader: Callable[[], Any]) -> Any:
         before = self._signature(path)
         if before is not None:

@@ -240,6 +240,11 @@ do_off() {
 do_on() {
   # 2. A missing container is a provisioning gap, never something this helper
   #    creates. Fail without disturbing the marker.
+  #
+  #    The line below is the first thing the GUI can show for this transaction
+  #    (v2 plan D38): the inspection plus the marker/health work under it can
+  #    take a moment, and a silent start reads as a hang.
+  progress "Checking the Windows VM"
   local state
   state=$(container_state)
   case "$state" in

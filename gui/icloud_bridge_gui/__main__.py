@@ -21,8 +21,8 @@ from typing import Any, Callable
 from PySide6.QtCore import QObject, QRunnable, QSocketNotifier, QThreadPool, QTimer, Signal
 from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
-from . import (autostart, bridge, cli, diagnostics, firstrun, health, lifecycle,
-               notify, power)
+from . import (autostart, backup, bridge, cli, diagnostics, firstrun, health,
+               lifecycle, notify, power)
 from .tray import OFF, STARTING, TrayIcon, load_icon
 from .window import MainWindow
 
@@ -49,6 +49,27 @@ PROVISIONING_INTRO = (
     "read until that succeeds."
 )
 
+#: D38 busy surfaces: the base wording each long operation shows above its
+#: elapsed clock and, where there is one, the helper's last `==> ` phase line.
+BUSY_STARTING = "starting"
+BUSY_SHUTDOWN = "shutdown"
+BUSY_CREATING = "creating"
+BUSY_PROVISIONING = "provisioning"
+
+BUSY_TEXT = {
+    BUSY_STARTING: "Starting the Windows VM…",
+    BUSY_SHUTDOWN: ("Shutting down… Do not power off your computer."),
+    BUSY_CREATING: ("Creating the Windows VM… this downloads several GB. "
+                    "Watch progress on the VM screen once it starts."),
+    BUSY_PROVISIONING: "Windows has been installing for",
+}
+BUSY_BANNER_KIND = {
+    BUSY_STARTING: "starting",
+    BUSY_SHUTDOWN: "shutdown",
+    BUSY_CREATING: "starting",
+    BUSY_PROVISIONING: "starting",
+}
+
 #: The shutdown work-drain gate waits a little longer than the CIFS 30 s timeout
 #: for in-flight mount-touching tasks before it gives up and refuses to unmount.
 SHUTDOWN_DRAIN_TIMEOUT_MS = 40000
@@ -58,6 +79,10 @@ DRAIN_POLL_MS = 250
 class _TaskSignals(QObject):
     done = Signal(object)
     failed = Signal(str)
+    #: One sanitized output line from a streaming child (v2 plan D38). A signal
+    #: rather than a direct call because the worker (or one of its reader
+    #: threads) emits it and a widget may only be touched on the GUI thread.
+    progress = Signal(str)
 
 
 class _Task(QRunnable):
@@ -114,6 +139,16 @@ class Application(QObject):
         self._last_gathered_at = ""
         self._last_snapshot: health.Snapshot | None = None
         self._marker_present: bool | None = None
+        #: D38 progress presentation. `_phase_line` is the last `==> ` line the
+        #: helper printed, `_busy_since` the monotonic start of the current busy
+        #: surface, and `_busy_timer` ticks the elapsed clock. All presentation:
+        #: no control decision reads any of them.
+        self._phase_line = ""
+        self._busy_since: float | None = None
+        self._busy_kind = ""
+        self._busy_timer = QTimer(self)
+        self._busy_timer.setInterval(1000)
+        self._busy_timer.timeout.connect(self._tick_busy)
         #: The last definitive `docker inspect` classification, or None.
         self._container_state: str | None = None
         #: Long-lived polling caches. The five-second loop exists for the cheap
@@ -142,6 +177,12 @@ class Application(QObject):
         self._setup_checks: list[firstrun.Check] = []
         self._setup_detail = ""
         self._setup_busy = False
+        #: D39 interrupted-provisioning record state. `_record` is the saved
+        #: record (or None) and `_record_state` its classification against what
+        #: Docker reports; the discard action is offered only for a *proved*
+        #: absent or different container.
+        self._record: firstrun.ProvisioningRecord | None = None
+        self._record_state = firstrun.RECORD_ABSENT
         #: Latching red-incident state for desktop notifications. Only the normal
         #: monitoring state feeds it; every transitional and intentional state
         #: resets it so an expected red never announces itself as a fault.
@@ -158,6 +199,7 @@ class Application(QObject):
         self._window.create_vm_requested.connect(self._on_create_vm_requested)
         self._window.connect_requested.connect(self._on_connect_requested)
         self._window.env_file_selected.connect(self._on_env_file_selected)
+        self._window.discard_record_requested.connect(self._on_discard_record)
         self._window.diagnostics_facts = self._diagnostic_facts
 
         self._tray: TrayIcon | None = None
@@ -193,10 +235,25 @@ class Application(QObject):
 
     def run_async(self, work: Callable[[], Any],
                   on_done: Callable[[Any], None],
-                  on_error: Callable[[str], None] | None = None) -> None:
+                  on_error: Callable[[str], None] | None = None,
+                  on_progress: Callable[[str], None] | None = None) -> None:
+        """Run ``work`` off the GUI thread.
+
+        ``on_progress`` receives streamed output lines **on the GUI thread**;
+        ``work`` emits them through ``task.signals.progress`` rather than
+        touching a widget itself.
+        """
+        self._start_task(_Task(work), on_done, on_error, on_progress)
+
+    def _start_task(self, task: _Task,
+                    on_done: Callable[[Any], None],
+                    on_error: Callable[[str], None] | None = None,
+                    on_progress: Callable[[str], None] | None = None) -> None:
+        """Track, wire and dispatch a task that has already been constructed."""
         self._active += 1
-        task = _Task(work)
         self._tasks.add(task)
+        if on_progress is not None:
+            task.signals.progress.connect(on_progress)
 
         def done(result: Any) -> None:
             self._active -= 1
@@ -242,6 +299,56 @@ class Application(QObject):
         if len(self._invalid_transitions) < 32:
             self._invalid_transitions.append(record)
         print(f"icloud-bridge-gui: {record}", file=sys.stderr)
+
+    # ------------------------------------------- the D38 elapsed-time clock --
+
+    def _begin_busy(self, kind: str) -> None:
+        """Start (or restart) the elapsed clock for one long operation."""
+        self._busy_kind = kind
+        self._busy_since = time.monotonic()
+        self._phase_line = ""
+        self._busy_timer.start()
+        self._refresh_busy_text()
+
+    def _end_busy(self) -> None:
+        self._busy_timer.stop()
+        self._busy_since = None
+        self._busy_kind = ""
+        self._phase_line = ""
+
+    def _tick_busy(self) -> None:
+        if self._busy_since is None:
+            self._busy_timer.stop()
+            return
+        self._refresh_busy_text()
+
+    @staticmethod
+    def _elapsed(seconds: float) -> str:
+        minutes, secs = divmod(int(max(0.0, seconds)), 60)
+        return f"{minutes} m {secs:02d} s" if minutes else f"{secs} s"
+
+    def _busy_text(self) -> str:
+        """The banner for the current busy surface: base, elapsed, last phase.
+
+        No percentage and no estimate: the helper cannot know how long a Windows
+        boot or an SMB activation will take, and a fake bar would be a lie (D38).
+        """
+        base = BUSY_TEXT.get(self._busy_kind, "")
+        if self._busy_since is not None:
+            base = f"{base} {self._elapsed(time.monotonic() - self._busy_since)}"
+        if self._phase_line:
+            base = f"{base}\n{self._phase_line}"
+        return base
+
+    def _refresh_busy_text(self) -> None:
+        if not self._busy_kind:
+            return
+        if self._busy_kind == BUSY_PROVISIONING:
+            # No long-lived subprocess here: Compose returned long ago and
+            # Windows is installing itself. Elapsed time is all we honestly have.
+            self._render_setup()
+            return
+        self._window.show_banner(self._busy_text(), BUSY_BANNER_KIND[self._busy_kind])
 
     # ------------------------------------------------ the D37 report inputs --
 
@@ -307,9 +414,24 @@ class Application(QObject):
             # once here means a diagnostic report can name the install origin in
             # every state rather than only during first-run setup (D37).
             bundle = firstrun.resolve_bundle()
+            # D39: the record and Docker are both consulted *before* any CIFS
+            # access, so an app that was closed mid-install resumes the no-CIFS
+            # Provisioning state instead of trying to mount a half-built guest.
+            record: firstrun.ProvisioningRecord | None = None
+            record_error = ""
+            try:
+                record = firstrun.read_provisioning_record()
+            except backup.BackupError as exc:
+                record_error = str(exc)
+            container_id = (firstrun.inspect_container_id()
+                            if record is not None and record.container_id else "")
+            record_state = firstrun.classify_record(record, status.state, container_id)
+            if record_error:
+                record_state = firstrun.RECORD_MALFORMED
             # Keep the classification, not just the plan: it is what decides
             # which power action the controls offer (D30).
-            return status, power.plan_startup(marker, status), marker, bundle
+            return (status, power.plan_startup(marker, status), marker, bundle,
+                    record, record_state, record_error)
 
         self.run_async(work,
                        lambda result: self._on_plan(result, token),
@@ -318,10 +440,43 @@ class Application(QObject):
     def _on_plan(self, result, token: int) -> None:
         if not lifecycle.accepts(self._model, token):
             return
-        status, plan, marker, bundle = result
+        status, plan, marker, bundle, record, record_state, record_error = result
         self._container_state = status.state
         self._marker_present = marker
         self._bundle = bundle
+        self._record = record
+        self._record_state = record_state
+
+        # D39 wins over the ordinary startup plan, because it is the only thing
+        # that knows a running container may be a *half-provisioned* one.
+        if record_state == firstrun.RECORD_MATCHES:
+            self._setup_detail = (
+                "Setup was interrupted while Windows was installing. Nothing on "
+                "the iCloud shares has been read. Continue the guest steps below, "
+                "then choose Check setup and connect.")
+            self._dispatch(lifecycle.Event.STARTUP_RESUME_PROVISIONING)
+            return
+        if record_state == firstrun.RECORD_CONTAINER_GONE:
+            self._setup_detail = (
+                "A VM creation was started but no container exists now. Check the "
+                "settings below and create it again, or discard this note.")
+            self._dispatch(lifecycle.Event.STARTUP_PROVISION_NEEDED)
+            return
+        if record_state == firstrun.RECORD_DIFFERENT:
+            self._setup_detail = (
+                "A VM creation was started earlier, but the container using that "
+                "name now is a different one. Nothing on the iCloud shares has "
+                "been read. Check the settings below, or discard this note.")
+            self._dispatch(lifecycle.Event.STARTUP_INSPECT_FAILED)
+            return
+        if record_state == firstrun.RECORD_MALFORMED:
+            self._setup_detail = (
+                f"This app's record of an interrupted setup could not be read "
+                f"({record_error}). It has been left alone. Work through the "
+                "checks below.")
+            self._dispatch(lifecycle.Event.STARTUP_INSPECT_FAILED)
+            return
+
         if plan.kind == power.POWER_ON:
             self._dispatch(lifecycle.Event.STARTUP_POWER_ON)
         elif plan.kind == power.PROVISION_NEEDED:
@@ -376,6 +531,42 @@ class Application(QObject):
 
         self.run_async(work, done, failed)
 
+    def _clear_provisioning_record(self) -> None:
+        try:
+            firstrun.clear_provisioning_record()
+        except backup.BackupError:
+            pass            # a stale record is a nuisance, never a failure here
+        self._record = None
+        self._record_state = firstrun.RECORD_ABSENT
+
+    def _on_discard_record(self) -> None:
+        """Forget a record Docker has disproved. Deletes nothing else (D39)."""
+        if self._record_state not in (firstrun.RECORD_CONTAINER_GONE,
+                                      firstrun.RECORD_DIFFERENT):
+            return
+        if not self._confirm_discard_record():
+            return
+        self._clear_provisioning_record()
+        self._setup_detail = "The interrupted-setup note was discarded."
+        self._run_setup_checks()
+
+    def _confirm_discard_record(self) -> bool:
+        self.show_window()
+        box = QMessageBox(self._window)
+        box.setWindowTitle("Discard the setup record?")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("Forget this app's note about an interrupted setup?")
+        box.setInformativeText(
+            "This removes a small file this app wrote to remember that a VM "
+            "creation was started. It does not delete a container, a virtual "
+            "disk, your .env file, or anything in iCloud.")
+        discard = box.addButton("Discard note", QMessageBox.ButtonRole.AcceptRole)
+        cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        box.exec()
+        return box.clickedButton() is discard
+
     @staticmethod
     def _default_env_path(bundle: firstrun.Bundle | None) -> str:
         """Pre-select the checkout's own `.env` when there is one to pre-select."""
@@ -394,6 +585,9 @@ class Application(QObject):
                      f"Provisioning scripts: {bundle.provision_dir}")
         if provisioning:
             title = "Provisioning Windows"
+            if self._busy_kind == BUSY_PROVISIONING and self._busy_since is not None:
+                title = (f"Provisioning Windows — "
+                         f"{self._elapsed(time.monotonic() - self._busy_since)}")
             intro = PROVISIONING_INTRO.format(
                 provision=bundle.provision_dir if bundle else "the provision directory",
                 host_command=self._host_setup_command())
@@ -409,7 +603,9 @@ class Application(QObject):
                         and firstrun.can_create_vm(self._setup_checks,
                                                    self._container_state or "")),
             show_connect=provisioning,
-            detail=self._setup_detail, busy=self._setup_busy)
+            detail=self._setup_detail, busy=self._setup_busy,
+            show_discard=self._record_state in (firstrun.RECORD_CONTAINER_GONE,
+                                                firstrun.RECORD_DIFFERENT))
 
     def _host_setup_command(self) -> str:
         """The host-side command that matches how this GUI was installed."""
@@ -437,30 +633,49 @@ class Application(QObject):
             return
         bundle, env_path = self._bundle, self._env_path
         self._setup_busy = True
-        self._setup_detail = ("Creating the Windows VM… this downloads several GB and "
-                              "can take a long time. You can watch progress on the VM "
-                              "screen once it starts.")
+        self._setup_detail = ""
+        self._begin_busy(BUSY_CREATING)
         self._render_setup()
+        started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        task_progress: dict[str, Any] = {}
 
         def work():
-            return firstrun.create_vm(bundle, env_path)
+            # D39: the record goes down *before* Compose runs, so an app that
+            # dies between the two still knows a creation was attempted. It
+            # carries no env path and no env content, ever.
+            firstrun.write_provisioning_record(
+                firstrun.ProvisioningRecord(started_at=started_at, phase="creating"))
+            ok, output = firstrun.create_vm(bundle, env_path,
+                                            on_line=task_progress.get("emit"))
+            container_id = ""
+            if ok:
+                container_id = firstrun.inspect_container_id()
+                firstrun.write_provisioning_record(firstrun.ProvisioningRecord(
+                    started_at=started_at, phase="provisioning",
+                    container_id=container_id))
+            return ok, output, started_at, container_id
 
         def done(result) -> None:
             self._setup_busy = False
-            ok, output = result
+            ok, output, stamp, container_id = result
             if ok:
+                self._record = firstrun.ProvisioningRecord(
+                    started_at=stamp, phase="provisioning", container_id=container_id)
+                self._record_state = firstrun.RECORD_MATCHES
                 self._setup_detail = output
                 self._dispatch(lifecycle.Event.VM_CREATED)
             else:
+                self._end_busy()
                 self._setup_detail = f"docker compose up -d failed:\n{output}"
                 self._render_setup()
 
         def failed(message: str) -> None:
             self._setup_busy = False
-            self._setup_detail = f"Could not run docker compose: {message}"
+            self._end_busy()
+            self._setup_detail = f"Could not create the VM: {message}"
             self._render_setup()
 
-        self.run_async(work, done, failed)
+        self._run_streaming(work, task_progress, done, failed)
 
     def _confirm_create_vm(self) -> bool:
         self.show_window()
@@ -549,31 +764,32 @@ class Application(QObject):
         self._window.clear_health_rows()
 
     def _fx_hide_banner(self) -> None:
+        self._end_busy()
         self._window.hide_banner()
 
     def _fx_hide_notice(self) -> None:
         self._window.hide_notice()
 
     def _fx_show_starting_banner(self) -> None:
-        self._window.show_banner(
-            "Starting the Windows VM… this can take a few minutes.", "starting")
+        self._begin_busy(BUSY_STARTING)
 
     def _fx_show_start_failed_banner(self) -> None:
+        self._end_busy()
         self._window.show_banner(
             f"The Windows VM did not start.\n{self._start_error}\n\n"
             "Open the VM screen to check it, then Retry start.", "error")
 
     def _fx_show_shutdown_banner(self) -> None:
-        self._window.show_banner(
-            "Shutting down… this can take about three minutes. "
-            "Do not power off your computer.", "shutdown")
+        self._begin_busy(BUSY_SHUTDOWN)
 
     def _fx_show_powered_off_banner(self) -> None:
+        self._end_busy()
         self._window.show_banner(
             "Bridge is powered off. The Windows VM is stopped and both shares are "
             "disconnected. Choose Start bridge to bring it back.", "off")
 
     def _fx_show_abort_banner(self) -> None:
+        self._end_busy()
         self._window.show_banner(self._abort_message, "error")
 
     def _fx_show_setup_tab(self) -> None:
@@ -662,6 +878,37 @@ class Application(QObject):
     def _fx_mark_container_stopped(self) -> None:
         self._container_state = "stopped"
 
+    def _fx_show_unknown_banner(self) -> None:
+        self._end_busy()
+        action = self._model.desired_action
+        self._window.show_banner(
+            f"The bridge could not be powered {action} within the time allowed, and "
+            "this app cannot tell what state it is in.\n"
+            f"{self._abort_message}\n\n"
+            "Nothing on the iCloud shares will be read or changed until you choose "
+            "Retry. The privileged helper may still be finishing on its own.",
+            "error")
+
+    def _fx_tray_transition_unknown(self) -> None:
+        if self._tray is None:
+            return
+        self._tray.set_transition(
+            health.RED, "iCloud bridge: the last power operation did not complete")
+        self._tray.set_lifecycle_busy(False)
+        self._tray.set_bridge_available(False)
+
+    def _fx_invalidate_caches(self) -> None:
+        """Every cached answer described a state we can no longer vouch for."""
+        self._documents.invalidate()
+        self._container_probe.invalidate()
+        self._classify_probe.invalidate()
+        self._last_snapshot = None
+
+    def _fx_mark_container_unknown(self) -> None:
+        # Not "stopped": we genuinely do not know, and `available_action` must
+        # offer nothing that assumes we do.
+        self._container_state = None
+
     def _fx_run_setup_checks(self) -> None:
         self._run_setup_checks()
 
@@ -669,13 +916,48 @@ class Application(QObject):
         self._setup_checks = []
 
     def _fx_render_setup(self) -> None:
+        # D38: no subprocess survives Compose, so the only honest progress for
+        # the Windows install is elapsed time since it started.
+        self._begin_busy(BUSY_PROVISIONING)
         self._render_setup()
 
     def _fx_run_power_on(self) -> None:
         token = self._model.token
-        self.run_async(power.power_on,
-                       lambda result: self._on_start_result(result, token),
-                       lambda message: self._on_start_exception(message, token))
+        task_progress: dict[str, Any] = {}
+
+        def work():
+            emit = task_progress.get("emit")
+            return power.power_on(on_line=emit)
+
+        self._run_streaming(work, task_progress,
+                            lambda result: self._on_start_result(result, token),
+                            lambda message: self._on_start_exception(message, token))
+
+    def _run_streaming(self, work, task_progress, on_done, on_error) -> None:
+        """`run_async`, with the worker's `progress` signal wired to `on_line`.
+
+        The emitter has to be handed to `work` *after* the task exists, so the
+        dict is the seam. Reader threads call it, the signal hops to the GUI
+        thread, and `_on_phase_line` updates the label.
+        """
+        task = _Task(work)
+        task_progress["emit"] = task.signals.progress.emit
+        self._start_task(task, on_done, on_error, self._on_phase_line)
+
+    def _on_phase_line(self, line: str) -> None:
+        """One streamed output line. Presentation only — never a control input.
+
+        For the helper, only `==> ` lines are phases; its other output is noise
+        and must not be parsed. Compose has no such convention, so during
+        creation the most recent line is shown as-is, elided to one row.
+        """
+        if self._busy_kind == BUSY_CREATING:
+            self._phase_line = line
+        else:
+            phase = power.phase_of(line)
+            if phase is not None:
+                self._phase_line = phase
+        self._refresh_busy_text()
 
     def _record_helper(self, action: str, ok: bool, detail: str) -> None:
         """Retain the last helper outcome for D37; the marker follows from it."""
@@ -695,7 +977,14 @@ class Application(QObject):
             return
         self._record_helper("on", result.success, result.message)
         if result.success:
+            # D39: the only automatic clear. Setup is finished when the bridge
+            # has actually powered on, not when Compose returned.
+            self._clear_provisioning_record()
             self._dispatch(lifecycle.Event.POWER_ON_SUCCEEDED)
+            return
+        if result.timed_out:
+            self._abort_message = result.message
+            self._dispatch(lifecycle.Event.POWER_TRANSITION_UNKNOWN)
             return
         self._start_error = result.message
         self._dispatch(lifecycle.Event.POWER_ON_FAILED)
@@ -787,6 +1076,11 @@ class Application(QObject):
         self._dispatch(lifecycle.Event.USER_START_BRIDGE)
 
     def _on_retry_start_requested(self) -> None:
+        if self._model.phase is lifecycle.Phase.TRANSITION_UNKNOWN:
+            # Repeat the interrupted transaction, whichever way it was going.
+            # `flock` in the helper serializes it against a surviving run.
+            self._dispatch(lifecycle.Event.USER_RETRY_TRANSITION)
+            return
         self._dispatch(lifecycle.Event.USER_RETRY_START)
 
     # ----------------------------------------------------------- quit flow ---
@@ -802,6 +1096,14 @@ class Application(QObject):
                     "The bridge is already powered off, so nothing more will be "
                     "disconnected. It stays off across a reboot; launching this app "
                     "again powers the VM back on."):
+                self._dispatch(lifecycle.Event.QUIT_CONFIRMED_GUI_ONLY)
+            return
+        if kind == lifecycle.QUIT_UNKNOWN:
+            if self._confirm_simple_quit(
+                    "The last power operation did not finish in time and this app "
+                    "cannot tell what state the bridge is in. Quitting changes "
+                    "nothing either way; the privileged helper may still be "
+                    "finishing on its own. Start this app again to reconcile."):
                 self._dispatch(lifecycle.Event.QUIT_CONFIRMED_GUI_ONLY)
             return
         if kind == lifecycle.QUIT_NOTHING_MOUNTED:
@@ -906,9 +1208,15 @@ class Application(QObject):
 
     def _fx_run_power_off(self) -> None:
         token = self._model.token
-        self.run_async(power.power_off,
-                       lambda result: self._on_power_off_result(result, token),
-                       lambda message: self._on_power_off_exception(message, token))
+        task_progress: dict[str, Any] = {}
+
+        def work():
+            emit = task_progress.get("emit")
+            return power.power_off(on_line=emit)
+
+        self._run_streaming(work, task_progress,
+                            lambda result: self._on_power_off_result(result, token),
+                            lambda message: self._on_power_off_exception(message, token))
 
     def _on_power_off_result(self, result: power.HelperResult, token: int) -> None:
         if not lifecycle.accepts(self._model, token):
@@ -918,6 +1226,11 @@ class Application(QObject):
             self._dispatch(lifecycle.Event.POWER_OFF_SUCCEEDED)
             return
         self._abort_message = result.message
+        if result.timed_out:
+            # Never the ordinary abort path: that resumes polling against shares
+            # the helper may already have unmounted (D38).
+            self._dispatch(lifecycle.Event.POWER_TRANSITION_UNKNOWN)
+            return
         self._dispatch(lifecycle.Event.POWER_OFF_FAILED)
 
     def _on_power_off_exception(self, message: str, token: int) -> None:
@@ -1038,6 +1351,7 @@ class Application(QObject):
         lifecycle.Effect.SHOW_SHUTDOWN_BANNER: _fx_show_shutdown_banner,
         lifecycle.Effect.SHOW_POWERED_OFF_BANNER: _fx_show_powered_off_banner,
         lifecycle.Effect.SHOW_ABORT_BANNER: _fx_show_abort_banner,
+        lifecycle.Effect.SHOW_UNKNOWN_BANNER: _fx_show_unknown_banner,
         lifecycle.Effect.SHOW_SETUP_TAB: _fx_show_setup_tab,
         lifecycle.Effect.HIDE_SETUP_TAB: _fx_hide_setup_tab,
         lifecycle.Effect.SHOW_WINDOW: _fx_show_window,
@@ -1048,11 +1362,14 @@ class Application(QObject):
         lifecycle.Effect.TRAY_SHUTTING_DOWN: _fx_tray_shutting_down,
         lifecycle.Effect.TRAY_POWERED_OFF: _fx_tray_powered_off,
         lifecycle.Effect.TRAY_SETUP: _fx_tray_setup,
+        lifecycle.Effect.TRAY_TRANSITION_UNKNOWN: _fx_tray_transition_unknown,
         lifecycle.Effect.ENABLE_NOTIFICATIONS: _fx_enable_notifications,
         lifecycle.Effect.DISABLE_NOTIFICATIONS: _fx_disable_notifications,
         lifecycle.Effect.RESET_INCIDENTS: _fx_reset_incidents,
         lifecycle.Effect.BEGIN_STARTUP_GRACE: _fx_begin_startup_grace,
         lifecycle.Effect.ANNOUNCE_START_FAILURE: _fx_announce_start_failure,
+        lifecycle.Effect.INVALIDATE_CACHES: _fx_invalidate_caches,
+        lifecycle.Effect.MARK_CONTAINER_UNKNOWN: _fx_mark_container_unknown,
         lifecycle.Effect.MARK_CONTAINER_RUNNING: _fx_mark_container_running,
         lifecycle.Effect.MARK_CONTAINER_STOPPED: _fx_mark_container_stopped,
         lifecycle.Effect.SYNC_POWER_CONTROLS: _sync_power_controls,

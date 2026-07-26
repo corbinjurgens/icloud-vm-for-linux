@@ -51,6 +51,11 @@ class Phase(str, Enum):
     SHUTTING_DOWN = "shutting_down"
     SETUP = "setup"
     PROVISIONING = "provisioning"
+    #: D38. The outer subprocess timeout fired, so we killed an unprivileged
+    #: `sudo` — which is no evidence the root helper stopped. The bridge may be
+    #: half-reconciled, so everything stays quiesced and cached state is
+    #: invalidated until an explicit Retry proves otherwise.
+    TRANSITION_UNKNOWN = "transition_unknown"
 
 
 #: Phases in which no CIFS access may happen at all: a transition owns the
@@ -59,6 +64,7 @@ class Phase(str, Enum):
 #: share paths and opening a mount are all forbidden here.
 NO_CIFS_PHASES = frozenset({
     Phase.STARTING,
+    Phase.TRANSITION_UNKNOWN,
     Phase.SHUTTING_DOWN,
     Phase.POWERED_OFF,
     Phase.START_FAILED,
@@ -80,6 +86,9 @@ class Event(Enum):
     STARTUP_ALREADY_ON = "startup_already_on"
     STARTUP_PROVISION_NEEDED = "startup_provision_needed"
     STARTUP_INSPECT_FAILED = "startup_inspect_failed"
+    #: D39: a provisioning record matches a live container, so the app re-enters
+    #: the no-CIFS Provisioning Windows state it was interrupted in.
+    STARTUP_RESUME_PROVISIONING = "startup_resume_provisioning"
 
     # The power-on transaction.
     USER_START_BRIDGE = "user_start_bridge"
@@ -95,6 +104,9 @@ class Event(Enum):
     DRAIN_TIMED_OUT = "drain_timed_out"
     POWER_OFF_SUCCEEDED = "power_off_succeeded"
     POWER_OFF_FAILED = "power_off_failed"
+    #: The outer timeout fired: we do not know what the helper did (D38).
+    POWER_TRANSITION_UNKNOWN = "power_transition_unknown"
+    USER_RETRY_TRANSITION = "user_retry_transition"
 
     # The first-run assistant (D31).
     VM_CREATED = "vm_created"
@@ -122,6 +134,7 @@ class Effect(Enum):
     SHOW_SHUTDOWN_BANNER = "show_shutdown_banner"
     SHOW_POWERED_OFF_BANNER = "show_powered_off_banner"
     SHOW_ABORT_BANNER = "show_abort_banner"
+    SHOW_UNKNOWN_BANNER = "show_unknown_banner"
     SHOW_SETUP_TAB = "show_setup_tab"
     HIDE_SETUP_TAB = "hide_setup_tab"
     SHOW_WINDOW = "show_window"
@@ -134,6 +147,7 @@ class Effect(Enum):
     TRAY_SHUTTING_DOWN = "tray_shutting_down"
     TRAY_POWERED_OFF = "tray_powered_off"
     TRAY_SETUP = "tray_setup"
+    TRAY_TRANSITION_UNKNOWN = "tray_transition_unknown"
 
     # Notifications.
     ENABLE_NOTIFICATIONS = "enable_notifications"
@@ -143,6 +157,8 @@ class Effect(Enum):
     ANNOUNCE_START_FAILURE = "announce_start_failure"
 
     # Docker classification the controller caches for `power.available_action`.
+    INVALIDATE_CACHES = "invalidate_caches"
+    MARK_CONTAINER_UNKNOWN = "mark_container_unknown"
     MARK_CONTAINER_RUNNING = "mark_container_running"
     MARK_CONTAINER_STOPPED = "mark_container_stopped"
     SYNC_POWER_CONTROLS = "sync_power_controls"
@@ -191,6 +207,10 @@ class Model:
     #: Whether the power-off transaction currently running should exit the app
     #: afterwards (Quit) or leave it idling (D30's keep-running power off).
     exit_after_power_off: bool = True
+    #: Which transaction D38's `transition_unknown` would retry: "on" or "off".
+    #: Meaningless in every other phase, and deliberately carried rather than
+    #: re-derived, because the phase alone cannot say what was interrupted.
+    desired_action: str = "on"
     #: Incremented by every valid transition; see the module docstring.
     token: int = 0
 
@@ -333,6 +353,26 @@ _ABORT_SHUTDOWN = (
 )
 
 
+#: D38. Nothing here mutates or reads: the helper may still hold its `flock` and
+#: still be reconciling mounts, so every cached answer is dropped and the only
+#: control left is Retry.
+_ENTER_TRANSITION_UNKNOWN = (
+    Effect.DISABLE_NOTIFICATIONS,
+    Effect.RESET_INCIDENTS,
+    Effect.STOP_POLLING,
+    Effect.STOP_DRAIN,
+    Effect.QUIESCE_IO,
+    Effect.CLEAR_HEALTH_ROWS,
+    Effect.HIDE_NOTICE,
+    Effect.INVALIDATE_CACHES,
+    Effect.MARK_CONTAINER_UNKNOWN,
+    Effect.SHOW_UNKNOWN_BANNER,
+    Effect.TRAY_TRANSITION_UNKNOWN,
+    Effect.SYNC_POWER_CONTROLS,
+    Effect.SHOW_WINDOW,
+)
+
+
 def _starting(model: Model, event: Event) -> Transition | None:
     if event is Event.STARTUP_POWER_ON:
         return Transition(_next(model, Phase.STARTING), _BEGIN_STARTUP)
@@ -340,10 +380,15 @@ def _starting(model: Model, event: Event) -> Transition | None:
         return Transition(_next(model, Phase.RUNNING), _ENTER_MONITORING)
     if event in (Event.STARTUP_PROVISION_NEEDED, Event.STARTUP_INSPECT_FAILED):
         return Transition(_next(model, Phase.SETUP), _ENTER_SETUP)
+    if event is Event.STARTUP_RESUME_PROVISIONING:
+        return Transition(_next(model, Phase.PROVISIONING), _ENTER_PROVISIONING)
     if event is Event.POWER_ON_SUCCEEDED:
         return Transition(_next(model, Phase.RUNNING), _ENTER_RUNNING)
     if event is Event.POWER_ON_FAILED:
         return Transition(_next(model, Phase.START_FAILED), _ENTER_START_FAILED)
+    if event is Event.POWER_TRANSITION_UNKNOWN:
+        return Transition(_next(model, Phase.TRANSITION_UNKNOWN, desired="on"),
+                          _ENTER_TRANSITION_UNKNOWN)
     if event is Event.QUIT_CONFIRMED_POWER_OFF:
         return Transition(_next(model, Phase.SHUTTING_DOWN, exit_after=True),
                           _BEGIN_POWER_OFF)
@@ -403,6 +448,11 @@ def _shutting_down(model: Model, event: Event) -> Transition | None:
         return Transition(_next(model, Phase.POWERED_OFF), _ENTER_POWERED_OFF)
     if event is Event.POWER_OFF_FAILED:
         return Transition(_next(model, Phase.RUNNING), _ABORT_SHUTDOWN)
+    if event is Event.POWER_TRANSITION_UNKNOWN:
+        # Emphatically not the abort path: that resumes polling against shares
+        # the helper may already have unmounted.
+        return Transition(_next(model, Phase.TRANSITION_UNKNOWN, desired="off"),
+                          _ENTER_TRANSITION_UNKNOWN)
     return None
 
 
@@ -428,6 +478,17 @@ def _provisioning(model: Model, event: Event) -> Transition | None:
     return None
 
 
+def _transition_unknown(model: Model, event: Event) -> Transition | None:
+    """Quiesced until an explicit Retry, or a result that resolves the doubt."""
+    if event is Event.USER_RETRY_TRANSITION:
+        if model.desired_action == "off":
+            return Transition(_next(model, Phase.SHUTTING_DOWN), _BEGIN_POWER_OFF)
+        return Transition(_next(model, Phase.STARTING), _BEGIN_STARTUP)
+    if event is Event.QUIT_CONFIRMED_GUI_ONLY:
+        return Transition(_next(model, Phase.TRANSITION_UNKNOWN), (Effect.EXIT_APP,))
+    return None
+
+
 _TABLE = {
     Phase.STARTING: _starting,
     Phase.RUNNING: _running,
@@ -436,17 +497,20 @@ _TABLE = {
     Phase.SHUTTING_DOWN: _shutting_down,
     Phase.SETUP: _setup,
     Phase.PROVISIONING: _provisioning,
+    Phase.TRANSITION_UNKNOWN: _transition_unknown,
 }
 
 
-def _next(model: Model, phase: Phase, *, exit_after: bool | None = None) -> Model:
-    """The successor model: new phase, bumped token, continuation carried over."""
+def _next(model: Model, phase: Phase, *, exit_after: bool | None = None,
+          desired: str | None = None) -> Model:
+    """The successor model: new phase, bumped token, continuations carried over."""
     return replace(
         model,
         phase=phase,
         token=model.token + 1,
         exit_after_power_off=(model.exit_after_power_off if exit_after is None
                               else exit_after),
+        desired_action=(model.desired_action if desired is None else desired),
     )
 
 
@@ -469,6 +533,10 @@ QUIT_IGNORE = "ignore"              # a transaction is already running
 QUIT_ALREADY_OFF = "already_off"    # nothing left for the helper to do
 QUIT_NOTHING_MOUNTED = "nothing_mounted"    # setup/provisioning
 QUIT_THREE_WAY = "three_way"        # power off, GUI only, or cancel
+#: D38: the helper's outcome is unknown, so offering to run it again from a Quit
+#: dialog would be a second guess on top of the first. Quitting is allowed;
+#: quitting *and powering off* is not.
+QUIT_UNKNOWN = "unknown_transition"
 
 
 def quit_kind(phase: Phase) -> str:
@@ -477,6 +545,8 @@ def quit_kind(phase: Phase) -> str:
         return QUIT_IGNORE
     if phase is Phase.POWERED_OFF:
         return QUIT_ALREADY_OFF
+    if phase is Phase.TRANSITION_UNKNOWN:
+        return QUIT_UNKNOWN
     if phase in (Phase.SETUP, Phase.PROVISIONING):
         return QUIT_NOTHING_MOUNTED
     return QUIT_THREE_WAY

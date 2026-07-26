@@ -501,6 +501,13 @@ Files: `gui/icloud_bridge_gui/diagnostics.py` (new),
 
 ## 6. Show progress and preserve provisioning state (D38/D39, I-005)
 
+> **Status: done.** `power.stream_command` streams the helper's own `==> ` lines
+> with no new IPC channel; busy surfaces show elapsed time plus the last phase;
+> an outer timeout enters the new `transition_unknown` phase instead of the
+> failure path; and `firstrun` writes the D39 provisioning record before Compose.
+> The `on` path of `host/icloud-bridge-power` gained one phase line (the audit's
+> only gap). D38, D39 and E15 are recorded.
+
 VM creation plus Windows provisioning can span 20–40+ minutes, and power-on
 retries real CIFS activation for up to five minutes; today the operator sees a
 static busy message.

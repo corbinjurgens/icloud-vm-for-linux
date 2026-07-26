@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import os
+import stat
 import sys
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from icloud_bridge_gui import firstrun, power  # noqa: E402
+from icloud_bridge_gui import backup, firstrun, power  # noqa: E402
 
 
 class FakeRunner:
@@ -343,3 +345,133 @@ def test_host_setup_touches_no_mount_path():
 
     firstrun.check_host_setup(runner=FakeRunner(), exists=exists)
     assert not any(path.startswith("/mnt/") for path in looked_at)
+
+
+# ------------------------ the interrupted-provisioning record (v2 plan D39) --
+
+@pytest.fixture
+def state_base(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    return str(tmp_path / "state")
+
+
+def record_of(**overrides):
+    base = dict(started_at="2026-07-26T12:00:00Z", phase="creating", container_id="")
+    base.update(overrides)
+    return firstrun.ProvisioningRecord(**base)
+
+
+def test_the_record_round_trips(state_base):
+    firstrun.write_provisioning_record(record_of(container_id="abc123"))
+    loaded = firstrun.read_provisioning_record()
+    assert loaded == record_of(container_id="abc123")
+
+
+def test_the_record_is_mode_0600_in_a_0700_directory(state_base):
+    firstrun.write_provisioning_record(record_of())
+    path = firstrun.provisioning_path()
+    assert stat.S_IMODE(os.lstat(path).st_mode) == 0o600
+    assert stat.S_IMODE(os.lstat(os.path.dirname(path)).st_mode) == 0o700
+
+
+def test_the_record_never_carries_the_env_path_or_its_contents(state_base):
+    firstrun.write_provisioning_record(record_of(container_id="abc"))
+    with open(firstrun.provisioning_path(), encoding="utf-8") as handle:
+        document = json.load(handle)
+    assert set(document) == {"version", "startedAt", "phase", "containerId"}
+
+
+def test_no_record_reads_as_none(state_base):
+    assert firstrun.read_provisioning_record() is None
+
+
+@pytest.mark.parametrize("payload", [
+    "not json",
+    json.dumps([1, 2]),
+    json.dumps({"version": 2, "startedAt": "x"}),
+    json.dumps({"startedAt": "x"}),
+    json.dumps({"version": 1}),
+    json.dumps({"version": 1, "startedAt": ""}),
+    json.dumps({"version": 1, "startedAt": 7}),
+])
+def test_a_malformed_record_raises_and_is_left_on_disk(state_base, payload):
+    backup.ensure_app_dir()
+    path = firstrun.provisioning_path()
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(payload)
+    with pytest.raises(backup.BackupError):
+        firstrun.read_provisioning_record()
+    # Never silently deleted, and never treated as proof a VM is configured.
+    assert os.path.exists(path)
+
+
+def test_a_symlinked_record_is_not_followed(state_base, tmp_path):
+    backup.ensure_app_dir()
+    victim = tmp_path / "victim.json"
+    victim.write_text("do not touch", encoding="utf-8")
+    os.symlink(str(victim), firstrun.provisioning_path())
+    with pytest.raises(backup.BackupError):
+        firstrun.read_provisioning_record()
+    with pytest.raises(backup.BackupError):
+        firstrun.write_provisioning_record(record_of())
+    assert victim.read_text(encoding="utf-8") == "do not touch"
+
+
+def test_clearing_is_idempotent(state_base):
+    firstrun.clear_provisioning_record()
+    firstrun.write_provisioning_record(record_of())
+    firstrun.clear_provisioning_record()
+    assert firstrun.read_provisioning_record() is None
+
+
+@pytest.mark.parametrize("state,container_id,expected", [
+    ("running", "abc123", firstrun.RECORD_MATCHES),
+    ("running", "different", firstrun.RECORD_DIFFERENT),
+    ("stopped", "abc123", firstrun.RECORD_MATCHES),
+    ("absent", "", firstrun.RECORD_CONTAINER_GONE),
+])
+def test_classify_a_record_with_a_known_container_id(state, container_id, expected):
+    assert firstrun.classify_record(
+        record_of(container_id="abc123"), state, container_id) == expected
+
+
+def test_a_pre_compose_record_accepts_the_fixed_container_name():
+    """Before Compose returns there is no id, so the name is all we have."""
+    assert firstrun.classify_record(record_of(), "running", "") == firstrun.RECORD_MATCHES
+    assert firstrun.classify_record(record_of(), "absent", "") == \
+        firstrun.RECORD_CONTAINER_GONE
+
+
+def test_no_record_leaves_startup_alone():
+    """A running container with no record keeps the existing startup behavior."""
+    assert firstrun.classify_record(None, "running", "abc") == firstrun.RECORD_ABSENT
+    assert firstrun.classify_record(None, "absent", "") == firstrun.RECORD_ABSENT
+
+
+def test_inspect_container_id_uses_an_exact_argv():
+    runner = FakeRunner({"docker inspect -f": power.RunResult(0, "sha256:abc\n", "")})
+    assert firstrun.inspect_container_id(runner) == "sha256:abc"
+    assert runner.calls[0] == ["docker", "inspect", "-f", "{{.Id}}", "icloud-windows"]
+
+
+def test_an_unreadable_container_id_is_empty_not_a_guess():
+    runner = FakeRunner({"docker inspect -f": power.RunResult(1, "", "boom")})
+    assert firstrun.inspect_container_id(runner) == ""
+
+
+# ----------------------------------------- streaming compose output (D38) ---
+
+def test_create_vm_streams_its_output_when_asked(tmp_path):
+    bundle = firstrun.Bundle(
+        root=str(tmp_path), compose_file=str(tmp_path / "docker-compose.yml"),
+        provision_dir=str(tmp_path / "provision"),
+        env_example=str(tmp_path / "env.example"), origin="source")
+    seen = []
+    runner = FakeRunner(
+        {"docker compose -p": power.RunResult(0, "Container icloud-windows Created\n", "")})
+    ok, output = firstrun.create_vm(bundle, "/tmp/.env", runner=runner,
+                                    on_line=seen.append)
+    assert ok
+    assert "Created" in output
+    # An explicit runner still wins, so existing fakes keep working unchanged.
+    assert seen == []
