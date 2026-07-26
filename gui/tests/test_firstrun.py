@@ -1,17 +1,26 @@
-"""First-run assistant tests: resolution, env validation, checks, argv (no Qt)."""
+"""First-run assistant tests: resolution, env validation, checks, argv (no Qt).
+
+The env-file section also pins the shared ``SHARE_PASS`` grammar (v2 plan D41)
+against ``host/icloud-bridge-configure``: the GUI sets the guest account from
+the same file the shell script derives ``/etc/credentials-icloud`` from, so the
+two readers agreeing is a correctness requirement, not tidiness.  The passwords
+here are synthetic fixtures.
+"""
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
+import subprocess
 import sys
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from icloud_bridge_gui import backup, firstrun, power  # noqa: E402
+from icloud_bridge_gui import backup, envfile, firstrun, power  # noqa: E402
 
 
 class FakeRunner:
@@ -147,9 +156,9 @@ def test_missing_and_empty_keys_are_both_problems(tmp_path):
     assert "SHARE_PASS is missing" in report.problems
 
 
-def test_quotes_are_stripped_and_junk_lines_are_reported(tmp_path):
+def test_quotes_are_stripped_from_compose_keys_and_junk_lines_are_reported(tmp_path):
     path = write_env(tmp_path, 'DISK_SIZE="120G"\nnot a setting\nRAM_SIZE=3G\n'
-                               "CPU_CORES=2\nSHARE_PASS='secret-value-here'\n")
+                               "CPU_CORES=2\nSHARE_PASS=a-very-long-random-secret\n")
     report = firstrun.read_env_file(path)
     assert any("line 2" in problem for problem in report.problems)
     # The quoted values still counted as present, so nothing else complains.
@@ -169,6 +178,139 @@ def test_the_env_file_is_never_executed(tmp_path):
     report = firstrun.read_env_file(path)
     assert report.ok
     assert not os.path.exists("/tmp/should-not-exist")
+
+
+def test_the_parser_lives_in_one_place_for_all_three_readers():
+    """`firstrun` re-exports it; it does not carry a second copy (D41)."""
+    assert firstrun.read_env_file is envfile.read_env_file
+    assert firstrun.EnvReport is envfile.EnvReport
+
+
+# ------------------------------------------- the shared SHARE_PASS grammar --
+# One physical `SHARE_PASS=` line in column 1; everything after the first `=` is
+# the value, so `#` and later `=` are data; no quote processing, no surrounding
+# whitespace, no NUL and no CR. Duplicates and quoted forms are rejected rather
+# than reinterpreted (v2 plan section 4.1).
+
+ACCEPTED = "accepted"
+REJECTED = "rejected"
+ABSENT = "absent"
+
+#: (name, file text, verdict, expected value). Every case is run through both
+#: the Python parser and the shell function, so the two cannot drift.
+GRAMMAR_CASES = [
+    ("plain", "DISK_SIZE=120G\nSHARE_PASS=a-very-long-random-secret\n",
+     ACCEPTED, "a-very-long-random-secret"),
+    ("hash and equals are data", "SHARE_PASS=pa#ss=word\n", ACCEPTED, "pa#ss=word"),
+    ("no trailing newline", "SHARE_PASS=abcdefgh", ACCEPTED, "abcdefgh"),
+    ("a similarly named key is not this one",
+     "MY_SHARE_PASS=other\nSHARE_PASS=chosen\n", ACCEPTED, "chosen"),
+    ("internal spaces are kept", "SHARE_PASS=two words\n", ACCEPTED, "two words"),
+    ("duplicated", "SHARE_PASS=first\nSHARE_PASS=second\n", REJECTED, ""),
+    ("double quoted", 'SHARE_PASS="quoted"\n', REJECTED, ""),
+    ("single quoted", "SHARE_PASS='quoted'\n", REJECTED, ""),
+    ("leading space in the value", "SHARE_PASS= leading\n", REJECTED, ""),
+    ("trailing space in the value", "SHARE_PASS=trailing \n", REJECTED, ""),
+    ("indented key", "  SHARE_PASS=indented\n", REJECTED, ""),
+    ("spaces around the equals", "SHARE_PASS = spaced\n", REJECTED, ""),
+    ("empty value", "SHARE_PASS=\n", REJECTED, ""),
+    ("carriage return", "SHARE_PASS=crlf\r\n", REJECTED, ""),
+    ("a NUL byte", "SHARE_PASS=nu\x00l\n", REJECTED, ""),
+    ("the placeholder", "SHARE_PASS=CHANGE_ME_STRONG_PASSWORD\n", REJECTED, ""),
+    ("the other placeholder", "SHARE_PASS=STRONG_PASSWORD_HERE\n", REJECTED, ""),
+    ("no such line", "DISK_SIZE=120G\n", ABSENT, ""),
+    ("only a comment", "# SHARE_PASS=commented-out\n", ABSENT, ""),
+]
+
+
+@pytest.mark.parametrize("name,text,verdict,expected",
+                         GRAMMAR_CASES, ids=[case[0] for case in GRAMMAR_CASES])
+def test_the_python_parser_applies_the_grammar(tmp_path, name, text, verdict, expected):
+    path = tmp_path / ".env"
+    path.write_bytes(text.encode("utf-8"))
+    value, problems = envfile.share_pass_problems(text)
+    if verdict == ACCEPTED:
+        assert problems == []
+        assert value == expected
+        assert envfile.read_share_pass(str(path)) == expected
+    else:
+        assert problems
+        assert value == ""
+        with pytest.raises(envfile.EnvError):
+            envfile.read_share_pass(str(path))
+    if verdict == ABSENT:
+        assert problems == ["SHARE_PASS is missing"]
+
+
+def test_a_rejection_never_quotes_the_value(tmp_path):
+    secret = "correct-horse-battery-staple-42"
+    path = tmp_path / ".env"
+    path.write_text(f"SHARE_PASS='{secret}'\n", encoding="utf-8")
+    with pytest.raises(envfile.EnvError) as excinfo:
+        envfile.read_share_pass(str(path))
+    assert secret not in str(excinfo.value)
+
+
+def test_the_report_still_never_carries_the_value(tmp_path):
+    secret = "correct-horse-battery-staple-42"
+    path = write_env(tmp_path, f"DISK_SIZE=1G\nRAM_SIZE=1G\nCPU_CORES=1\n"
+                               f"SHARE_PASS={secret}\n")
+    report = firstrun.read_env_file(path)
+    assert report.ok
+    assert secret not in repr(report) + "".join(report.problems + report.keys)
+
+
+# ---------------------- the same grammar in host/icloud-bridge-configure --
+
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CONFIGURE = os.path.join(REPO, "host", "icloud-bridge-configure")
+
+
+def _extract_function(path: str, name: str) -> str:
+    """Pull one top-level shell function out of a script by its brace block.
+
+    The same seam `test_power_helper.py` uses: the script as a whole needs root,
+    systemd and a live Docker daemon, but this function is pure text work over
+    one file and can be proved here.
+    """
+    with open(path, encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith(f"{name}() {{"))
+    end = next(i for i in range(start, len(lines)) if lines[i] == "}")
+    return "\n".join(lines[start:end + 1])
+
+
+def shell_read_share_pass(path: str):
+    """``(exit status, stdout)`` from the script's own ``read_share_pass``."""
+    script = _extract_function(CONFIGURE, "read_share_pass") + \
+        '\nread_share_pass "$1"\n'
+    completed = subprocess.run(["bash", "-c", script, "bash", path],
+                               capture_output=True, text=True, check=False)
+    return completed.returncode, completed.stdout
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not installed")
+@pytest.mark.parametrize("name,text,verdict,expected",
+                         GRAMMAR_CASES, ids=[case[0] for case in GRAMMAR_CASES])
+def test_the_shell_parser_applies_the_same_grammar(tmp_path, name, text, verdict,
+                                                   expected):
+    """A divergence here would configure Windows and /etc/credentials-icloud
+    with different passwords, and the bridge would fail to mount with a value
+    that looks correct at both ends."""
+    path = tmp_path / ".env"
+    path.write_bytes(text.encode("utf-8"))
+    status, stdout = shell_read_share_pass(str(path))
+    if verdict == ACCEPTED:
+        assert status == 0
+        assert stdout == expected + "\n"
+    elif verdict == REJECTED:
+        assert status == 1
+        assert stdout == ""
+    else:
+        # 2 is "this file simply does not set it": keep looking at the next
+        # candidate rather than failing the whole run.
+        assert status == 2
+        assert stdout == ""
 
 
 # ------------------------------------------------------------- host checks --

@@ -18,21 +18,29 @@ Deliberate boundaries:
 * **The GUI installs nothing privileged.**  Failed checks carry a copyable
   command from SETUP.md; the operator runs package installs, group changes,
   `icloud-bridge-configure` and `setup-host.sh` themselves.
-* **The share password is never handled.**  The env file is parsed as text, not
-  sourced as shell; ``SHARE_PASS`` is checked for presence and for still being
-  the placeholder, and its value is never printed, logged, put in argv, copied
-  into a resource bundle, or placed on the clipboard.  Carrying it into the
-  guest stays the manual `provision/03-create-share.ps1` step.
+* **The share password is never handled *here*.**  The env file is parsed as
+  text, not sourced as shell, by the shared :mod:`envfile` grammar; this module
+  receives only an :class:`~.envfile.EnvReport` — key names and problems — so
+  the value is never printed, logged, put in argv, copied into a resource
+  bundle, or placed on the clipboard by anything in the first-run path.  D41
+  narrows D31's original "never handled by the GUI at all": :mod:`guestprov` is
+  the one module allowed to return that value, and only to stream it into the
+  container over stdin at the moment the guest asks for it.  Carrying it in by
+  hand remains the documented `provision/03-create-share.ps1` fallback.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
 
 from . import backup
+# Re-exported deliberately: the env file's grammar is shared with `guestprov`
+# and `host/icloud-bridge-configure` (D41), but the first-run assistant is still
+# where the operator's file is chosen and reported on.
+from .envfile import EnvReport, read_env_file, read_file_text
 from .power import (CONTAINER_NAME, HELPER_PATH, RunResult, Runner, default_runner,
                     docker_env, docker_runner, streaming_runner)
 
@@ -66,10 +74,6 @@ OK = "ok"
 WARN = "warn"
 FAIL = "fail"
 
-_PLACEHOLDER_PASSWORDS = frozenset({"CHANGE_ME_STRONG_PASSWORD", "STRONG_PASSWORD_HERE"})
-#: Keys the compose file interpolates, plus the share password.
-REQUIRED_ENV_KEYS = ("DISK_SIZE", "RAM_SIZE", "CPU_CORES", "SHARE_PASS")
-
 
 # ----------------------------------------------------------------- results --
 
@@ -98,18 +102,6 @@ class Bundle:
     origin: str                       # override | source | user | package
     source_checkout: str = ""         # recorded by the per-user installer
     checkout_missing: bool = False    # …and no longer where it said
-
-
-@dataclass
-class EnvReport:
-    """What the operator's env file contains — never *what* the password is."""
-    path: str
-    problems: list[str] = field(default_factory=list)
-    keys: list[str] = field(default_factory=list)
-
-    @property
-    def ok(self) -> bool:
-        return not self.problems
 
 
 # ------------------------------------------------------ resource resolution --
@@ -178,66 +170,12 @@ def _read_checkout(root: str, *, exists: Callable[[str], bool],
     if not exists(marker):
         return "", False
     try:
-        recorded = (read_text or _read_text)(marker).strip()
+        recorded = (read_text or read_file_text)(marker).strip()
     except OSError:
         return "", False
     if not recorded:
         return "", False
     return recorded, not exists(os.path.join(recorded, "host", "setup-host.sh"))
-
-
-def _read_text(path: str) -> str:
-    with open(path, encoding="utf-8", errors="replace") as handle:
-        return handle.read(64 * 1024)
-
-
-# -------------------------------------------------------------- env parsing --
-
-def read_env_file(path: str, *,
-                  read_text: Callable[[str], str] | None = None) -> EnvReport:
-    """Validate an env file as *text*.
-
-    Never sourced as shell — that would execute whatever is in it — and the
-    values of secrets are never returned. Only the key names come back.
-    """
-    report = EnvReport(path=path)
-    try:
-        raw = (read_text or _read_text)(path)
-    except OSError as exc:
-        report.problems.append(f"cannot read {path}: {exc}")
-        return report
-
-    values: dict[str, str] = {}
-    for number, line in enumerate(raw.splitlines(), start=1):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if "=" not in stripped:
-            report.problems.append(f"line {number} is not KEY=value")
-            continue
-        key, _, value = stripped.partition("=")
-        key = key.strip()
-        if not key:
-            report.problems.append(f"line {number} has an empty key")
-            continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        values[key] = value
-
-    report.keys = sorted(values)
-    for key in REQUIRED_ENV_KEYS:
-        if key not in values:
-            report.problems.append(f"{key} is missing")
-        elif not values[key]:
-            report.problems.append(f"{key} is empty")
-    # Reported by name only: the placeholder check must not echo the value, and
-    # neither must anything else here.
-    if values.get("SHARE_PASS") in _PLACEHOLDER_PASSWORDS:
-        report.problems.append(
-            "SHARE_PASS is still the placeholder — set a strong password "
-            "(20+ random characters) before creating the share")
-    return report
 
 
 # ------------------------------------------------------------- host checks --

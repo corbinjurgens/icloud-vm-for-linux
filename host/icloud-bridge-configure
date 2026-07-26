@@ -13,6 +13,13 @@
 # gitignored .env, and the mount ownership plus the D29 sudoers grant key off
 # whichever desktop account will actually run the GUI.
 #
+# The SHARE_PASS line is read with one deliberately small grammar, shared with
+# gui/icloud_bridge_gui/envfile.py (v2 plan D41): exactly one line beginning
+# SHARE_PASS= in column 1, every byte after the first = being the value, with no
+# quoting, no surrounding whitespace, and no NUL or CR. Anything else is
+# rejected rather than reinterpreted, so the Windows account and this file
+# cannot silently end up with different passwords.
+#
 # What it does:
 #   1. /etc/credentials-icloud       from SHARE_PASS
 #   2. uid=/gid= in the two installed .mount units  -> the desktop user
@@ -33,6 +40,75 @@ MOUNT_UNITS=(mnt-icloud.mount mnt-icloud_bridge.mount)
 # the first non-comment line, so editing the header cannot desynchronize --help.
 usage() {
   awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+}
+
+# read_share_pass <env-file> — print the SHARE_PASS value, or explain on stderr
+# why the file is not acceptable. Exit status: 0 value printed, 1 the value is
+# present but unusable, 2 this file simply has no SHARE_PASS line.
+#
+# One grammar, three readers (v2 plan D41 and section 4.1): this must accept
+# exactly what gui/icloud_bridge_gui/envfile.py accepts. Getting that wrong is
+# not a cosmetic difference — the guest account is set from the GUI's reading of
+# this same file, so a divergence produces a share whose password looks right on
+# both sides and mounts on neither. gui/tests/test_firstrun.py extracts this
+# function and runs the same fixtures through both implementations.
+#
+# Whole-file rather than value-only in one respect: `read` silently drops NUL
+# bytes, so a NUL anywhere in the file is refused instead of being invisibly
+# removed from a password. That errs towards refusing, which is the safe way to
+# differ.
+read_share_pass() {
+  local file=$1 line trimmed value="" count=0 loose=0
+  if [ "$(tr -d '\0' < "$file" | wc -c)" -ne "$(wc -c < "$file")" ]; then
+    echo "$file: SHARE_PASS file contains a NUL byte" >&2
+    return 1
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in
+      SHARE_PASS=*)
+        count=$((count + 1))
+        value=${line#SHARE_PASS=} ;;
+      *SHARE_PASS*)
+        trimmed=${line#"${line%%[![:space:]]*}"}
+        case $trimmed in
+          '#'*) ;;
+          SHARE_PASS[[:space:]]*=*|SHARE_PASS=*) loose=1 ;;
+        esac ;;
+    esac
+  done < "$file"
+
+  if [ "$count" -gt 1 ]; then
+    echo "$file: SHARE_PASS is set on more than one line; exactly one line is allowed" >&2
+    return 1
+  fi
+  if [ "$count" -eq 0 ]; then
+    if [ "$loose" -eq 1 ]; then
+      echo "$file: SHARE_PASS must start in column 1 with no spaces around '='" >&2
+      return 1
+    fi
+    return 2
+  fi
+  case $value in
+    *$'\r'*)
+      echo "$file: SHARE_PASS contains a carriage return; this file must use LF line endings" >&2
+      return 1 ;;
+  esac
+  if [ -z "$value" ]; then
+    echo "$file: SHARE_PASS is empty" >&2
+    return 1
+  fi
+  case $value in
+    [[:space:]]*|*[[:space:]])
+      echo "$file: SHARE_PASS has leading or trailing whitespace; the value is used exactly as written" >&2
+      return 1 ;;
+    \"*\"|\'*\')
+      echo "$file: SHARE_PASS is quoted; the quotes would become part of the password — remove them" >&2
+      return 1 ;;
+    CHANGE_ME_STRONG_PASSWORD|STRONG_PASSWORD_HERE)
+      echo "$file: SHARE_PASS is still the placeholder — set a strong password (20+ random characters)" >&2
+      return 1 ;;
+  esac
+  printf '%s\n' "$value"
 }
 
 env_file=""
@@ -81,11 +157,19 @@ esac
 if [ -z "${SHARE_PASS:-}" ]; then
   for candidate in "$env_file" "${ICLOUD_ENV_FILE:-}" ./.env "$STATE_DIR/.env"; do
     [ -n "$candidate" ] && [ -f "$candidate" ] || continue
-    # `|| true` is load-bearing: under `set -o pipefail` a grep that matches
-    # nothing fails the whole pipeline, and `set -e` would then kill the script
-    # with no message at all for a .env that simply has no SHARE_PASS line.
-    SHARE_PASS="$(grep -E '^SHARE_PASS=' "$candidate" | cut -d= -f2- || true)"
-    [ -n "${SHARE_PASS:-}" ] && { echo "==> Reading SHARE_PASS from $candidate"; break; }
+    # A file with no SHARE_PASS line at all (status 2) just means "look in the
+    # next candidate". A file that *does* set it but breaks the shared grammar
+    # is a hard stop: silently moving on would configure this host from one file
+    # while the operator believes another one is in effect.
+    value="$(read_share_pass "$candidate")" && status=0 || status=$?
+    if [ "$status" -eq 0 ]; then
+      SHARE_PASS="$value"
+      echo "==> Reading SHARE_PASS from $candidate"
+      break
+    elif [ "$status" -ne 2 ]; then
+      echo "Fix that line, or point --env-file at the file you meant." >&2
+      exit 1
+    fi
   done
 fi
 if [ -n "${SHARE_PASS:-}" ] && [ "$SHARE_PASS" != "CHANGE_ME_STRONG_PASSWORD" ]; then

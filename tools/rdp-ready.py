@@ -11,6 +11,10 @@ check reported "guest ready" 30 seconds into a 5 GB ISO download. This sends a
 real X.224 Connection Request and requires a TPKT response.
 
   python3 tools/rdp-ready.py && echo up
+
+The GUI has its own copy of this handshake in
+`gui/icloud_bridge_gui/guestprov.py` (`guest_os_ready`), because `tools/` is not
+installed with the package. Keep the two in step if the probe ever changes.
 """
 import socket, sys
 
