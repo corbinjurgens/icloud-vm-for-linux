@@ -1171,6 +1171,10 @@ gui/
 │   ├── lifecycle.py       # Qt-free, no I/O of any kind: the D29-D31 state
 │   │                      #   machine as a pure reducer (model, event) -> effects
 │   ├── autostart.py       # Qt-free: read/toggle the XDG autostart entry (D29)
+│   ├── backup.py          # Qt-free, never CIFS: the local exclusions snapshot,
+│   │                      #   its revision-monotonicity and restore preview (D36)
+│   ├── diagnostics.py     # Qt-free, no mount I/O: the allowlisted, redacted
+│   │                      #   support report over `Facts` (D37)
 │   ├── tray.py            # QSystemTrayIcon: icon state (D23), menu, autostart item
 │   ├── window.py          # QMainWindow with 2 tabs: Status, Selective Sync
 │   └── icons/             # icloud-green.svg, icloud-yellow.svg, icloud-red.svg,

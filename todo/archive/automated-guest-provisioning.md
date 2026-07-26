@@ -1,11 +1,17 @@
 # Todo: App-driven Windows guest provisioning
 
-> **Status: planned, not started.** This note is the investigation record and the
-> execution plan. Per `CONTRIBUTING.md` ("Plans own decisions; files own code"),
-> the decision rows drafted below MUST be moved into the v2 plan register
-> (`docs/plan-gui-selective-sync.md` section 1) in the first implementation
-> commit, claiming the next free D numbers at the moment of editing. Do not
-> implement against this note alone.
+> **Status: executed 2026-07-27; archived.** Milestones M0-M4 are implemented and
+> committed. The decision rows drafted below were moved into the v2 plan register
+> as **D40-D44**, which — together with the new `docs/plan-gui-selective-sync.md`
+> sections 4.1 and 4.2 — is the specification of record. This note is kept only
+> as the investigation history; do not implement against it.
+>
+> **M5 (operator verification) was not performed and cannot be.** It needs real
+> KVM, a Windows guest and a live container, none of which exist in the
+> development workspace. `make lint-ps` proves PowerShell syntax only. Everything
+> M5 lists remains unproven: `RunLevel Highest`, Store/winget timing, the live
+> Samba reload and its read-only enforcement, SMB access to `Provision`/`Data`
+> from the elevated task, and Windows PowerShell 5.1 runtime behaviour.
 
 ## Goal
 

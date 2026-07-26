@@ -304,7 +304,7 @@ contents and syntax; they do not prove any of the above.
 ### 2026-07-27 — App-driven guest provisioning: the decisions, before any code
 
 The plan half of the work described in
-[`todo/automated-guest-provisioning.md`](todo/automated-guest-provisioning.md).
+[`todo/archive/automated-guest-provisioning.md`](todo/archive/automated-guest-provisioning.md).
 No behaviour changed here — this entry records the decisions that the
 implementation must now be judged against, because `CONTRIBUTING.md` requires a
 todo's proposed decisions to reach a plan register before they are implemented.

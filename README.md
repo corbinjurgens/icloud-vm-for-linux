@@ -158,8 +158,9 @@ docker compose logs -f                 # follow the build (Ctrl-C stops the log 
 The **first** `up` downloads a multi-gigabyte Windows 11 ISO and runs an unattended
 install — typically **20–40 minutes**. Watch it live at
 **http://127.0.0.1:8006** (noVNC). The debloat step (`provision/01-debloat.ps1`)
-runs automatically via the `/oem` mount, and a `NEXT-STEPS.txt` is left on the
-guest desktop. Wait for the Windows desktop to appear before continuing.
+runs automatically via the `/oem` mount, the provisioning watcher registers
+itself so the app can drive the rest (step 3), and a `NEXT-STEPS.txt` is left on
+the guest desktop. Wait for the Windows desktop to appear before continuing.
 
 ### 3. Setup inside the guest (the app does it; the Apple sign-in is yours)
 
