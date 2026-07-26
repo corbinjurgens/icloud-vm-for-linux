@@ -245,6 +245,62 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-27 — The app now provisions the Windows guest, and the docs say so
+
+The implementation of the decisions recorded in the entry below, plus the
+operator documentation for it. After **Create Windows VM**, the Setup tab offers
+**Set up Windows automatically**: the app installs iCloud for Windows, waits
+while the operator signs in, creates the SMB share, installs the bridge agent,
+and hands over to **Check setup and connect**. The Apple ID sign-in and the
+iCloud Drive toggle are what remain manual, and that is unchanged and deliberate.
+
+- **One action repairs an existing VM.** **Re-run Windows provisioning…** is on
+  the Status tab, in the tray menu, and behind the D35 skew and
+  protocol-incompatible banners — one implementation with one enablement rule,
+  deliberately still available while the bridge protocol is `skewed` or
+  `incompatible`, because that is what those banners point at. Its confirmation
+  says plainly that `/mnt/icloud` and `/mnt/icloud_bridge` **stay mounted**: the
+  app pauses its own bridge reads but cannot police another program's use of the
+  mounts, so the operator closes files and shells under `/mnt/icloud*` first.
+- **A run reconciles rather than replays** (D44). It inspects a fixed checklist,
+  repairs only the components that are missing or drifted, stops before mutating
+  anything that reads as blocked or unknown, and re-checks everything afterwards.
+  An agent-build mismatch on an otherwise healthy VM therefore plans exactly
+  *Update bridge agent*: no env file is requested, no password is reset, no ACLs
+  are rewritten. The **Reset share password from an env file** option on the
+  re-run confirmation is unchecked, and only a first run or a missing account
+  asks for the secret without it.
+- **The share credential is never shown green.** It reads *reset during this run*
+  or *preserved*, each qualified with why the app cannot do better: Windows never
+  reveals an account password, so connecting is the proof. That honesty is the
+  point — a green row there would be a claim about something nothing on the host
+  can verify.
+- **No active recovery instruction names `C:\OEM` any more.** It is written once
+  at install time and goes stale — the author's live VM was four commits behind,
+  missing the very skew detection it was supposed to have. The troubleshooting
+  rows in `SETUP.md`, the pre-2026-07-26 data-path catch-up section, and
+  `README.md`'s pre-release note now route through the re-provision action; the
+  by-hand sequence is retained as an explicitly labelled fallback and points at
+  the administrator-protected `C:\ProgramData\icloud-bridge-provision\current`
+  copy that each run refreshes (D42). Historical entries in this file and in
+  `docs/acceptance-results.md` are left exactly as they were written.
+- **The one-time bootstrap is documented where it is needed.** A VM created
+  before this feature has no watcher task, so a staged run is never acknowledged
+  — not an error. The app keeps polling and, after 90 s, shows the single
+  elevated command that installs the watcher; the already-staged request is then
+  picked up with no further click on the host. `SETUP.md` §8 carries the same
+  command, and `docs/automation-notes.md`'s scoreboard now records steps 9, 13
+  and 14 (scripts 02, 03 and 04) as automated rather than as operator work.
+
+**Nothing here has been run against a real guest.** The checkout has no KVM, no
+Windows VM and no Docker guest container, so the whole live matrix — the
+read-only enforcement on the `Provision` share, `RunLevel Highest` behaviour,
+Windows PowerShell 5.1 runtime behaviour of the new scripts, Store readiness
+timing, the bootstrap on the author's pre-feature VM, and every reconciliation
+outcome — is still the milestone after this one, and is unproven. `make check`
+and `make lint-ps` prove pure state models, command construction, package
+contents and syntax; they do not prove any of the above.
+
 ### 2026-07-27 — App-driven guest provisioning: the decisions, before any code
 
 The plan half of the work described in

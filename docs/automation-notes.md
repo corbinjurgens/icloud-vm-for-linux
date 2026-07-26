@@ -21,17 +21,28 @@ This file is the engineering record ("why it was manual, and how to remove it").
 | 6 | Detect "guest is ready" | naive check gave a false positive | **Yes — done** (`tools/rdp-ready.py`) |
 | 7 | Get files into the guest | painful via noVNC | **Yes — done** (`\\host.lan\Data`) |
 | 8 | Run scripts in the guest (execution policy) | blocked, then misdiagnosed | **Yes** — invoke with `-ExecutionPolicy Bypass` |
-| 9 | Install iCloud (wrong winget ID) | failed, needed `winget search` | **Yes — done** (ID corrected) |
-| 10 | Type commands into the guest | copy/paste hell | **Yes — done** (`tools/guest-ctl.sh`) |
+| 9 | Install iCloud (`02-install-icloud.ps1`, wrong winget ID) | failed, needed `winget search` | **Yes — done** (ID corrected; the app runs the install with bounded retries, D40-D44) |
+| 10 | Type commands into the guest | copy/paste hell | **Yes — done** (`tools/guest-ctl.sh`) — but see the note below: it is a debugging aid, not the product mechanism |
 | 11 | **Apple ID sign-in + 2FA** | manual | **No — and must stay manual** |
 | 12 | iCloud Drive ON (Files On-Demand stays ON) | GUI toggle | Partly — GUI automation is brittle |
-| 13 | Create SMB share (`03-create-share.ps1`) | manual | **Yes** — scriptable, needs the secret |
-| 14 | Bridge agent + selective sync (`04-bridge-agent.ps1`) | n/a on the first run | **Yes** — scriptable, no secret |
+| 13 | Create SMB share (`03-create-share.ps1`) | manual | **Yes — done** (D40-D44; the secret is streamed over `docker exec` stdin only once the guest asks for it, D41) |
+| 14 | Bridge agent + selective sync (`04-bridge-agent.ps1`) | n/a on the first run | **Yes — done** (D40-D44; scoped so an agent update touches nothing else) |
 | 15 | Host mount + acceptance tests | scripted | Yes (already) |
 
 **Net:** everything except #11 (and arguably #12) can be automated. #11 is a hard
 stop by design — 2FA cannot be automated and attempting it risks account lockout
 (explicitly out of scope in `CONTRIBUTING.md`).
+
+Steps 9, 13 and 14 stopped being operator work on 2026-07-27: the app stages its
+own current copies of those scripts on a Samba share the guest cannot write to,
+and an elevated task inside Windows inspects the VM, repairs only what is missing
+or drifted, and verifies the result (v2 plan D40-D44, §4.1/§4.2). The scripts
+themselves did not change purpose — the automated path runs exactly what the
+operator would have run by hand, which is still the documented fallback in
+[`SETUP.md` §8](../SETUP.md). Step 8's execution-policy prefix is likewise now
+the app's problem rather than the operator's, except in that fallback. **None of
+this has been exercised against a real guest yet** — see the 2026-07-27 entries
+in [`CHANGELOG.md`](../CHANGELOG.md).
 
 Step 12 got *smaller* between v1 and v2. v1 needed two toggles (iCloud Drive on,
 Files On-Demand **off**) plus a global `attrib +P -U` pin. Live testing on
@@ -216,25 +227,37 @@ docker cp provision/04-bridge-agent.ps1 icloud-windows:/tmp/smb/
 #   copy \\host.lan\Data\04-bridge-agent.ps1 C:\OEM\
 ```
 
+**Superseded as a delivery channel (2026-07-27).** `Data` is served
+`writable`/`guest only`/`force user = root`, so anything staged there can be
+replaced by any process in the guest — which is fine for handing over a file to
+copy by hand, and disqualifying for anything an elevated task will execute. The
+app therefore stages provisioning code on a *separate* `read only = yes` share
+and executes only an administrator-protected copy of it, keeping `Data` as the
+status channel (v2 plan D40-D42). Nothing reachable through a guest-writable path
+is ever run elevated, and the same applies to `C:\OEM`, which is written once at
+install time and goes stale from then on.
+
 ---
 
 ## 4. What a fully automated re-run would look like
+
+This was written before the guest half was automated. It is kept because it is
+the shell-level shape of the run; in practice the guest steps are now the app's
+**Set up Windows automatically** button (`SETUP.md` §8), which does them over the
+provisioning channel rather than by typing into the guest:
 
 ```bash
 sudo ./host/setup-prereqs.sh            # engine, cifs-utils, context, groups
 cp .env.example .env && $EDITOR .env    # SHARE_PASS + sizing
 sudo cp -l /srv/isos/win11-25h2-x64.iso /srv/icloud-vm/storage/custom.iso   # no download
-docker compose up -d
-until python3 tools/rdp-ready.py; do sleep 60; done                    # real check
-./tools/guest-ctl.sh run 'winget install --id 9PKTQ5699M62 --source msstore --accept-package-agreements --accept-source-agreements' 120
-./tools/guest-ctl.sh run 'explorer.exe shell:AppsFolder\AppleInc.iCloud_nzyj5cx40ttqa!iCloud' 15
-#  >>> MANUAL: Apple ID + 2FA, iCloud Drive ON (leave Files On-Demand ON) <<<
-./tools/watch-sync.sh                                                  # placeholders settled
-#  03-create-share.ps1 with SHARE_PASS  (see SETUP.md section 8)
-#  04-bridge-agent.ps1                  (no secret; see SETUP.md section 8)
-sudo ./host/setup-host.sh && ./host/acceptance-tests.sh
-#  >>> GATE: run E0 before trusting the mount (docs/selective-sync.md) <<<
 ./gui/install-gui.sh                                                   # as the desktop user
+#  In the GUI: Create Windows VM, then Set up Windows automatically.
+#  It waits for Windows itself (the same X.224 probe as tools/rdp-ready.py),
+#  installs iCloud, and drives 03 and 04 elevated inside the guest.
+#  >>> MANUAL: Apple ID + 2FA, iCloud Drive ON (leave Files On-Demand ON) <<<
+#  Then: Check setup and connect, which runs the host half.
+sudo ./host/setup-host.sh && ./host/acceptance-tests.sh   # or the GUI's button
+#  >>> GATE: run E0 before trusting the mount (docs/selective-sync.md) <<<
 ```
 
 Remaining manual surface: **the Apple sign-in, and the E0 gate.**
@@ -255,4 +278,8 @@ Remaining manual surface: **the Apple sign-in, and the E0 gate.**
 - Have `setup-prereqs.sh` fail loudly if the active context is `desktop-linux`.
 - Fold `tools/keep-iso.sh` into the boot path so the ISO is preserved by default.
 - Teach `acceptance-tests.sh` to use `tools/rdp-ready.py` instead of a bare
-  port check.
+  port check. (The GUI already gates a provisioning run on that same X.224/TPKT
+  handshake, reimplemented in `guestprov.py`; the shell test still does not.)
+
+Nothing in this list was closed by the 2026-07-27 provisioning work — it removed
+scoreboard steps 9, 13 and 14, none of which were listed here.

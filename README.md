@@ -84,12 +84,15 @@ cached until the guest needs the space back.
 │   ├── lint-ps1.ps1       # PowerShell parse + analyzer pass
 │   └── deb/               # control.in, maintainer scripts, launcher, overrides
 ├── provision/             # scripts run INSIDE the Windows guest
-│   ├── install.bat        # dockur OEM bootstrap (auto-runs 01, writes desktop note)
+│   ├── install.bat        # dockur OEM bootstrap (runs 01, installs the watcher, desktop note)
 │   ├── 01-debloat.ps1
 │   ├── 02-install-icloud.ps1
 │   ├── 03-create-share.ps1
 │   ├── 04-bridge-agent.ps1# control share, agent task, ABE, ACL boundaries
-│   └── agent.ps1          # byte-identical copy of guest-agent/agent.ps1 for C:\OEM
+│   ├── watcher.ps1        # elevated task: consumes host triggers, runs the orchestrator
+│   ├── guest-setup.ps1    # provisioning orchestrator: inspect, repair only drift, verify
+│   ├── guest-state.ps1    # side-effect-free guest invariants and work-plan derivation
+│   └── agent.ps1          # byte-identical copy of guest-agent/agent.ps1 for the guest payload
 ├── guest-agent/
 │   └── agent.ps1          # THE guest agent (source of truth): exclusions, status, reclaim
 ├── gui/                   # host GUI + tray icon (PySide6)
@@ -158,33 +161,26 @@ install — typically **20–40 minutes**. Watch it live at
 runs automatically via the `/oem` mount, and a `NEXT-STEPS.txt` is left on the
 guest desktop. Wait for the Windows desktop to appear before continuing.
 
-### 3. One-time setup inside the guest (manual)
+### 3. Setup inside the guest (the app does it; the Apple sign-in is yours)
 
-On the guest desktop (via the web viewer, or RDP to `127.0.0.1:3389`), open
-**PowerShell as Administrator** and (§5–§7):
+Install the GUI (step 5) and choose **Set up Windows automatically** on its Setup
+tab. It installs iCloud for Windows, waits while you sign in, creates the
+`syncshare` SMB account and the data share, installs the bridge agent and its
+control share, and hands over to **Check setup and connect** — driving the same
+scripts an operator would, elevated inside the guest, over a share Windows cannot
+write to (v2 plan D40-D44). **Signing in to iCloud — Apple ID, 2FA, and leaving
+iCloud Drive and Files On-Demand switched ON — is the only step you perform
+inside the VM**; 2FA stays manual by design. Each run inspects a fixed checklist
+first and repairs only what is missing or has drifted, so **Re-run Windows
+provisioning…** (Status tab, tray menu, and the agent-skew banner) is a safe way
+to repair an existing VM later. **Do not pin anything** — see
+[Files On-Demand](#files-on-demand-and-disk-space) below.
 
-1. Install the client — Windows blocks `.ps1` files by default, so the
-   `-ExecutionPolicy Bypass` prefix is required:
-   ```powershell
-   powershell -ExecutionPolicy Bypass -NoProfile -File C:\OEM\02-install-icloud.ps1
-   ```
-   Or install "iCloud" from the Microsoft Store if winget/msstore errors.
-2. Launch iCloud, **sign in with your Apple ID + 2FA**. Turn **iCloud Drive ON**,
-   **leave Files On-Demand ON**, and leave Photos/Mail/Contacts/Calendar **OFF**.
-   Wait for the initial metadata population to settle. **Do not pin anything** —
-   see [Files On-Demand](#files-on-demand-and-disk-space) below.
-3. Edit `C:\OEM\03-create-share.ps1`, set `$pass` to the **same** `SHARE_PASS`
-   value from your host `.env`, then run it as Administrator (same bypass):
-   ```powershell
-   powershell -ExecutionPolicy Bypass -NoProfile -File C:\OEM\03-create-share.ps1
-   ```
-   This creates the dedicated `syncshare` SMB account and shares the sync root.
-4. Install the bridge agent and selective sync (Administrator, no secret needed):
-   ```powershell
-   powershell -ExecutionPolicy Bypass -NoProfile -File C:\OEM\04-bridge-agent.ps1
-   ```
-   It creates the `bridge` control share, registers the `icloud-bridge-agent`
-   scheduled task, and turns on Access-Based Enumeration for the data share.
+The full manual sequence — scripts 02, sign-in, 03, 04, run as Administrator on
+the guest desktop (§5–§7) — remains supported and is one click away under **Show
+manual steps**. It is written out, with the correct script directory and the
+one-time bootstrap needed by VMs created before automated provisioning, in
+[`SETUP.md` §8](SETUP.md).
 
 ### 4. Mount on the host and verify
 
@@ -312,8 +308,9 @@ without committing.
 
 This project is **pre-release**: there are no tags and no installed copies
 beyond the author's. Formats and interfaces change without a migration path, so
-after pulling, re-run `04-bridge-agent.ps1` in the guest if the GUI says the
-agent no longer matches.
+after pulling, choose **Re-run Windows provisioning…** if the GUI says the guest
+agent no longer matches — it installs the bundled agent and nothing else when
+the rest of the VM is healthy.
 
 `make test` creates `.venv` on first use; there is no system pytest and PEP 668
 blocks `pip install --user`, so a venv is the supported route. `make run` and
