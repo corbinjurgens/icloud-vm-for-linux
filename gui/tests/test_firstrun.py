@@ -20,7 +20,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from icloud_bridge_gui import backup, envfile, firstrun, power  # noqa: E402
+from icloud_bridge_gui import (backup, envfile, firstrun, guestprov,  # noqa: E402
+                               lifecycle, power)
 
 
 class FakeRunner:
@@ -489,12 +490,16 @@ def test_host_setup_touches_no_mount_path():
     assert not any(path.startswith("/mnt/") for path in looked_at)
 
 
-# ------------------------ the interrupted-provisioning record (v2 plan D39) --
+# -------------------- the durable provisioning record (v2 plan D39, D43) --
 
 @pytest.fixture
 def state_base(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     return str(tmp_path / "state")
+
+
+RUN_ID = "0123456789abcdef0123456789abcdef"
+OTHER_RUN_ID = "fedcba9876543210fedcba9876543210"
 
 
 def record_of(**overrides):
@@ -503,10 +508,40 @@ def record_of(**overrides):
     return firstrun.ProvisioningRecord(**base)
 
 
+def document_of(**overrides):
+    """A complete, valid on-disk document; each test spoils one field."""
+    base = {
+        "version": firstrun.PROVISIONING_VERSION,
+        "mode": firstrun.MODE_FIRST_RUN,
+        "startedAt": "2026-07-26T12:00:00Z",
+        "phase": firstrun.RECORD_PHASE_STAGING,
+        "containerId": "abc123",
+        "containerStartedAt": "2026-07-26T11:59:00.1Z",
+        "guestRunId": RUN_ID,
+        "guestPhase": "",
+        "resetShareCredential": True,
+    }
+    base.update(overrides)
+    return json.dumps(base)
+
+
 def test_the_record_round_trips(state_base):
-    firstrun.write_provisioning_record(record_of(container_id="abc123"))
+    record = record_of(container_id="abc123", mode=firstrun.MODE_REPROVISION,
+                       phase=firstrun.RECORD_PHASE_TRIGGERED,
+                       container_started_at="2026-07-26T11:59:00.123456789Z",
+                       guest_run_id=RUN_ID, guest_phase="inspecting",
+                       reset_share_credential=True)
+    firstrun.write_provisioning_record(record)
+    assert firstrun.read_provisioning_record() == record
+
+
+def test_the_record_defaults_to_a_first_run_with_no_guest_run(state_base):
+    """The pre-Compose write of D39 is still exactly what it was."""
+    firstrun.write_provisioning_record(record_of())
     loaded = firstrun.read_provisioning_record()
-    assert loaded == record_of(container_id="abc123")
+    assert loaded.mode == firstrun.MODE_FIRST_RUN
+    assert loaded.guest_run_id == ""
+    assert loaded.reset_share_credential is False
 
 
 def test_the_record_is_mode_0600_in_a_0700_directory(state_base):
@@ -517,10 +552,36 @@ def test_the_record_is_mode_0600_in_a_0700_directory(state_base):
 
 
 def test_the_record_never_carries_the_env_path_or_its_contents(state_base):
-    firstrun.write_provisioning_record(record_of(container_id="abc"))
+    firstrun.write_provisioning_record(
+        record_of(container_id="abc", guest_run_id=RUN_ID,
+                  phase=firstrun.RECORD_PHASE_STAGING, reset_share_credential=True))
     with open(firstrun.provisioning_path(), encoding="utf-8") as handle:
         document = json.load(handle)
-    assert set(document) == {"version", "startedAt", "phase", "containerId"}
+    assert set(document) == {"version", "mode", "startedAt", "phase", "containerId",
+                             "containerStartedAt", "guestRunId", "guestPhase",
+                             "resetShareCredential"}
+
+
+def test_rewriting_the_record_replaces_it_atomically(state_base):
+    firstrun.write_provisioning_record(record_of())
+    firstrun.write_provisioning_record(record_of(phase=firstrun.RECORD_PHASE_TRIGGERED,
+                                                 guest_run_id=RUN_ID))
+    path = firstrun.provisioning_path()
+    assert firstrun.read_provisioning_record().guest_run_id == RUN_ID
+    assert stat.S_IMODE(os.lstat(path).st_mode) == 0o600
+    # The unique temp file is renamed over the target, never left behind.
+    assert os.listdir(os.path.dirname(path)) == [firstrun.PROVISIONING_RECORD]
+
+
+def test_a_malformed_run_id_or_mode_is_refused_before_it_reaches_the_guest(state_base):
+    """The run ID is a path component in the guest; it is never sanitized."""
+    with pytest.raises(ValueError):
+        firstrun.write_provisioning_record(record_of(guest_run_id="run-1"))
+    with pytest.raises(ValueError):
+        firstrun.write_provisioning_record(record_of(mode="whatever"))
+    with pytest.raises(ValueError):
+        firstrun.write_provisioning_record(record_of(phase="somewhere"))
+    assert firstrun.read_provisioning_record() is None
 
 
 def test_no_record_reads_as_none(state_base):
@@ -530,11 +591,20 @@ def test_no_record_reads_as_none(state_base):
 @pytest.mark.parametrize("payload", [
     "not json",
     json.dumps([1, 2]),
-    json.dumps({"version": 2, "startedAt": "x"}),
+    # No migration path: the D39 schema is simply not this one (CONTRIBUTING).
+    json.dumps({"version": 1, "startedAt": "x", "phase": "creating",
+                "containerId": ""}),
     json.dumps({"startedAt": "x"}),
-    json.dumps({"version": 1}),
-    json.dumps({"version": 1, "startedAt": ""}),
-    json.dumps({"version": 1, "startedAt": 7}),
+    document_of(version=3),
+    document_of(startedAt=""),
+    document_of(startedAt=7),
+    document_of(mode="reprovisioning"),
+    document_of(phase="finished"),
+    document_of(guestRunId="RUN"),
+    document_of(guestRunId=RUN_ID.upper()),
+    document_of(guestRunId=7),
+    document_of(resetShareCredential=1),
+    document_of(resetShareCredential="true"),
 ])
 def test_a_malformed_record_raises_and_is_left_on_disk(state_base, payload):
     backup.ensure_app_dir()
@@ -588,6 +658,168 @@ def test_no_record_leaves_startup_alone():
     """A running container with no record keeps the existing startup behavior."""
     assert firstrun.classify_record(None, "running", "abc") == firstrun.RECORD_ABSENT
     assert firstrun.classify_record(None, "absent", "") == firstrun.RECORD_ABSENT
+
+
+@pytest.mark.parametrize("mode", [firstrun.MODE_FIRST_RUN, firstrun.MODE_REPROVISION])
+def test_both_modes_take_the_same_startup_before_cifs_gate(mode):
+    """D43: otherwise a restarted app mounts while 03/04 rewrite guest state."""
+    record = record_of(container_id="abc123", mode=mode, guest_run_id=RUN_ID,
+                       phase=firstrun.RECORD_PHASE_TRIGGERED)
+    assert firstrun.classify_record(record, "running", "abc123") == \
+        firstrun.RECORD_MATCHES
+
+
+# -------------------------- resuming an interrupted run (v2 plan D43) --
+# Every status here is built by `guestprov.classify_status`, the real validator,
+# from a document the guest could have written. Nothing in this section runs
+# Docker: the run's whole restart decision table is pure.
+
+TOKEN = "2026-07-26T11:59:00.123456789Z"
+NEW_TOKEN = "2026-07-27T08:00:00.987654321Z"
+
+
+def guest_status(phase, *, run_id=RUN_ID, for_run=RUN_ID, error=None):
+    document = {
+        "version": 1, "runId": run_id, "phase": phase, "detail": "",
+        "updatedAt": "2026-07-26T12:01:00Z", "error": error,
+        "checks": {key: "pending" for key in guestprov.CHECK_KEYS},
+        "work": [],
+    }
+    return guestprov.classify_status(document, for_run)
+
+
+def live_record(**overrides):
+    base = dict(container_id="abc123", container_started_at=TOKEN,
+                guest_run_id=RUN_ID, phase=firstrun.RECORD_PHASE_TRIGGERED)
+    base.update(overrides)
+    return record_of(**base)
+
+
+def test_a_record_from_before_this_feature_has_no_run_to_resume():
+    assert firstrun.classify_resume(record_of(), None) == firstrun.RESUME_NO_RUN
+    assert firstrun.classify_resume(None, None) == firstrun.RESUME_NO_RUN
+
+
+@pytest.mark.parametrize("mode", [firstrun.MODE_FIRST_RUN, firstrun.MODE_REPROVISION])
+def test_a_live_container_and_token_and_active_run_just_keeps_polling(mode):
+    """Restart during a first run, and during a re-provision: same answer."""
+    status = guest_status(guestprov.PHASE_INSTALLING_ICLOUD)
+    assert firstrun.classify_resume(live_record(mode=mode), status,
+                                    container_started_at=TOKEN) == firstrun.RESUME_POLL
+
+
+def test_a_guest_waiting_for_the_secret_needs_the_env_file_again():
+    """The path was never stored, so re-selection is the recovery (D41)."""
+    status = guest_status(guestprov.PHASE_WAITING_FOR_SECRET)
+    assert firstrun.classify_resume(live_record(), status,
+                                    container_started_at=TOKEN) == \
+        firstrun.RESUME_NEEDS_SECRET
+
+
+def test_an_acknowledged_run_is_believed_over_the_restart_evidence():
+    """The watcher records the accepted run locally and survives a reboot."""
+    status = guest_status(guestprov.PHASE_CREATING_SHARE)
+    assert firstrun.classify_resume(live_record(), status,
+                                    container_started_at=NEW_TOKEN) == \
+        firstrun.RESUME_POLL
+
+
+def test_a_finished_or_failed_run_is_reported_as_such():
+    done = guest_status(guestprov.PHASE_DONE)
+    assert firstrun.classify_resume(live_record(), done,
+                                    container_started_at=TOKEN) == firstrun.RESUME_DONE
+    failed = guest_status(guestprov.PHASE_CREATING_SHARE, error="the share is not there")
+    assert firstrun.classify_resume(live_record(), failed,
+                                    container_started_at=TOKEN) == \
+        firstrun.RESUME_FAILED
+
+
+@pytest.mark.parametrize("status", [
+    guestprov.Status(guestprov.PHASE_ABSENT),
+    guestprov.Status(guestprov.PHASE_UNREADABLE, reason="not JSON"),
+    guest_status(guestprov.PHASE_VERIFYING, run_id=OTHER_RUN_ID),
+])
+def test_a_restarted_container_with_no_usable_status_offers_a_new_run(status):
+    """A changed start token is never a reason to adopt an uncorrelated status."""
+    assert firstrun.classify_resume(live_record(), status,
+                                    container_started_at=NEW_TOKEN) == \
+        firstrun.RESUME_CONFIRM_NEW_RUN
+
+
+@pytest.mark.parametrize("status", [
+    guestprov.Status(guestprov.PHASE_ABSENT),
+    guest_status(guestprov.PHASE_VERIFYING, run_id=OTHER_RUN_ID),
+])
+def test_without_restart_evidence_a_missing_status_keeps_polling(status):
+    """Abandoning a possibly live wait is an explicit confirmation, not a default."""
+    assert firstrun.classify_resume(live_record(), status,
+                                    container_started_at=TOKEN) == \
+        firstrun.RESUME_POLL_OR_ABANDON
+
+
+@pytest.mark.parametrize("observed", ["", TOKEN])
+def test_an_unreadable_start_token_is_not_evidence_of_a_restart(observed):
+    record = live_record(container_started_at="")
+    assert firstrun.container_restarted(record, observed) is False
+    assert firstrun.classify_resume(record, guestprov.Status(guestprov.PHASE_ABSENT),
+                                    container_started_at=observed) == \
+        firstrun.RESUME_POLL_OR_ABANDON
+
+
+@pytest.mark.parametrize("observed", [TOKEN, NEW_TOKEN, ""])
+def test_a_crash_while_staging_retries_the_same_run_id(observed):
+    """The trigger's atomic rename may never have happened; nothing consumed it."""
+    record = live_record(phase=firstrun.RECORD_PHASE_STAGING)
+    assert firstrun.classify_resume(record, guestprov.Status(guestprov.PHASE_ABSENT),
+                                    container_started_at=observed) == \
+        firstrun.RESUME_RETRY_STAGE
+    # …with the *same* saved run ID: the decision never mints a new one.
+    assert record.guest_run_id == RUN_ID
+
+
+def test_an_acknowledged_run_leaves_the_staging_retry_behind():
+    status = guest_status(guestprov.PHASE_INSPECTING)
+    record = live_record(phase=firstrun.RECORD_PHASE_STAGING)
+    assert firstrun.classify_resume(record, status,
+                                    container_started_at=TOKEN) == firstrun.RESUME_POLL
+
+
+def test_a_matching_status_advances_the_recorded_guest_phase():
+    record = live_record(phase=firstrun.RECORD_PHASE_STAGING)
+    updated = firstrun.record_after_status(
+        record, guest_status(guestprov.PHASE_LAUNCHING_ICLOUD))
+    assert updated.guest_phase == guestprov.PHASE_LAUNCHING_ICLOUD
+    assert updated.phase == firstrun.RECORD_PHASE_TRIGGERED
+    assert updated.guest_run_id == RUN_ID
+    assert updated.mode == record.mode
+
+
+@pytest.mark.parametrize("status", [
+    guest_status(guestprov.PHASE_DONE, run_id=OTHER_RUN_ID),
+    guestprov.Status(guestprov.PHASE_ABSENT),
+    guestprov.Status(guestprov.PHASE_UNREADABLE, reason="not JSON"),
+])
+def test_a_mismatched_status_never_replaces_the_saved_run(status):
+    record = live_record(guest_phase=guestprov.PHASE_INSPECTING)
+    assert firstrun.record_after_status(record, status) == record
+
+
+def test_the_modes_have_one_spelling_shared_with_the_reducer():
+    assert firstrun.MODE_FIRST_RUN == lifecycle.MODE_FIRST_RUN
+    assert firstrun.MODE_REPROVISION == lifecycle.MODE_REPROVISION
+    assert firstrun.PROVISIONING_MODES == lifecycle.PROVISIONING_MODES
+
+
+def test_inspect_container_started_at_uses_an_exact_argv():
+    runner = FakeRunner({"docker inspect -f": power.RunResult(0, TOKEN + "\n", "")})
+    assert firstrun.inspect_container_started_at(runner) == TOKEN
+    assert runner.calls[0] == ["docker", "inspect", "-f", "{{.State.StartedAt}}",
+                               "icloud-windows"]
+
+
+def test_an_unreadable_start_token_reads_as_empty_not_a_guess():
+    runner = FakeRunner({"docker inspect -f": power.RunResult(1, "", "boom")})
+    assert firstrun.inspect_container_started_at(runner) == ""
 
 
 def test_inspect_container_id_uses_an_exact_argv():

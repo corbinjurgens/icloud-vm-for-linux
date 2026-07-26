@@ -8,8 +8,9 @@ testable through a running Qt event loop. Here it is a function:
     reduce(model, event) -> Transition
 
 :class:`Model` is the whole lifecycle state (the canonical phase, the power-off
-continuation, and the operation token). :class:`Transition` is the next model
-plus an ordered tuple of :class:`Effect` tokens. The controller keeps ownership
+continuation, the guest-provisioning mode, and the operation token).
+:class:`Transition` is the next model plus an ordered tuple of :class:`Effect`
+tokens. The controller keeps ownership
 of *doing*: timers, worker threads, dialogs and widgets. It translates a signal
 into an :class:`Event`, calls :func:`reduce`, and applies the effects in order.
 
@@ -78,6 +79,16 @@ def is_no_cifs(phase: Phase) -> bool:
     return phase in NO_CIFS_PHASES
 
 
+#: What a guest-provisioning run is for (v2 plan D43). The same run mechanics
+#: serve both, and only the *continuation* differs, so this is carried in the
+#: model rather than expressed as a second provisioning phase. It is also the
+#: spelling stored in the private record, which is why `firstrun.py` imports
+#: these constants instead of writing its own.
+MODE_FIRST_RUN = "first-run"
+MODE_REPROVISION = "reprovision"
+PROVISIONING_MODES = (MODE_FIRST_RUN, MODE_REPROVISION)
+
+
 class Event(Enum):
     """Something that happened. Payloads (messages) stay with the controller."""
 
@@ -111,6 +122,16 @@ class Event(Enum):
     # The first-run assistant (D31).
     VM_CREATED = "vm_created"
     CONNECT_READY = "connect_ready"
+
+    # App-driven guest provisioning (D40-D44). No new phase: a run reuses the
+    # no-CIFS `Phase.PROVISIONING`, entered from Setup for a first run and from
+    # Monitoring for a re-provision, and the mode decides only where success
+    # goes. These events are the *only* way in: the Qt layer never sets the
+    # phase itself.
+    PROVISION_BEGIN_FIRST_RUN = "provision_begin_first_run"
+    PROVISION_BEGIN_REPROVISION = "provision_begin_reprovision"
+    PROVISION_SUCCEEDED = "provision_succeeded"
+    PROVISION_FAILED = "provision_failed"
 
 
 class Effect(Enum):
@@ -211,6 +232,11 @@ class Model:
     #: Meaningless in every other phase, and deliberately carried rather than
     #: re-derived, because the phase alone cannot say what was interrupted.
     desired_action: str = "on"
+    #: What the current guest-provisioning run is for (D43). Meaningless outside
+    #: :data:`Phase.PROVISIONING`, and carried for the same reason
+    #: ``desired_action`` is: the phase alone cannot say whether success hands
+    #: over to **Check setup and connect** or returns to monitoring.
+    provisioning_mode: str = MODE_FIRST_RUN
     #: Incremented by every valid transition; see the module docstring.
     token: int = 0
 
@@ -315,6 +341,45 @@ _ENTER_PROVISIONING = (
     Effect.SHOW_WINDOW,
 )
 
+#: Entering a run from **monitoring** (D43's `reprovision`). The bridge is up
+#: and its mounts stay mounted, so this is the teardown of the *app's* view of
+#: it: notifications off, polling stopped, I/O quiesced, health rows cleared and
+#: every cached document/classification dropped, because elevated guest scripts
+#: are about to rewrite the share, its ACLs and the agent task. Then exactly the
+#: presentation `_ENTER_PROVISIONING` uses.
+_BEGIN_REPROVISIONING = (
+    Effect.MARK_CONTAINER_RUNNING,
+    Effect.DISABLE_NOTIFICATIONS,
+    Effect.RESET_INCIDENTS,
+    Effect.STOP_POLLING,
+    Effect.QUIESCE_IO,
+    Effect.CLEAR_HEALTH_ROWS,
+    Effect.HIDE_BANNER,
+    Effect.HIDE_NOTICE,
+    Effect.INVALIDATE_CACHES,
+    Effect.SHOW_SETUP_TAB,
+    Effect.CLEAR_SETUP_CHECKS,
+    Effect.RENDER_SETUP,
+    Effect.SYNC_POWER_CONTROLS,
+    Effect.SHOW_WINDOW,
+)
+
+#: A run that ended without leaving the state: a failure in either mode, or a
+#: first-run success. It changes what the Setup tab shows and nothing else —
+#: CIFS stays paused, because in `first-run` mode the only honest mountability
+#: test is still the operator's explicit **Check setup and connect** (D31).
+_RENDER_PROVISIONING_RESULT = (
+    Effect.RENDER_SETUP,
+    Effect.SYNC_POWER_CONTROLS,
+    Effect.SHOW_WINDOW_UNLESS_MINIMIZED,
+)
+
+#: D43's other continuation: a `reprovision` run succeeded, so the bridge this
+#: app powered on and never unmounted goes back to being monitored. The cache
+#: invalidation is what forces the fresh gather that re-checks the protocol and
+#: the agent build against the newly installed agent (D35).
+_PROVISION_SUCCEEDED_REPROVISION = (Effect.INVALIDATE_CACHES,) + _ENTER_MONITORING
+
 _BEGIN_POWER_OFF = (
     Effect.DISABLE_NOTIFICATIONS,
     Effect.RESET_INCIDENTS,
@@ -398,6 +463,12 @@ def _starting(model: Model, event: Event) -> Transition | None:
 
 
 def _running(model: Model, event: Event) -> Transition | None:
+    if event is Event.PROVISION_BEGIN_REPROVISION:
+        # D35's recovery and the post-feature-update repair. The mounts stay
+        # mounted — the app cannot police another process using them — but this
+        # app stops reading them for the duration.
+        return Transition(_next(model, Phase.PROVISIONING, mode=MODE_REPROVISION),
+                          _BEGIN_REPROVISIONING)
     if event is Event.USER_POWER_OFF_CONFIRMED:
         return Transition(_next(model, Phase.SHUTTING_DOWN, exit_after=False),
                           _BEGIN_POWER_OFF)
@@ -457,8 +528,11 @@ def _shutting_down(model: Model, event: Event) -> Transition | None:
 
 
 def _setup(model: Model, event: Event) -> Transition | None:
-    if event is Event.VM_CREATED:
-        return Transition(_next(model, Phase.PROVISIONING), _ENTER_PROVISIONING)
+    if event in (Event.VM_CREATED, Event.PROVISION_BEGIN_FIRST_RUN):
+        # A VM this app just created has nothing configured in it, so both doors
+        # out of Setup lead to the same first run.
+        return Transition(_next(model, Phase.PROVISIONING, mode=MODE_FIRST_RUN),
+                          _ENTER_PROVISIONING)
     if event is Event.CONNECT_READY:
         return Transition(_next(model, Phase.STARTING),
                           (Effect.HIDE_SETUP_TAB,) + _BEGIN_STARTUP)
@@ -468,6 +542,29 @@ def _setup(model: Model, event: Event) -> Transition | None:
 
 
 def _provisioning(model: Model, event: Event) -> Transition | None:
+    # Beginning a run from here is the ordinary case, not an oddity: the first
+    # run is offered on this very screen once the VM exists, and **Try
+    # inspection and repair again** starts a fresh run after a failure. The
+    # controller replays the mode the record carries, so a retried
+    # re-provisioning does not silently become a first run.
+    if event is Event.PROVISION_BEGIN_FIRST_RUN:
+        return Transition(_next(model, Phase.PROVISIONING, mode=MODE_FIRST_RUN),
+                          _ENTER_PROVISIONING)
+    if event is Event.PROVISION_BEGIN_REPROVISION:
+        return Transition(_next(model, Phase.PROVISIONING, mode=MODE_REPROVISION),
+                          _ENTER_PROVISIONING)
+    if event is Event.PROVISION_FAILED:
+        return Transition(_next(model, Phase.PROVISIONING),
+                          _RENDER_PROVISIONING_RESULT)
+    if event is Event.PROVISION_SUCCEEDED:
+        if model.provisioning_mode == MODE_REPROVISION:
+            return Transition(_next(model, Phase.RUNNING),
+                              _PROVISION_SUCCEEDED_REPROVISION)
+        # First run: `done` means the guest is configured, not that the host
+        # half is. The operator's **Check setup and connect** still runs the
+        # helper, and its real CIFS activation is still the only proof.
+        return Transition(_next(model, Phase.PROVISIONING),
+                          _RENDER_PROVISIONING_RESULT)
     if event is Event.CONNECT_READY:
         return Transition(_next(model, Phase.STARTING),
                           (Effect.HIDE_SETUP_TAB,) + _BEGIN_STARTUP)
@@ -502,7 +599,7 @@ _TABLE = {
 
 
 def _next(model: Model, phase: Phase, *, exit_after: bool | None = None,
-          desired: str | None = None) -> Model:
+          desired: str | None = None, mode: str | None = None) -> Model:
     """The successor model: new phase, bumped token, continuations carried over."""
     return replace(
         model,
@@ -511,6 +608,7 @@ def _next(model: Model, phase: Phase, *, exit_after: bool | None = None,
         exit_after_power_off=(model.exit_after_power_off if exit_after is None
                               else exit_after),
         desired_action=(model.desired_action if desired is None else desired),
+        provisioning_mode=(model.provisioning_mode if mode is None else mode),
     )
 
 
@@ -540,7 +638,15 @@ QUIT_UNKNOWN = "unknown_transition"
 
 
 def quit_kind(phase: Phase) -> str:
-    """The Quit confirmation this phase needs, before any event exists."""
+    """The Quit confirmation this phase needs, before any event exists.
+
+    :data:`Phase.PROVISIONING` answers :data:`QUIT_NOTHING_MOUNTED` in **both**
+    modes: a guest whose share, ACLs and agent task are being rewritten must not
+    be powered off from a Quit dialog any more than a half-installed one may be
+    (D31/D43). During a `reprovision` the shares *are* still mounted, so the
+    wording the Qt layer puts on this token has to come from the model's mode,
+    not from the token's name.
+    """
     if phase is Phase.SHUTTING_DOWN:
         return QUIT_IGNORE
     if phase is Phase.POWERED_OFF:

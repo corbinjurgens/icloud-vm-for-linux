@@ -715,7 +715,7 @@ def test_an_incompatible_protocol_refuses_the_apply_write(controller, fakes, mon
     # The Selective Sync tab is not the current tab, so `isVisible` is False for
     # a reason unrelated to this; `isHidden` is the per-widget question.
     assert not window._sync_error.isHidden()
-    assert "04-bridge-agent.ps1" in window._sync_error.text()
+    assert "Re-run Windows provisioning" in window._sync_error.text()
 
 
 def test_an_incompatible_protocol_dispatches_no_list_request(controller, fakes):
@@ -733,7 +733,7 @@ def test_a_skewed_agent_still_dispatches_and_shows_the_banner(controller, fakes)
     window.apply_snapshot(
         snapshot_with(bridge.Compatibility(bridge.COMPAT_SKEWED, 99, "the guest agent is build 99")))
     assert window._protocol.isVisible()
-    assert "04-bridge-agent.ps1" in window._protocol.text()
+    assert "Re-run Windows provisioning" in window._protocol.text()
 
     def asked_for_docs():
         return any(call[0][:1] == ("Docs",) for call in fakes.request_listing.calls)

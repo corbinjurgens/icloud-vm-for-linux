@@ -18,6 +18,12 @@ Deliberate boundaries:
 * **The GUI installs nothing privileged.**  Failed checks carry a copyable
   command from SETUP.md; the operator runs package installs, group changes,
   `icloud-bridge-configure` and `setup-host.sh` themselves.
+* **The durable record is not only about the first run.**  D43 widens D39's
+  interrupted-provisioning record to cover an explicit re-provisioning too, and
+  adds what reattachment needs: the mode, the container's `State.StartedAt`
+  token, the guest run ID, the last guest phase, and the non-secret
+  `resetShareCredential` intent.  :func:`classify_resume` is the whole decision
+  table for the next launch and is pure, so it can be proved without Docker.
 * **The share password is never handled *here*.**  The env file is parsed as
   text, not sourced as shell, by the shared :mod:`envfile` grammar; this module
   receives only an :class:`~.envfile.EnvReport` — key names and problems — so
@@ -33,14 +39,17 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
-from . import backup
+from . import backup, guestprov
 # Re-exported deliberately: the env file's grammar is shared with `guestprov`
 # and `host/icloud-bridge-configure` (D41), but the first-run assistant is still
 # where the operator's file is chosen and reported on.
 from .envfile import EnvReport, read_env_file, read_file_text
+# One spelling of the two run modes, shared with the reducer that branches on
+# them (D43). `lifecycle` imports nothing, so this direction has no cycle.
+from .lifecycle import MODE_FIRST_RUN, MODE_REPROVISION, PROVISIONING_MODES
 from .power import (CONTAINER_NAME, HELPER_PATH, RunResult, Runner, default_runner,
                     docker_env, docker_runner, streaming_runner)
 
@@ -437,18 +446,24 @@ def check_host_setup(*, runner: Runner = default_runner,
     return checks
 
 
-# ------------------------------- the interrupted-provisioning record (D39) --
+# --------------------------- the durable provisioning record (D39, D43) --
 # The GUI can be closed, crash, or be logged out during the 20-40 minutes a
-# Windows install takes. Without a record, the next launch sees a running
-# container with no configuration and has to guess; D31's no-CIFS Provisioning
-# state is exactly what must survive that gap.
+# Windows install takes, and again during the second window in which elevated
+# guest scripts rewrite the share, its ACLs and the agent task. Without a
+# record, the next launch sees a running container with no configuration and has
+# to guess; D31's no-CIFS Provisioning state is exactly what must survive both
+# gaps, so the same record covers a `first-run` and a `reprovision` alike.
 #
 # The record is private local state, never CIFS, and deliberately holds *no*
 # env-file path and no env-file content: it must be safe to read and must never
-# become a second place a share password can live.
+# become a second place a share password can live. That exclusion is why
+# re-selection — not recovery — is the restart path for a pending secret (D41).
 
 PROVISIONING_RECORD = "provisioning.json"
-PROVISIONING_VERSION = 1
+#: Bumped by D43's added fields. There is no migration and no tolerated older
+#: form (`CONTRIBUTING.md`): a version-1 document on disk reads as malformed,
+#: which enters Setup with a diagnostic and deletes nothing.
+PROVISIONING_VERSION = 2
 
 #: Classifications of a record against what Docker currently reports.
 RECORD_ABSENT = "absent"            # no record; ordinary startup rules apply
@@ -457,12 +472,41 @@ RECORD_CONTAINER_GONE = "gone"      # the container is not there: back to Setup
 RECORD_DIFFERENT = "different"      # a different container owns the name
 RECORD_MALFORMED = "malformed"      # unreadable: report it, never silently drop
 
+#: How far the **host** got, which is a different question from the guest phase
+#: the watcher publishes in ``guest_phase`` — the two vocabularies are separate,
+#: and `staging` existing in both is a coincidence of English, not one state.
+#: This one is load-bearing: host `staging` means the trigger's atomic rename
+#: may not have happened, so the saved run ID may never have reached the guest.
+RECORD_PHASE_CREATING = "creating"          # `docker compose up -d` is running
+RECORD_PHASE_PROVISIONING = "provisioning"  # the VM exists; the guest work is next
+RECORD_PHASE_STAGING = "staging"            # ensure_channel/stage in flight
+RECORD_PHASE_TRIGGERED = "triggered"        # the trigger landed; poll for the run
+RECORD_PHASES = (RECORD_PHASE_CREATING, RECORD_PHASE_PROVISIONING,
+                 RECORD_PHASE_STAGING, RECORD_PHASE_TRIGGERED)
+
 
 @dataclass(frozen=True)
 class ProvisioningRecord:
+    """What must survive a crash to reattach to a run instead of guessing.
+
+    ``guest_run_id`` is what makes reattachment a *match*; ``container_started_at``
+    is Docker's own `State.StartedAt` token, which separates "the container
+    restarted" from "the watcher is merely quiet" — two conditions whose correct
+    responses are opposite (D43).
+    """
+
     started_at: str
-    phase: str = "creating"
+    phase: str = RECORD_PHASE_CREATING
     container_id: str = ""
+    mode: str = MODE_FIRST_RUN
+    container_started_at: str = ""
+    guest_run_id: str = ""
+    #: The last guest phase parsed from a status carrying this run ID. Never a
+    #: phase read from a status belonging to some other run.
+    guest_phase: str = ""
+    #: The non-secret intent staged in the trigger. The value it eventually
+    #: delivers is not here and never will be.
+    reset_share_credential: bool = False
 
 
 def provisioning_path(base: str | None = None) -> str:
@@ -471,15 +515,35 @@ def provisioning_path(base: str | None = None) -> str:
 
 def write_provisioning_record(record: ProvisioningRecord,
                               base: str | None = None) -> None:
-    """Record the intent **before** Compose runs, atomically and mode 0600."""
+    """Record the intent **before** the mutating step, atomically and mode 0600.
+
+    "Before" means before Compose creates the VM, and before the trigger that
+    authorizes a guest run: there must be no window in which a trigger exists
+    with no record naming its run.
+
+    The mode and run ID are validated here rather than at construction so every
+    writer is covered by one check. A malformed run ID is a programming error —
+    it is a path component in the guest — and raises rather than being sanitized.
+    """
+    if record.mode not in PROVISIONING_MODES:
+        raise ValueError(f"unknown provisioning mode {record.mode!r}")
+    if record.phase not in RECORD_PHASES:
+        raise ValueError(f"unknown record phase {record.phase!r}")
+    if record.guest_run_id:
+        guestprov.validate_run_id(record.guest_run_id)
     backup.ensure_app_dir(base)
     path = provisioning_path(base)
     backup.check_destination(path)
     backup.write_json_atomic(path, {
         "version": PROVISIONING_VERSION,
+        "mode": record.mode,
         "startedAt": record.started_at,
         "phase": record.phase,
         "containerId": record.container_id,
+        "containerStartedAt": record.container_started_at,
+        "guestRunId": record.guest_run_id,
+        "guestPhase": record.guest_phase,
+        "resetShareCredential": record.reset_share_credential,
     })
 
 
@@ -511,12 +575,38 @@ def read_provisioning_record(base: str | None = None) -> ProvisioningRecord | No
     started = document.get("startedAt")
     if not isinstance(started, str) or not started:
         raise backup.BackupError(f'{path} has no usable "startedAt"')
+    mode = document.get("mode")
+    if mode not in PROVISIONING_MODES:
+        raise backup.BackupError(f'{path} has no usable "mode"')
     phase = document.get("phase")
+    if phase not in RECORD_PHASES:
+        raise backup.BackupError(f'{path} has no usable "phase"')
+    run_id = document.get("guestRunId")
+    if not isinstance(run_id, str):
+        raise backup.BackupError(f'{path} has an unusable "guestRunId"')
+    if run_id:
+        try:
+            guestprov.validate_run_id(run_id)
+        except ValueError as exc:
+            raise backup.BackupError(f'{path} has an unusable "guestRunId": {exc}') \
+                from exc
+    reset = document.get("resetShareCredential")
+    # A JSON `1` is not the same document as a JSON `true`, and this boolean
+    # decides whether a run resets a working share password.
+    if not isinstance(reset, bool):
+        raise backup.BackupError(f'{path} has an unusable "resetShareCredential"')
     container_id = document.get("containerId")
+    started_token = document.get("containerStartedAt")
+    guest_phase = document.get("guestPhase")
     return ProvisioningRecord(
         started_at=started,
-        phase=phase if isinstance(phase, str) and phase else "creating",
-        container_id=container_id if isinstance(container_id, str) else "")
+        phase=phase,
+        container_id=container_id if isinstance(container_id, str) else "",
+        mode=mode,
+        container_started_at=(started_token if isinstance(started_token, str) else ""),
+        guest_run_id=run_id,
+        guest_phase=guest_phase if isinstance(guest_phase, str) else "",
+        reset_share_credential=reset)
 
 
 def clear_provisioning_record(base: str | None = None) -> None:
@@ -538,6 +628,10 @@ def classify_record(record: ProvisioningRecord | None, container_state: str,
     existing is the only evidence available and is accepted. Once the id is
     recorded, it must match: a different container under the same name is a
     stale record, and nothing may be read from its mounts.
+
+    A `reprovision` record is classified exactly like a `first-run` one, which
+    is what subjects it to the same startup-before-CIFS gate (D43): otherwise a
+    restarted app would mount while scripts 03/04 are changing guest state.
     """
     if record is None:
         return RECORD_ABSENT
@@ -555,3 +649,99 @@ def inspect_container_id(runner: Runner = docker_runner,
     """The container's full id, or an empty string when it cannot be read."""
     result = _run(runner, ["docker", "inspect", "-f", "{{.Id}}", name])
     return (result.stdout or "").strip() if result.returncode == 0 else ""
+
+
+def inspect_container_started_at(runner: Runner = docker_runner,
+                                 *, name: str = CONTAINER_NAME) -> str:
+    """Docker's ``State.StartedAt`` token, or ``""`` when it cannot be read.
+
+    Opaque on purpose: it is compared for equality with the saved copy and never
+    parsed as a time. Any restart gives a new value, which is the whole signal —
+    the inbox, the `[Provision]` stanza dockur regenerates at container start,
+    and anything else living in the container's `/run` do not survive one.
+    """
+    result = _run(runner, ["docker", "inspect", "-f", "{{.State.StartedAt}}", name])
+    return (result.stdout or "").strip() if result.returncode == 0 else ""
+
+
+# ------------------------------- resuming a guest provisioning run (D43) --
+
+#: What a saved run needs on the next launch. Every one of these is a no-CIFS
+#: outcome: they choose between polling, re-staging and asking, never between
+#: mounting and not mounting.
+RESUME_NO_RUN = "no-run"            # the record names no guest run
+RESUME_POLL = "poll"                # reattach to the saved run and keep polling
+RESUME_NEEDS_SECRET = "needs-secret"  # poll, and ask for the env file again
+RESUME_RETRY_STAGE = "retry-stage"  # re-stage the *same* run ID; nothing consumed it
+RESUME_CONFIRM_NEW_RUN = "confirm-new-run"  # restarted: offer a confirmed new run
+RESUME_POLL_OR_ABANDON = "poll-or-abandon"  # keep polling; abandoning is explicit
+RESUME_DONE = "done"                # the saved run finished
+RESUME_FAILED = "failed"            # the saved run published an error
+
+
+def container_restarted(record: ProvisioningRecord, container_started_at: str) -> bool:
+    """Whether Docker says the container restarted since the record was written.
+
+    Only a *known* difference counts. An unrecorded or unreadable token is not
+    evidence of a restart, and answering "yes" on missing evidence is what would
+    let the app abandon a live run without asking (D43).
+    """
+    return bool(record.container_started_at) and bool(container_started_at) \
+        and container_started_at != record.container_started_at
+
+
+def classify_resume(record: ProvisioningRecord | None,
+                    status: guestprov.Status | None, *,
+                    container_started_at: str = "") -> str:
+    """What to do with a saved run, given one poll of the guest's status (D43).
+
+    Pure, so the whole branch table is testable without Docker: the controller
+    supplies the classified :class:`guestprov.Status` — already run-ID matched
+    by :func:`guestprov.poll` — and the container's current start token.
+
+    The ordering encodes the rules that must not be improvised around:
+
+    * an *acknowledged* status for this run is believed over any restart
+      evidence, because the watcher records the accepted run locally and
+      survives a reboot on the same run;
+    * an unacknowledged run still in host `staging` is re-staged under the
+      **same** run ID. It cannot have been consumed — nothing acknowledged it —
+      so this needs no confirmation and covers a crash between the record write
+      and the trigger's atomic rename;
+    * only then does a changed start token turn "no status" into an offer of a
+      confirmed new run, rather than adopting an uncorrelated one;
+    * with no restart evidence, a missing status keeps polling. Abandoning a
+      possibly live run is an explicit confirmation, never a default.
+    """
+    if record is None or not record.guest_run_id:
+        return RESUME_NO_RUN
+    if status is not None and status.acknowledged:
+        if status.failed:
+            return RESUME_FAILED
+        if status.phase == guestprov.PHASE_DONE:
+            return RESUME_DONE
+        if status.phase == guestprov.PHASE_WAITING_FOR_SECRET:
+            # The env-file path is deliberately not in the record, so the
+            # operator selects it again; the secret itself is re-deliverable.
+            return RESUME_NEEDS_SECRET
+        return RESUME_POLL
+    if record.phase == RECORD_PHASE_STAGING:
+        return RESUME_RETRY_STAGE
+    if container_restarted(record, container_started_at):
+        return RESUME_CONFIRM_NEW_RUN
+    return RESUME_POLL_OR_ABANDON
+
+
+def record_after_status(record: ProvisioningRecord,
+                        status: guestprov.Status) -> ProvisioningRecord:
+    """The record updated from a status — only when the status is *ours*.
+
+    D43 updates the record after a matching status is parsed, and only then: a
+    mismatched, stale, absent or malformed status never replaces the saved run
+    ID, never rewrites the phase, and never clears anything.
+    """
+    if not status.acknowledged or status.run_id != record.guest_run_id:
+        return record
+    # An acknowledgement is proof the trigger landed, whatever the host thought
+    # it was still doing.
+    return replace(record, phase=RECORD_PHASE_TRIGGERED, guest_phase=status.phase)

@@ -24,8 +24,9 @@ F = lifecycle.Effect
 P = lifecycle.Phase
 
 
-def model(phase, *, exit_after=True, token=0):
-    return lifecycle.Model(phase=phase, exit_after_power_off=exit_after, token=token)
+def model(phase, *, exit_after=True, token=0, mode=lifecycle.MODE_FIRST_RUN):
+    return lifecycle.Model(phase=phase, exit_after_power_off=exit_after, token=token,
+                           provisioning_mode=mode)
 
 
 # --------------------------------------------------------- the phase names --
@@ -81,6 +82,8 @@ EXPECTED: dict[tuple[P, E], tuple[P, tuple[F, ...]]] = {
     (P.RUNNING, E.QUIT_CONFIRMED_POWER_OFF): (P.SHUTTING_DOWN, lifecycle._BEGIN_POWER_OFF),
     (P.RUNNING, E.QUIT_CONFIRMED_GUI_ONLY): (P.RUNNING, (F.EXIT_APP,)),
     (P.RUNNING, E.USER_START_BRIDGE): (P.STARTING, lifecycle._BEGIN_STARTUP),
+    (P.RUNNING, E.PROVISION_BEGIN_REPROVISION): (P.PROVISIONING,
+                                                 lifecycle._BEGIN_REPROVISIONING),
 
     (P.START_FAILED, E.USER_RETRY_START): (P.STARTING, lifecycle._BEGIN_STARTUP),
     (P.START_FAILED, E.USER_START_BRIDGE): (P.STARTING, lifecycle._BEGIN_STARTUP),
@@ -104,10 +107,18 @@ EXPECTED: dict[tuple[P, E], tuple[P, tuple[F, ...]]] = {
     # POWER_OFF_SUCCEEDED depends on the continuation; asserted separately.
 
     (P.SETUP, E.VM_CREATED): (P.PROVISIONING, lifecycle._ENTER_PROVISIONING),
+    (P.SETUP, E.PROVISION_BEGIN_FIRST_RUN): (P.PROVISIONING,
+                                             lifecycle._ENTER_PROVISIONING),
     (P.SETUP, E.CONNECT_READY): (P.STARTING,
                                  (F.HIDE_SETUP_TAB,) + lifecycle._BEGIN_STARTUP),
     (P.SETUP, E.QUIT_CONFIRMED_GUI_ONLY): (P.SETUP, (F.EXIT_APP,)),
 
+    (P.PROVISIONING, E.PROVISION_BEGIN_FIRST_RUN): (P.PROVISIONING,
+                                                    lifecycle._ENTER_PROVISIONING),
+    (P.PROVISIONING, E.PROVISION_BEGIN_REPROVISION): (P.PROVISIONING,
+                                                      lifecycle._ENTER_PROVISIONING),
+    (P.PROVISIONING, E.PROVISION_FAILED): (P.PROVISIONING,
+                                           lifecycle._RENDER_PROVISIONING_RESULT),
     (P.PROVISIONING, E.CONNECT_READY): (P.STARTING,
                                         (F.HIDE_SETUP_TAB,) + lifecycle._BEGIN_STARTUP),
     (P.PROVISIONING, E.QUIT_CONFIRMED_GUI_ONLY): (P.PROVISIONING, (F.EXIT_APP,)),
@@ -118,6 +129,8 @@ _CONTINUATION_PAIRS = {
     (P.SHUTTING_DOWN, E.POWER_OFF_SUCCEEDED),
     # D38's Retry repeats whichever direction was interrupted.
     (P.TRANSITION_UNKNOWN, E.USER_RETRY_TRANSITION),
+    # D43's success continuation depends on what the run was for.
+    (P.PROVISIONING, E.PROVISION_SUCCEEDED),
 }
 
 
@@ -255,7 +268,9 @@ def test_no_cifs_phase_never_reaches_polling_without_a_successful_power_on(phase
 
     `STARTING` and `SHUTTING_DOWN` are excluded because they are the two states
     that legitimately end in `RUNNING` — `POWER_ON_SUCCEEDED` and an aborted
-    teardown that restores what was already mounted.
+    teardown that restores what was already mounted. `PROVISIONING` is checked
+    in its `first-run` mode here, where the helper has never run; its one
+    `reprovision` exit is asserted separately below.
     """
     for event in E:
         transition = lifecycle.reduce(model(phase), event)
@@ -313,6 +328,116 @@ def test_provisioning_calls_the_helper_only_on_the_explicit_connect():
         if event is not E.CONNECT_READY:
             assert F.RUN_POWER_ON not in effects, event
     assert F.RUN_POWER_ON not in lifecycle._ENTER_PROVISIONING
+
+
+# ------------------------------ app-driven guest provisioning (D40-D44) --
+
+def test_a_run_can_be_entered_from_setup_and_from_monitoring():
+    """One state, two doors: D31's assistant and D35's recovery action."""
+    from_setup = lifecycle.reduce(model(P.SETUP), E.PROVISION_BEGIN_FIRST_RUN)
+    assert from_setup.model.phase is P.PROVISIONING
+    assert from_setup.model.provisioning_mode == lifecycle.MODE_FIRST_RUN
+
+    from_monitoring = lifecycle.reduce(model(P.RUNNING), E.PROVISION_BEGIN_REPROVISION)
+    assert from_monitoring.model.phase is P.PROVISIONING
+    assert from_monitoring.model.provisioning_mode == lifecycle.MODE_REPROVISION
+
+
+def test_beginning_a_run_from_monitoring_stops_reading_the_bridge():
+    """Elevated scripts are about to rewrite the share, its ACLs and the agent."""
+    effects = lifecycle.reduce(model(P.RUNNING), E.PROVISION_BEGIN_REPROVISION).effects
+    assert not (set(effects) & lifecycle.CIFS_EFFECTS)
+    assert not (set(effects) & lifecycle.MUTATING_EFFECTS)
+    for expected in (F.STOP_POLLING, F.QUIESCE_IO, F.DISABLE_NOTIFICATIONS,
+                     F.RESET_INCIDENTS, F.CLEAR_HEALTH_ROWS, F.INVALIDATE_CACHES):
+        assert expected in effects
+    assert effects.index(F.STOP_POLLING) < effects.index(F.QUIESCE_IO)
+
+
+@pytest.mark.parametrize("mode", [lifecycle.MODE_FIRST_RUN, lifecycle.MODE_REPROVISION])
+def test_a_run_in_flight_keeps_cifs_paused_in_both_modes(mode):
+    """Only a *finished* reprovision may resume I/O; nothing else in here may."""
+    for event in (E.PROVISION_BEGIN_FIRST_RUN, E.PROVISION_BEGIN_REPROVISION,
+                  E.PROVISION_FAILED):
+        effects = lifecycle.reduce(model(P.PROVISIONING, mode=mode), event).effects
+        assert not (set(effects) & lifecycle.CIFS_EFFECTS), event
+        assert not (set(effects) & lifecycle.MUTATING_EFFECTS), event
+
+
+def test_a_first_run_success_waits_for_the_explicit_connect():
+    """D31/D43: `done` says the guest is configured, not that the host half is."""
+    transition = lifecycle.reduce(
+        model(P.PROVISIONING, mode=lifecycle.MODE_FIRST_RUN), E.PROVISION_SUCCEEDED)
+    assert transition.model.phase is P.PROVISIONING
+    assert transition.effects == lifecycle._RENDER_PROVISIONING_RESULT
+    assert not (set(transition.effects) & lifecycle.CIFS_EFFECTS)
+    assert F.RUN_POWER_ON not in transition.effects
+    # And the way on is still the same explicit action it always was.
+    assert lifecycle.reduce(transition.model, E.CONNECT_READY).model.phase is P.STARTING
+
+
+def test_a_reprovision_success_returns_to_monitoring():
+    transition = lifecycle.reduce(
+        model(P.PROVISIONING, mode=lifecycle.MODE_REPROVISION), E.PROVISION_SUCCEEDED)
+    assert transition.model.phase is P.RUNNING
+    assert transition.effects == lifecycle._PROVISION_SUCCEEDED_REPROVISION
+    # The fresh gather that re-checks the protocol and the agent build (D35)
+    # only means anything against dropped caches.
+    assert transition.effects[0] is F.INVALIDATE_CACHES
+    for expected in (F.HIDE_SETUP_TAB, F.RESUME_IO, F.START_POLLING, F.FORCE_REFRESH,
+                     F.ENABLE_NOTIFICATIONS, F.TRAY_RUNNING):
+        assert expected in transition.effects
+    # It never calls the helper: the bridge was never powered off.
+    assert not (set(transition.effects) & lifecycle.MUTATING_EFFECTS)
+
+
+def test_a_failure_stays_in_the_state_so_the_run_can_be_retried():
+    failed = lifecycle.reduce(
+        model(P.PROVISIONING, mode=lifecycle.MODE_REPROVISION), E.PROVISION_FAILED)
+    assert failed.model.phase is P.PROVISIONING
+    # A retry replays the mode the record carries, so a retried re-provisioning
+    # does not silently become a first run.
+    retried = lifecycle.reduce(failed.model, E.PROVISION_BEGIN_REPROVISION)
+    assert retried.model.provisioning_mode == lifecycle.MODE_REPROVISION
+    assert lifecycle.reduce(retried.model, E.PROVISION_SUCCEEDED).model.phase is P.RUNNING
+
+
+def test_the_mode_survives_events_that_do_not_set_it():
+    """It is carried, not re-derived: the phase alone cannot say what a run is for."""
+    begun = lifecycle.reduce(model(P.RUNNING), E.PROVISION_BEGIN_REPROVISION).model
+    assert lifecycle.reduce(begun, E.PROVISION_FAILED).model.provisioning_mode == \
+        lifecycle.MODE_REPROVISION
+
+
+def test_creating_the_vm_is_always_a_first_run():
+    assert lifecycle.reduce(
+        model(P.SETUP, mode=lifecycle.MODE_REPROVISION),
+        E.VM_CREATED).model.provisioning_mode == lifecycle.MODE_FIRST_RUN
+
+
+@pytest.mark.parametrize("phase", [p for p in P if p not in (P.SETUP, P.PROVISIONING)])
+def test_a_first_run_cannot_be_started_from_anywhere_else(phase):
+    assert lifecycle.reduce(model(phase), E.PROVISION_BEGIN_FIRST_RUN).effects == (
+        F.REPORT_INVALID_TRANSITION,)
+
+
+@pytest.mark.parametrize("phase", [p for p in P if p not in (P.RUNNING, P.PROVISIONING)])
+def test_a_reprovision_cannot_be_started_from_anywhere_else(phase):
+    assert lifecycle.reduce(model(phase), E.PROVISION_BEGIN_REPROVISION).effects == (
+        F.REPORT_INVALID_TRANSITION,)
+
+
+@pytest.mark.parametrize("event", [E.PROVISION_SUCCEEDED, E.PROVISION_FAILED])
+@pytest.mark.parametrize("phase", [p for p in P if p is not P.PROVISIONING])
+def test_a_run_result_outside_the_provisioning_state_is_invalid(phase, event):
+    """A result can only belong to a run, and a run is only ever that state."""
+    assert lifecycle.reduce(model(phase), event).effects == (
+        F.REPORT_INVALID_TRANSITION,)
+
+
+def test_the_provisioning_modes_are_the_two_the_record_stores():
+    assert lifecycle.PROVISIONING_MODES == (lifecycle.MODE_FIRST_RUN,
+                                            lifecycle.MODE_REPROVISION)
 
 
 def test_the_power_on_transaction_always_pauses_io_before_running_it():

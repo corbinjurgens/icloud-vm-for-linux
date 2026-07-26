@@ -366,9 +366,34 @@ def test_a_merely_missing_tree_does_not_override_a_good_status():
     assert compat.writable
 
 
-def test_the_recovery_instruction_names_script_04():
-    assert "04-bridge-agent.ps1" in bridge.UPDATE_AGENT_INSTRUCTION
-    assert "04-bridge-agent.ps1" in bridge.SKEW_BANNER
+def test_the_recovery_instruction_points_at_the_re_provision_action():
+    """D35's recovery is one confirmed in-app action, not a guest chore."""
+    assert "Re-run Windows provisioning" in bridge.UPDATE_AGENT_INSTRUCTION
+    assert "bundled agent" in bridge.UPDATE_AGENT_INSTRUCTION
+    # The pre-feature VM still needs its one-time elevated bootstrap, and the
+    # wording has to say so or the run looks stuck instead of un-acknowledged.
+    assert "bootstrap" in bridge.UPDATE_AGENT_INSTRUCTION
+    assert bridge.SKEW_BANNER.startswith("The guest agent does not match this app.")
+    assert bridge.UPDATE_AGENT_INSTRUCTION in bridge.SKEW_BANNER
+
+
+def test_no_active_recovery_text_names_the_oem_path():
+    """`C:\\OEM` is whatever the VM was installed with and is never run (D42).
+
+    Checked across every module string rather than the two constants, so a
+    future error message cannot quietly reintroduce the instruction D35 removed.
+    """
+    offenders = [name for name, value in vars(bridge).items()
+                 if isinstance(value, str) and not name.startswith("__")
+                 and "oem" in value.casefold()]
+    assert offenders == []
+    protocol_errors = []
+    for document in ({}, {"version": 7}, {"version": "1"}):
+        with pytest.raises(bridge.ProtocolError) as excinfo:
+            bridge._check_protocol_version(document, "status.json")
+        protocol_errors.append(str(excinfo.value))
+    assert not any("OEM" in text.upper() for text in protocol_errors)
+    assert all("Re-run Windows provisioning" in text for text in protocol_errors)
 
 
 def test_read_exclusions_still_uses_its_own_version_check(share):

@@ -93,11 +93,18 @@ class Compatibility:
         return self.state in (COMPAT_CURRENT, COMPAT_SKEWED)
 
 
-#: The recovery action for both skew and an unsupported protocol. Deliberately a
-#: copyable instruction, never an automated guest-side update: the GUI has no
-#: guest-admin credentials and must not gain any.
+#: The recovery action for both skew and an unsupported protocol: one confirmed
+#: **Re-run Windows provisioning…** action, which stages this app's own bundled
+#: scripts and agent (D35 as amended, D40-D44). It names no `C:\OEM` path,
+#: because that copy is whatever the VM was installed with and is never an
+#: execution source (D42). The two constraints behind the old copyable
+#: instruction are intact: the GUI still holds no guest-admin credentials, and
+#: it still never updates guest code silently — elevation lives in the guest
+#: watcher task, and the update happens only through this explicit action.
 UPDATE_AGENT_INSTRUCTION = (
-    "In the VM, re-run C:\\OEM\\04-bridge-agent.ps1 (elevated) to update it.")
+    "Choose Re-run Windows provisioning… to install the bundled agent. VMs "
+    "created before automated provisioning may require the one-time elevated "
+    "bootstrap step.")
 
 SKEW_BANNER = ("The guest agent does not match this app. " + UPDATE_AGENT_INSTRUCTION)
 
