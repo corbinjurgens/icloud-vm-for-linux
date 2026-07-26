@@ -904,6 +904,8 @@ gui/
 │   │                      #   list-request round-trip; worker-thread I/O
 │   ├── power.py           # Qt-free: docker inspect + marker read, startup plan,
 │   │                      #   and `sudo -n icloud-bridge-power on|off` (D29)
+│   ├── lifecycle.py       # Qt-free, no I/O of any kind: the D29-D31 state
+│   │                      #   machine as a pure reducer (model, event) -> effects
 │   ├── autostart.py       # Qt-free: read/toggle the XDG autostart entry (D29)
 │   ├── tray.py            # QSystemTrayIcon: icon state (D23), menu, autostart item
 │   ├── window.py          # QMainWindow with 2 tabs: Status, Selective Sync
@@ -1197,7 +1199,16 @@ useful when the tray instance already exists.
   that checkout no longer contains `host/setup-host.sh`.
 - **In-session power control (D30).** The controller holds one lifecycle state —
   `starting`, `running`, `start_failed`, `powered_off`, `shutting_down`,
-  `setup` — and `power.available_action(lifecycle, container)` maps it, together
+  `setup`, `provisioning`. That state machine is implemented as a **pure reducer**
+  in `lifecycle.py`: `reduce(model, event) -> Transition` returns the next model
+  plus an ordered tuple of effect tokens, and the controller does nothing but
+  translate a signal into an event, reduce, and apply the effects in order. Every
+  valid transition advances an operation token, so a worker completion belonging
+  to a superseded operation is dropped before it is reduced; an unexpected
+  (phase, event) pair mutates nothing and reports itself. This is where the "no
+  CIFS until the helper says both shares are live" rule is actually enforced, and
+  `gui/tests/test_lifecycle.py` asserts the whole table without Qt.
+  `power.available_action(lifecycle, container)` maps that state, together
   with the last **definitive** `docker inspect` classification, to the single
   action offered as a tray item and one Status-tab button:
   - `running` + container `running` → **Power off bridge (keep this app running)**;

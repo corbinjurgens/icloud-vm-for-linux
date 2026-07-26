@@ -84,6 +84,12 @@ report instead of improvising one.
 
 ## 1. Scaffold the live acceptance record (I-001)
 
+> **Status: done.** `docs/acceptance-results.md` exists with the E0-E11d rows,
+> the environment baseline, and the fail/append/maintenance/privacy rules;
+> `SETUP.md` and the CHANGELOG point at it; the package ships it under
+> `/usr/share/doc/icloud-bridge/docs/`. Every row is still `not yet run` — that
+> is operator work on the real host, and this workspace may not change it.
+
 I-001 itself — running the E0–E11d matrix — needs the real KVM host and is
 operator work. The workspace part is to make the record exist so results land
 somewhere durable instead of in chat logs.
@@ -135,6 +141,10 @@ Files: `docs/acceptance-results.md` (new), `SETUP.md`, `CHANGELOG.md`,
 `packaging/build-deb.sh`, `docs/implementation-plan.md`.
 
 ## 2. Extract the lifecycle reducer and add offscreen Qt wiring tests (I-006)
+
+> **Status: done.** `lifecycle.py` holds the reducer, the controller is the loop
+> around it, and `test_lifecycle.py` / `test_qt_wiring.py` cover the table and
+> the wiring. Behavior-preserving as required: no plan contract changed.
 
 `__main__.py` (~1000 lines) and `window.py` (~1300 lines) hold the D29–D31
 orchestration in Qt callbacks. Extract the decision logic before items 3–6 add

@@ -20,7 +20,7 @@ from typing import Any, Callable
 from PySide6.QtCore import QObject, QRunnable, QSocketNotifier, QThreadPool, QTimer, Signal
 from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
-from . import cli, firstrun, health, notify, power
+from . import cli, firstrun, health, lifecycle, notify, power
 from .tray import OFF, STARTING, TrayIcon, load_icon
 from .window import MainWindow
 
@@ -89,9 +89,19 @@ class Application(QObject):
         #: Count of worker tasks in flight, so the shutdown gate can wait for
         #: mount-touching work to drain before it lets the helper unmount.
         self._active = 0
-        #: The D30 lifecycle state. Health colours never change it; only a
-        #: transition, a definitive Docker classification, or a user action does.
-        self._lifecycle = power.LIFECYCLE_STARTING
+        #: The D30 lifecycle state, owned by the pure reducer in `lifecycle.py`.
+        #: Health colours never change it; only a transition, a definitive Docker
+        #: classification, or a user action does. This controller is the loop
+        #: around it: translate signal to event, `reduce`, apply effects in order.
+        self._model = lifecycle.Model()
+        #: Messages that belong to the *next* banner an effect will draw. Effects
+        #: are parameterless tokens, so the text the reducer has no business
+        #: knowing about is staged here immediately before the dispatch.
+        self._start_error = ""
+        self._abort_message = ""
+        #: Bounded record of unexpected (phase, event) pairs, so a wiring mistake
+        #: is diagnosable rather than silent.
+        self._invalid_transitions: list[str] = []
         #: The last definitive `docker inspect` classification, or None.
         self._container_state: str | None = None
         #: Long-lived polling caches. The five-second loop exists for the cheap
@@ -113,9 +123,6 @@ class Application(QObject):
         self._force_pending = False
         self._drain_timer: QTimer | None = None
         self._drain_ticks_left = 0
-        #: Whether the power-off transition currently running should exit the app
-        #: afterwards (Quit) or leave it idling (D30's keep-running power off).
-        self._exit_after_power_off = True
         #: First-run assistant state (D31). All of it is Docker/filesystem facts
         #: about the *installation*; none of it involves a mount.
         self._bundle: firstrun.Bundle | None = None
@@ -132,7 +139,7 @@ class Application(QObject):
         self._window = MainWindow(self.run_async)
         self._window.refresh_requested.connect(lambda: self._refresh(force=True))
         self._window.quit_requested.connect(self._on_quit_requested)
-        self._window.retry_start_requested.connect(self._begin_startup)
+        self._window.retry_start_requested.connect(self._on_retry_start_requested)
         self._window.power_off_requested.connect(self._on_power_off_requested)
         self._window.start_requested.connect(self._on_start_requested)
         self._window.setup_recheck_requested.connect(self._run_setup_checks)
@@ -145,7 +152,7 @@ class Application(QObject):
             self._tray = TrayIcon(self)
             self._tray.show_window_requested.connect(self.show_window)
             self._tray.quit_requested.connect(self._on_quit_requested)
-            self._tray.retry_start_requested.connect(self._begin_startup)
+            self._tray.retry_start_requested.connect(self._on_retry_start_requested)
             self._tray.power_off_requested.connect(self._on_power_off_requested)
             self._tray.start_requested.connect(self._on_start_requested)
             self._tray.show()
@@ -198,62 +205,73 @@ class Application(QObject):
         self._window.raise_()
         self._window.activateWindow()
 
+    # -------------------------------------------------------- the state loop --
+
+    def _dispatch(self, event: lifecycle.Event, token: int | None = None) -> None:
+        """Reduce one event and apply the resulting effects, in order.
+
+        ``token`` is the operation token a worker captured when it was
+        dispatched. A completion whose token no longer matches belongs to an
+        operation something else has already superseded, and is dropped *before*
+        reduction so it cannot resurrect a state the user has left.
+        """
+        if token is not None and not lifecycle.accepts(self._model, token):
+            return
+        transition = lifecycle.reduce(self._model, event)
+        # The model is current before the effects run, so an effect that starts
+        # an operation captures the token that operation must report back with.
+        self._model = transition.model
+        for effect in transition.effects:
+            self._EFFECTS[effect](self)
+
+    def _report_invalid_transition(self) -> None:
+        record = f"{self._model.phase.value}: unexpected event"
+        if len(self._invalid_transitions) < 32:
+            self._invalid_transitions.append(record)
+        print(f"icloud-bridge-gui: {record}", file=sys.stderr)
+
     # --------------------------------------------------------- startup flow --
 
     def _inspect_and_start(self) -> None:
         """Decide, off the GUI thread, whether startup must power the bridge on."""
+        token = self._model.token
+
         def work():
             status = power.inspect_container()
             # Keep the classification, not just the plan: it is what decides
             # which power action the controls offer (D30).
             return status, power.plan_startup(power.marker_exists(), status)
-        self.run_async(work, self._on_plan, self._on_plan_error)
 
-    def _on_plan(self, result: tuple[power.DockerStatus, power.StartupPlan]) -> None:
+        self.run_async(work,
+                       lambda result: self._on_plan(result, token),
+                       lambda message: self._on_plan_error(message, token))
+
+    def _on_plan(self, result: tuple[power.DockerStatus, power.StartupPlan],
+                 token: int) -> None:
+        if not lifecycle.accepts(self._model, token):
+            return
         status, plan = result
         self._container_state = status.state
         if plan.kind == power.POWER_ON:
-            self._begin_startup()
+            self._dispatch(lifecycle.Event.STARTUP_POWER_ON)
         elif plan.kind == power.PROVISION_NEEDED:
             # No container: the first-run assistant, with bridge I/O still
             # paused. There is nothing to mount, so nothing may be read (D31).
-            self._enter_setup()
+            self._setup_detail = ""
+            self._dispatch(lifecycle.Event.STARTUP_PROVISION_NEEDED)
         elif plan.kind == power.INSPECT_ERROR:
-            self._enter_setup(f"Cannot inspect the Windows VM: {plan.detail}")
+            self._setup_detail = f"Cannot inspect the Windows VM: {plan.detail}"
+            self._dispatch(lifecycle.Event.STARTUP_INSPECT_FAILED)
         else:   # ALREADY_ON
-            self._enter_monitoring()
+            self._dispatch(lifecycle.Event.STARTUP_ALREADY_ON)
 
-    def _on_plan_error(self, message: str) -> None:
-        self._enter_setup(f"Startup inspection failed: {message}")
+    def _on_plan_error(self, message: str, token: int) -> None:
+        if not lifecycle.accepts(self._model, token):
+            return
+        self._setup_detail = f"Startup inspection failed: {message}"
+        self._dispatch(lifecycle.Event.STARTUP_INSPECT_FAILED)
 
     # -------------------------------------------------- first-run assistant --
-
-    def _enter_setup(self, detail: str = "") -> None:
-        """Setup required: no CIFS, no health polling, no selective sync (D31).
-
-        Both entry reasons — no container at all, and an inspection we could not
-        trust — have the same property: there is no evidence a mount exists, so
-        touching one could block on a dead CIFS handle for the whole timeout.
-        """
-        self._lifecycle = power.LIFECYCLE_SETUP
-        self._setup_detail = detail
-        self._notify_enabled = False
-        self._incidents.reset()
-        self._timer.stop()
-        self._window.quiesce()
-        self._window.clear_health_rows()
-        self._window.hide_banner()
-        self._window.hide_notice()
-        self._window.show_setup_tab()
-        if self._tray is not None:
-            self._tray.set_lifecycle_busy(False)
-            self._tray.set_bridge_available(False)
-            self._tray.set_transition(
-                health.RED, "iCloud bridge: setup required — open the status window")
-        self._sync_power_controls()
-        if not self._minimized:
-            self.show_window()
-        self._run_setup_checks()
 
     def _run_setup_checks(self) -> None:
         """Re-run the readiness checks and the Docker inspection — nothing else."""
@@ -297,7 +315,7 @@ class Application(QObject):
         return candidate if os.path.exists(candidate) else ""
 
     def _render_setup(self) -> None:
-        provisioning = self._lifecycle == power.LIFECYCLE_PROVISIONING
+        provisioning = self._model.phase is lifecycle.Phase.PROVISIONING
         bundle = self._bundle
         if bundle is None:
             paths = "Installation files: not found"
@@ -361,7 +379,8 @@ class Application(QObject):
             self._setup_busy = False
             ok, output = result
             if ok:
-                self._enter_provisioning(output)
+                self._setup_detail = output
+                self._dispatch(lifecycle.Event.VM_CREATED)
             else:
                 self._setup_detail = f"docker compose up -d failed:\n{output}"
                 self._render_setup()
@@ -391,25 +410,6 @@ class Application(QObject):
         box.exec()
         return box.clickedButton() is create
 
-    def _enter_provisioning(self, detail: str = "") -> None:
-        """The container exists and Windows is installing itself.
-
-        Emphatically **not** ``_begin_startup()``: the initial Windows install
-        legitimately keeps SMB unavailable for far longer than the helper's
-        five-minute readiness deadline, so calling `on` here would fail and leave
-        the operator staring at a start error during a normal install (D31).
-        """
-        self._lifecycle = power.LIFECYCLE_PROVISIONING
-        self._container_state = "running"
-        self._setup_detail = detail
-        self._timer.stop()
-        self._window.quiesce()
-        self._window.show_setup_tab()
-        self._setup_checks = []
-        self._render_setup()
-        self._sync_power_controls()
-        self.show_window()
-
     def _on_connect_requested(self) -> None:
         """Verify the host half is installed, then hand over to the power helper."""
         if self._setup_busy:
@@ -431,8 +431,7 @@ class Application(QObject):
                 # The helper's own CIFS activation is the only honest
                 # mountability test; nothing here touches a mount.
                 self._setup_detail = ""
-                self._window.hide_setup_tab()
-                self._begin_startup()
+                self._dispatch(lifecycle.Event.CONNECT_READY)
                 return
             self._setup_detail = ("The bridge is not ready to connect yet. Fix the "
                                   "items above, then check again.")
@@ -445,79 +444,140 @@ class Application(QObject):
 
         self.run_async(work, done, failed)
 
-    def _begin_startup(self) -> None:
-        """Run the power-on transition, showing the distinct 'starting' state.
+    # ------------------------------------------------------ effect handlers --
+    # Each of these does one imperative thing the reducer asked for. They are
+    # deliberately dumb: no decisions, no branching on lifecycle state. The
+    # order they run in is the reducer's, transcribed from the `_enter_*`
+    # methods they replace.
 
-        Reached from process start, from **Retry start**, and from D30's **Start
-        bridge** — all three pause every kind of new I/O first, because CIFS
-        must not be touched until the helper says both shares are live.
-        """
-        self._lifecycle = power.LIFECYCLE_STARTING
-        self._notify_enabled = False
-        self._incidents.reset()
+    def _fx_stop_polling(self) -> None:
         self._timer.stop()
+
+    def _fx_start_polling(self) -> None:
+        self._timer.start()
+
+    def _fx_force_refresh(self) -> None:
+        self._refresh(force=True)
+
+    def _fx_quiesce_io(self) -> None:
         # quiesce() rather than set_io_paused(): it also stops the window's
         # request/response poller and drops queued list requests, which matters
         # when Start is pressed from the powered-off state.
         self._window.quiesce()
+
+    def _fx_pause_io(self) -> None:
+        self._window.set_io_paused(True)
+
+    def _fx_resume_io(self) -> None:
+        # resume() also restarts the request/response poller quiesce stopped.
+        self._window.resume()
+
+    def _fx_reload_selective_sync(self) -> None:
+        self._window.reload_selective_sync()
+
+    def _fx_clear_health_rows(self) -> None:
+        self._window.clear_health_rows()
+
+    def _fx_hide_banner(self) -> None:
+        self._window.hide_banner()
+
+    def _fx_hide_notice(self) -> None:
+        self._window.hide_notice()
+
+    def _fx_show_starting_banner(self) -> None:
         self._window.show_banner(
             "Starting the Windows VM… this can take a few minutes.", "starting")
-        self._sync_power_controls()
-        if self._tray is not None:
-            self._tray.set_transition(STARTING, "iCloud bridge: starting the Windows VM…")
-            self._tray.set_lifecycle_busy(True, allow_quit=True)
-            self._tray.set_bridge_available(False)
+
+    def _fx_show_start_failed_banner(self) -> None:
+        self._window.show_banner(
+            f"The Windows VM did not start.\n{self._start_error}\n\n"
+            "Open the VM screen to check it, then Retry start.", "error")
+
+    def _fx_show_shutdown_banner(self) -> None:
+        self._window.show_banner(
+            "Shutting down… this can take about three minutes. "
+            "Do not power off your computer.", "shutdown")
+
+    def _fx_show_powered_off_banner(self) -> None:
+        self._window.show_banner(
+            "Bridge is powered off. The Windows VM is stopped and both shares are "
+            "disconnected. Choose Start bridge to bring it back.", "off")
+
+    def _fx_show_abort_banner(self) -> None:
+        self._window.show_banner(self._abort_message, "error")
+
+    def _fx_show_setup_tab(self) -> None:
+        self._window.show_setup_tab()
+
+    def _fx_hide_setup_tab(self) -> None:
+        self._window.hide_setup_tab()
+
+    def _fx_show_window(self) -> None:
+        self.show_window()
+
+    def _fx_show_window_unless_minimized(self) -> None:
         if not self._minimized:
             self.show_window()
-        self.run_async(power.power_on, self._on_start_result, self._on_start_exception)
 
-    def _on_start_result(self, result: power.HelperResult) -> None:
-        if result.success:
-            self._enter_running()
-        else:
-            self._enter_start_failed(result.message)
+    def _fx_tray_starting(self) -> None:
+        if self._tray is None:
+            return
+        self._tray.set_transition(STARTING, "iCloud bridge: starting the Windows VM…")
+        self._tray.set_lifecycle_busy(True, allow_quit=True)
+        self._tray.set_bridge_available(False)
 
-    def _on_start_exception(self, message: str) -> None:
-        self._enter_start_failed(f"the power helper could not be run: {message}")
+    def _fx_tray_running(self) -> None:
+        if self._tray is None:
+            return
+        self._tray.set_lifecycle_busy(False)
+        self._tray.set_bridge_available(True)
 
-    def _enter_running(self) -> None:
-        """Both shares are live: resume every kind of monitoring and I/O."""
-        self._lifecycle = power.LIFECYCLE_RUNNING
-        self._container_state = "running"   # the helper just proved it
-        self._window.hide_setup_tab()
-        self._window.hide_banner()
-        # resume() also restarts the request/response poller that quiesce stopped.
-        self._window.resume()
-        if self._tray is not None:
-            self._tray.set_lifecycle_busy(False)
-            self._tray.set_bridge_available(True)
-        self._sync_power_controls()
+    def _fx_tray_start_failed(self) -> None:
+        if self._tray is None:
+            return
+        self._tray.set_transition(
+            health.RED, f"iCloud bridge: start failed — {self._start_error}")
+        self._tray.set_lifecycle_busy(False)
+        self._tray.set_bridge_available(False)
+
+    def _fx_tray_shutting_down(self) -> None:
+        if self._tray is None:
+            return
+        self._tray.set_transition(STARTING, "iCloud bridge: shutting down…")
+        self._tray.set_lifecycle_busy(True, allow_quit=False)
+
+    def _fx_tray_powered_off(self) -> None:
+        if self._tray is None:
+            return
+        self._tray.set_lifecycle_busy(False)
+        self._tray.set_bridge_available(False)
+        self._tray.set_transition(
+            OFF, "iCloud bridge: powered off — choose Start bridge to reconnect")
+
+    def _fx_tray_setup(self) -> None:
+        if self._tray is None:
+            return
+        self._tray.set_lifecycle_busy(False)
+        self._tray.set_bridge_available(False)
+        self._tray.set_transition(
+            health.RED, "iCloud bridge: setup required — open the status window")
+
+    def _fx_enable_notifications(self) -> None:
+        self._notify_enabled = True
+
+    def _fx_disable_notifications(self) -> None:
+        self._notify_enabled = False
+
+    def _fx_reset_incidents(self) -> None:
+        self._incidents.reset()
+
+    def _fx_begin_startup_grace(self) -> None:
         # The canary is legitimately as old as the bridge was off, so give the
         # host health timer a bounded window to refresh it before a red snapshot
-        # counts as an incident (item 4).
+        # counts as an incident.
         self._incidents.begin_startup_grace(time.monotonic())
-        self._notify_enabled = True
-        self._window.reload_selective_sync()
-        self._timer.start()
-        self._refresh(force=True)
 
-    def _enter_start_failed(self, message: str) -> None:
-        # Keep mount work paused and do NOT auto-retry every five seconds; wait
-        # for the operator to fix the VM and press Retry (v2 plan D29).
-        self._lifecycle = power.LIFECYCLE_START_FAILED
-        self._notify_enabled = False
-        self._incidents.reset()
-        self._timer.stop()
-        self._window.set_io_paused(True)
-        self._window.show_banner(
-            f"The Windows VM did not start.\n{message}\n\n"
-            "Open the VM screen to check it, then Retry start.", "error")
-        self._sync_power_controls()
-        if self._tray is not None:
-            self._tray.set_transition(health.RED, f"iCloud bridge: start failed — {message}")
-            self._tray.set_lifecycle_busy(False)
-            self._tray.set_bridge_available(False)
-            self._sync_power_controls()     # set_lifecycle_busy cleared it
+    def _fx_announce_start_failure(self) -> None:
         if self._minimized and self._tray is not None:
             # A minimized autostart launch has no visible window; use a tray
             # notification rather than an invisible modal.
@@ -526,27 +586,50 @@ class Application(QObject):
         else:
             self.show_window()
 
-    def _enter_monitoring(self) -> None:
-        """The bridge is up already (ALREADY_ON): resume normal monitoring."""
-        self._lifecycle = power.LIFECYCLE_RUNNING
-        self._incidents.reset()
-        self._notify_enabled = True
-        self._window.hide_setup_tab()
-        self._window.resume()
-        self._window.hide_banner()
-        if self._tray is not None:
-            self._tray.set_lifecycle_busy(False)
-            self._tray.set_bridge_available(True)
-        self._sync_power_controls()
-        self._window.reload_selective_sync()
-        self._timer.start()
-        self._refresh(force=True)
+    def _fx_mark_container_running(self) -> None:
+        self._container_state = "running"
+
+    def _fx_mark_container_stopped(self) -> None:
+        self._container_state = "stopped"
+
+    def _fx_run_setup_checks(self) -> None:
+        self._run_setup_checks()
+
+    def _fx_clear_setup_checks(self) -> None:
+        self._setup_checks = []
+
+    def _fx_render_setup(self) -> None:
+        self._render_setup()
+
+    def _fx_run_power_on(self) -> None:
+        token = self._model.token
+        self.run_async(power.power_on,
+                       lambda result: self._on_start_result(result, token),
+                       lambda message: self._on_start_exception(message, token))
+
+    def _fx_exit_app(self) -> None:
+        self._quit_gui_only()
+
+    def _on_start_result(self, result: power.HelperResult, token: int) -> None:
+        if not lifecycle.accepts(self._model, token):
+            return
+        if result.success:
+            self._dispatch(lifecycle.Event.POWER_ON_SUCCEEDED)
+            return
+        self._start_error = result.message
+        self._dispatch(lifecycle.Event.POWER_ON_FAILED)
+
+    def _on_start_exception(self, message: str, token: int) -> None:
+        if not lifecycle.accepts(self._model, token):
+            return
+        self._start_error = f"the power helper could not be run: {message}"
+        self._dispatch(lifecycle.Event.POWER_ON_FAILED)
 
     # ------------------------------------------------- the D30 power controls --
 
     def _sync_power_controls(self) -> None:
         """Offer the one lifecycle action this state allows — and only that one."""
-        action = power.available_action(self._lifecycle, self._container_state)
+        action = power.available_action(self._model.phase.value, self._container_state)
         self._window.set_power_action(action)
         if self._tray is not None:
             self._tray.set_power_action(action)
@@ -584,11 +667,11 @@ class Application(QObject):
 
     def _on_power_off_requested(self) -> None:
         """D30's **Power off bridge**: the Quit transaction without the exit."""
-        if self._lifecycle != power.LIFECYCLE_RUNNING:
+        if self._model.phase is not lifecycle.Phase.RUNNING:
             return
         if not self._confirm_power_off():
             return
-        self._begin_power_off(then_exit=False)
+        self._dispatch(lifecycle.Event.USER_POWER_OFF_CONFIRMED)
 
     def _confirm_power_off(self) -> bool:
         self.show_window()
@@ -610,62 +693,49 @@ class Application(QObject):
         return box.clickedButton() is off_btn
 
     def _on_start_requested(self) -> None:
-        """D30's **Start bridge**, from the powered-off or recoverable state."""
-        if self._lifecycle == power.LIFECYCLE_POWERED_OFF:
-            self._begin_startup()
-            return
-        if (self._lifecycle == power.LIFECYCLE_RUNNING
-                and self._container_state == "stopped"):
-            self._begin_startup()
+        """D30's **Start bridge**, from the powered-off or recoverable state.
 
-    def _enter_powered_off(self) -> None:
-        """Idle in-process after a successful power-off: no CIFS, no polling."""
-        self._lifecycle = power.LIFECYCLE_POWERED_OFF
-        self._container_state = "stopped"
-        self._notify_enabled = False
-        self._incidents.reset()
-        self._timer.stop()
-        # quiesce() already ran as part of the transaction; keep it that way.
-        self._window.hide_notice()
-        self._window.clear_health_rows()
-        self._window.show_banner(
-            "Bridge is powered off. The Windows VM is stopped and both shares are "
-            "disconnected. Choose Start bridge to bring it back.", "off")
-        if self._tray is not None:
-            self._tray.set_lifecycle_busy(False)
-            self._tray.set_bridge_available(False)
-            self._tray.set_transition(
-                OFF, "iCloud bridge: powered off — choose Start bridge to reconnect")
-        self._sync_power_controls()
+        The guard is `power.available_action` itself, so the enabling rule has
+        exactly one implementation: powered off, or running with a container a
+        `docker inspect` definitively classified as stopped.
+        """
+        if power.available_action(self._model.phase.value,
+                                  self._container_state) != power.ACTION_START:
+            return
+        self._dispatch(lifecycle.Event.USER_START_BRIDGE)
+
+    def _on_retry_start_requested(self) -> None:
+        self._dispatch(lifecycle.Event.USER_RETRY_START)
 
     # ----------------------------------------------------------- quit flow ---
 
     def _on_quit_requested(self) -> None:
-        if self._lifecycle == power.LIFECYCLE_SHUTTING_DOWN:
+        kind = lifecycle.quit_kind(self._model.phase)
+        if kind == lifecycle.QUIT_IGNORE:
             return
-        if self._lifecycle == power.LIFECYCLE_POWERED_OFF:
+        if kind == lifecycle.QUIT_ALREADY_OFF:
             # Already off, durably: the marker and the stopped VM outlive this
             # process, so there is nothing left for the helper to do (D30).
             if self._confirm_simple_quit(
                     "The bridge is already powered off, so nothing more will be "
                     "disconnected. It stays off across a reboot; launching this app "
                     "again powers the VM back on."):
-                self._quit_gui_only()
+                self._dispatch(lifecycle.Event.QUIT_CONFIRMED_GUI_ONLY)
             return
-        if self._lifecycle in (power.LIFECYCLE_SETUP, power.LIFECYCLE_PROVISIONING):
+        if kind == lifecycle.QUIT_NOTHING_MOUNTED:
             # Nothing is mounted, and a half-installed Windows guest must not be
             # torn down by quitting the app that is guiding the install (D31).
             if self._confirm_simple_quit(
                     "Setup is not finished, so there is nothing mounted to "
                     "disconnect. Any VM that has already been created keeps "
                     "running; start this app again to continue."):
-                self._quit_gui_only()
+                self._dispatch(lifecycle.Event.QUIT_CONFIRMED_GUI_ONLY)
             return
         choice = self._ask_quit()
         if choice == "off":
-            self._begin_power_off(then_exit=True)
+            self._dispatch(lifecycle.Event.QUIT_CONFIRMED_POWER_OFF)
         elif choice == "gui":
-            self._quit_gui_only()
+            self._dispatch(lifecycle.Event.QUIT_CONFIRMED_GUI_ONLY)
 
     def _confirm_simple_quit(self, informative: str) -> bool:
         """Quit confirmation for the states with nothing to tear down."""
@@ -713,103 +783,73 @@ class Application(QObject):
             self._tray.hide()
         self._app.quit()
 
-    def _begin_power_off(self, *, then_exit: bool) -> None:
-        """The one power-off transaction, with two possible continuations (D30).
+    # ---------------------------------------- the one power-off transaction ---
+    # Quit and the keep-running power off share every step that matters — stop
+    # polling, refuse new bridge I/O, drain in-flight mount work, then call the
+    # helper — and differ only in what success means. That is why the reducer
+    # gives both the same effect tuple and carries the continuation in the model.
 
-        Quit and the keep-running power off share every step that matters — stop
-        polling, refuse new bridge I/O, drain in-flight mount work, then call the
-        helper — and differ only in what success means. Duplicating the ordering
-        for the second caller is exactly how the two would drift apart.
-        """
-        self._lifecycle = power.LIFECYCLE_SHUTTING_DOWN
-        self._exit_after_power_off = then_exit
-        self._notify_enabled = False
-        self._incidents.reset()
-        self._timer.stop()
-        # Stop scheduling bridge I/O and let in-flight work drain first.
-        self._window.quiesce()
-        self._window.show_banner(
-            "Shutting down… this can take about three minutes. "
-            "Do not power off your computer.", "shutdown")
-        self._sync_power_controls()
-        if self._tray is not None:
-            self._tray.set_transition(STARTING, "iCloud bridge: shutting down…")
-            self._tray.set_lifecycle_busy(True, allow_quit=False)
-        self.show_window()
-
+    def _fx_begin_drain(self) -> None:
+        token = self._model.token
         self._drain_ticks_left = SHUTDOWN_DRAIN_TIMEOUT_MS // DRAIN_POLL_MS
         self._drain_timer = QTimer(self)
         self._drain_timer.setInterval(DRAIN_POLL_MS)
-        self._drain_timer.timeout.connect(self._check_drain)
+        self._drain_timer.timeout.connect(lambda: self._check_drain(token))
         self._drain_timer.start()
-        self._check_drain()
+        # Safe to reduce re-entrantly: BEGIN_DRAIN is the last effect of the
+        # transition that produced it, so nothing after this runs against a
+        # model the nested dispatch has already replaced.
+        self._check_drain(token)
 
-    def _check_drain(self) -> None:
+    def _fx_stop_drain(self) -> None:
+        if self._drain_timer is not None:
+            self._drain_timer.stop()
+
+    def _check_drain(self, token: int) -> None:
+        if not lifecycle.accepts(self._model, token):
+            self._fx_stop_drain()
+            return
         # Never begin the unmount while a task (Apply write, gather, or list poll)
         # is still touching CIFS.
         if self._active == 0 and not self._window.apply_in_flight():
-            if self._drain_timer is not None:
-                self._drain_timer.stop()
-            self._run_power_off()
+            self._dispatch(lifecycle.Event.DRAIN_COMPLETED, token)
             return
         self._drain_ticks_left -= 1
         if self._drain_ticks_left <= 0:
-            if self._drain_timer is not None:
-                self._drain_timer.stop()
-            self._abort_shutdown(
+            self._abort_message = (
                 "A file operation on the iCloud mount is still in progress, so the "
                 "bridge was not disconnected. Close any open files or transfers "
                 "and try again.")
+            self._dispatch(lifecycle.Event.DRAIN_TIMED_OUT, token)
 
-    def _run_power_off(self) -> None:
-        self.run_async(power.power_off, self._on_power_off_result, self._on_power_off_exception)
+    def _fx_run_power_off(self) -> None:
+        token = self._model.token
+        self.run_async(power.power_off,
+                       lambda result: self._on_power_off_result(result, token),
+                       lambda message: self._on_power_off_exception(message, token))
 
-    def _on_power_off_result(self, result: power.HelperResult) -> None:
-        if not result.success:
-            self._abort_shutdown(result.message)
-        elif self._exit_after_power_off:
-            self._quit_gui_only()
-        else:
-            self._enter_powered_off()
+    def _on_power_off_result(self, result: power.HelperResult, token: int) -> None:
+        if not lifecycle.accepts(self._model, token):
+            return
+        if result.success:
+            self._dispatch(lifecycle.Event.POWER_OFF_SUCCEEDED)
+            return
+        self._abort_message = result.message
+        self._dispatch(lifecycle.Event.POWER_OFF_FAILED)
 
-    def _on_power_off_exception(self, message: str) -> None:
-        self._abort_shutdown(f"the power helper could not be run: {message}")
-
-    def _abort_shutdown(self, message: str) -> None:
-        # Helper failure or a busy drain: nothing was torn down, so restore the
-        # exact running state — polling, I/O, incident announcements and the
-        # power controls all as they were.
-        self._lifecycle = power.LIFECYCLE_RUNNING
-        self._notify_enabled = True
-        self._window.show_banner(message, "error")
-        self._window.resume()
-        if self._tray is not None:
-            self._tray.set_lifecycle_busy(False)
-            self._tray.set_bridge_available(True)
-        self._sync_power_controls()
-        self._timer.start()
-        self._refresh(force=True)
-        self.show_window()
+    def _on_power_off_exception(self, message: str, token: int) -> None:
+        if not lifecycle.accepts(self._model, token):
+            return
+        self._abort_message = f"the power helper could not be run: {message}"
+        self._dispatch(lifecycle.Event.POWER_OFF_FAILED)
 
     # ------------------------------------------------------------ refreshing --
 
-    #: States that own the mounts or deliberately have none: no health polling,
-    #: no CIFS, no bridge reads (v2 plan D29 lifecycle rule, extended by D30).
-    _PAUSED_STATES = frozenset({
-        power.LIFECYCLE_STARTING,
-        power.LIFECYCLE_SHUTTING_DOWN,
-        power.LIFECYCLE_POWERED_OFF,
-        power.LIFECYCLE_START_FAILED,
-        # D31: setup and provisioning have no mount to gather from, and a dead
-        # CIFS handle would block the worker for the whole timeout.
-        power.LIFECYCLE_SETUP,
-        power.LIFECYCLE_PROVISIONING,
-    })
-
     def _refresh(self, force: bool = False) -> None:
-        # No health polling while a transition owns the tray/mount state, or
-        # while the bridge is intentionally off.
-        if self._lifecycle in self._PAUSED_STATES:
+        # No health polling while a transition owns the tray/mount state, while
+        # the bridge is intentionally off, or while there is nothing mounted to
+        # gather from (v2 plan D29, extended by D30/D31).
+        if lifecycle.is_no_cifs(self._model.phase):
             return
         if self._refreshing:
             # Never dispatch a second concurrent gather — the caches are
@@ -834,7 +874,7 @@ class Application(QObject):
 
     def _on_snapshot(self, snapshot: health.Snapshot) -> None:
         self._refreshing = False
-        if self._lifecycle in self._PAUSED_STATES:
+        if lifecycle.is_no_cifs(self._model.phase):
             # A transition owns the state now; it does its own forced pass.
             self._force_pending = False
             return
@@ -855,7 +895,7 @@ class Application(QObject):
 
     def _on_snapshot_failed(self, message: str) -> None:
         self._refreshing = False
-        if self._lifecycle in self._PAUSED_STATES:
+        if lifecycle.is_no_cifs(self._model.phase):
             self._force_pending = False
             return
         checks = [health.Check("GUI", health.RED, f"health check failed: {message}")]
@@ -889,6 +929,54 @@ class Application(QObject):
             self._window.show_notice(message.body)
         else:
             self._window.hide_notice()
+
+    #: Effect token to handler. Every member of `lifecycle.Effect` must appear
+    #: here; `test_qt_wiring` asserts the two stay in step, so adding an effect
+    #: without wiring it is a test failure rather than a silent no-op.
+    _EFFECTS = {
+        lifecycle.Effect.STOP_POLLING: _fx_stop_polling,
+        lifecycle.Effect.START_POLLING: _fx_start_polling,
+        lifecycle.Effect.FORCE_REFRESH: _fx_force_refresh,
+        lifecycle.Effect.QUIESCE_IO: _fx_quiesce_io,
+        lifecycle.Effect.PAUSE_IO: _fx_pause_io,
+        lifecycle.Effect.RESUME_IO: _fx_resume_io,
+        lifecycle.Effect.RELOAD_SELECTIVE_SYNC: _fx_reload_selective_sync,
+        lifecycle.Effect.CLEAR_HEALTH_ROWS: _fx_clear_health_rows,
+        lifecycle.Effect.HIDE_BANNER: _fx_hide_banner,
+        lifecycle.Effect.HIDE_NOTICE: _fx_hide_notice,
+        lifecycle.Effect.SHOW_STARTING_BANNER: _fx_show_starting_banner,
+        lifecycle.Effect.SHOW_START_FAILED_BANNER: _fx_show_start_failed_banner,
+        lifecycle.Effect.SHOW_SHUTDOWN_BANNER: _fx_show_shutdown_banner,
+        lifecycle.Effect.SHOW_POWERED_OFF_BANNER: _fx_show_powered_off_banner,
+        lifecycle.Effect.SHOW_ABORT_BANNER: _fx_show_abort_banner,
+        lifecycle.Effect.SHOW_SETUP_TAB: _fx_show_setup_tab,
+        lifecycle.Effect.HIDE_SETUP_TAB: _fx_hide_setup_tab,
+        lifecycle.Effect.SHOW_WINDOW: _fx_show_window,
+        lifecycle.Effect.SHOW_WINDOW_UNLESS_MINIMIZED: _fx_show_window_unless_minimized,
+        lifecycle.Effect.TRAY_STARTING: _fx_tray_starting,
+        lifecycle.Effect.TRAY_RUNNING: _fx_tray_running,
+        lifecycle.Effect.TRAY_START_FAILED: _fx_tray_start_failed,
+        lifecycle.Effect.TRAY_SHUTTING_DOWN: _fx_tray_shutting_down,
+        lifecycle.Effect.TRAY_POWERED_OFF: _fx_tray_powered_off,
+        lifecycle.Effect.TRAY_SETUP: _fx_tray_setup,
+        lifecycle.Effect.ENABLE_NOTIFICATIONS: _fx_enable_notifications,
+        lifecycle.Effect.DISABLE_NOTIFICATIONS: _fx_disable_notifications,
+        lifecycle.Effect.RESET_INCIDENTS: _fx_reset_incidents,
+        lifecycle.Effect.BEGIN_STARTUP_GRACE: _fx_begin_startup_grace,
+        lifecycle.Effect.ANNOUNCE_START_FAILURE: _fx_announce_start_failure,
+        lifecycle.Effect.MARK_CONTAINER_RUNNING: _fx_mark_container_running,
+        lifecycle.Effect.MARK_CONTAINER_STOPPED: _fx_mark_container_stopped,
+        lifecycle.Effect.SYNC_POWER_CONTROLS: _sync_power_controls,
+        lifecycle.Effect.RUN_SETUP_CHECKS: _fx_run_setup_checks,
+        lifecycle.Effect.CLEAR_SETUP_CHECKS: _fx_clear_setup_checks,
+        lifecycle.Effect.RENDER_SETUP: _fx_render_setup,
+        lifecycle.Effect.RUN_POWER_ON: _fx_run_power_on,
+        lifecycle.Effect.RUN_POWER_OFF: _fx_run_power_off,
+        lifecycle.Effect.BEGIN_DRAIN: _fx_begin_drain,
+        lifecycle.Effect.STOP_DRAIN: _fx_stop_drain,
+        lifecycle.Effect.EXIT_APP: _fx_exit_app,
+        lifecycle.Effect.REPORT_INVALID_TRANSITION: _report_invalid_transition,
+    }
 
 
 def _claim_single_instance() -> socket.socket | None:
