@@ -5,6 +5,11 @@ executed, verified, and archived. Read `CONTRIBUTING.md` completely before
 touching anything; it governs every rule referenced below (pathspec commits,
 shared-session etiquette, verification, and the plans-own-decisions rule).
 
+**Items 2, 3 and 4 landed on 2026-07-27** (`4bd83e1`, `56c2c32`, `d4caba3`); see
+`todo/archive/post-provisioning-followups.md` for what each one did and for two
+corrections it turned up. What remains here is the operator-only work, plus one
+unanswered question.
+
 ## Context you need before starting
 
 - The feature landed as commits `3b3d43e..cb569bf` plus `8e03467` (which
@@ -56,17 +61,12 @@ This checkout sits on the author's live host, which also runs the
 
 ## Items
 
-Suggested order: 4 (minutes, any time) → 2 → 3 (both workspace-only) → rebuild
-the deb once → 1 (needs the operator present). Landing 2 before 1 means the
-operator installs once and the M5 run also exercises the improved failure
-surfacing.
-
 1. **M5 — operator verification on this host.** The one substantive piece the
    plan could not do. Interactive: the GUI needs the operator's display and the
    guest needs their eyes.
-   - First refresh the installed copy: `make deb` (shared build state — do not
-     run while another session is building), then have the operator install it
-     and re-run `sudo icloud-bridge-configure` if it asks
+   - `dist/icloud-bridge_0.2.0_all.deb` was rebuilt 2026-07-27 at 11:49 and
+     carries the D45 helper; rebuild only if the tree has moved since. Have the
+     operator install it and re-run `sudo icloud-bridge-configure` if it asks
      (`! sudo apt install ./dist/icloud-bridge_0.2.0_all.deb`).
    - Then walk milestone 6 of `todo/archive/automated-guest-provisioning.md`
      steps (a)-(i) in order: Provision-share read-only proof, the pre-feature
@@ -81,54 +81,12 @@ surfacing.
    - Record results in `CHANGELOG.md` (append, do not reflow) and the
      `docs/automation-notes.md` scoreboard.
 
-2. **Surface credential-specific mount failures from the power helper.** The
-   "Retry and reset share password..." route almost cannot fire today.
-   - The gap: `gui/icloud_bridge_gui/__main__.py` matches
-     `CREDENTIAL_FAILURE_MARKERS` (NT_STATUS_LOGON_FAILURE, "permission
-     denied", ...) against the power helper's stderr to raise
-     `PROVISION_CONNECT_FAILED` (`lifecycle.py`, the third door into a
-     provisioning run's state). But `host/icloud-bridge-power`'s only
-     mount-failure message is the generic ready-deadline text ("shares did not
-     become usable within Ns"); the real CIFS error stays in the journals of
-     `mnt-icloud.mount` / `mnt-icloud_bridge.mount`. So a wrong password looks
-     identical to a slow guest, and the GUI shows the generic red banner
-     instead of the credential route.
-   - Fix shape: when the ready deadline expires, harvest a short, sanitized
-     excerpt of the two mount units' recent journal entries and append it to
-     the `die` message. Keep the exit-status contract (the GUI shows stderr
-     and does not parse exit codes), keep the transaction semantics, and make
-     sure no secret can appear in the excerpt.
-   - Process: this is a behavioural change to a root helper on the privileged
-     power path. Update the v2 plan in the same commit (the D29/lifecycle
-     contract section and §4.2's "connecting is the proof" discussion), and if
-     the surfacing policy warrants a decision row, claim the next free D-number
-     at edit time and re-check it before commit. Extend
-     `gui/tests/test_power_helper.py` and the connect-failure routing tests.
-   - After landing, the installed helper is stale until the operator
-     reinstalls — coordinate with item 1.
+   - The M5 run now also exercises D45's failure surfacing: a start that times
+     out should show the mount units' own error under the generic sentence, and
+     a deliberately wrong `SHARE_PASS` should reach the credential route rather
+     than the generic red banner. That path has never run against a live
+     journal.
 
-3. **Point the v1 plan's troubleshooting at app-driven re-provisioning.**
-   `docs/implementation-plan.md` still instructs manual recovery in live
-   guidance rows: ~line 217 (re-run `C:\OEM\01-debloat.ps1` after a feature
-   update), ~304-305 (edit/run 03 from `C:\OEM`), ~425 ("Re-run scripts 01, 03
-   and 04"), ~429 (re-run 04 elevated). The v2 plan wins on conflict and D35/D42
-   route recovery through **Re-run Windows provisioning...**, with the manual
-   sequence as a documented fallback run from
-   `C:\ProgramData\icloud-bridge-provision\current` (not stale `C:\OEM`) once
-   the app has provisioned the VM.
-   - Update those rows to lead with the app action and demote the manual path
-     to the fallback, cross-referencing SETUP.md §8 and D42 rather than
-     duplicating them.
-   - Leave historical records (`CHANGELOG.md` entries,
-     `docs/acceptance-results.md`) as written. Add a changelog entry for the
-     doc change.
-
-4. **Housekeeping.**
-   - Add `.claude/` to `.gitignore` (it holds `settings.local.json` and the
-     plan-run ledger; both are machine/session-local, matching the existing
-     `.mcp.json` / `.idea` entries). Commit the one-line change by pathspec.
-   - Delete `dist/icloud-bridge_2.0.0_all.deb` — a stale artifact from before
-     the deliberate 2.0.0 -> 0.2.0 renumber (`37a6fab`). `dist/` is ignored;
-     this is disk cleanup only.
-   - `master` is ~40 commits ahead of `origin/master`. Never push without the
-     operator's explicit request — ask whether they want it pushed.
+4. **Housekeeping — one question left.** `master` is ~40 commits ahead of
+   `origin/master`. Never push without the operator's explicit request — ask
+   whether they want it pushed. (Asked 2026-07-27; unanswered.)
