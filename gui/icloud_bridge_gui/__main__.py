@@ -19,10 +19,10 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QRunnable, QSocketNotifier, QThreadPool, QTimer, Signal
-from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QCheckBox, QMessageBox, QSystemTrayIcon
 
-from . import (autostart, backup, bridge, cli, diagnostics, firstrun, health,
-               lifecycle, notify, power)
+from . import (autostart, backup, bridge, cli, diagnostics, firstrun, guestprov,
+               health, lifecycle, notify, power)
 from .tray import OFF, STARTING, TrayIcon, load_icon
 from .window import MainWindow
 
@@ -30,13 +30,26 @@ from .window import MainWindow
 SINGLE_INSTANCE_ADDRESS = "\0icloud-bridge-gui"
 REFRESH_INTERVAL_MS = 5000
 
-#: Shown while Windows installs itself (D31). Everything here is deliberately
-#: manual: the Store/winget install needs an interactive session, Apple's 2FA
-#: cannot be automated, and the share password must not pass through this app.
+#: Shown while Windows installs itself (D31/D40-D44). The app drives the guest
+#: sequence now; the Apple sign-in and the iCloud Drive toggle stay manual,
+#: because 2FA cannot be automated safely (`CONTRIBUTING.md` Scope).
 PROVISIONING_INTRO = (
     "The Windows VM is being created. The first install downloads Windows and "
     "takes 20–40 minutes — watch it on the VM screen.\n\n"
-    "When the Windows desktop appears, run these in the guest, in order "
+    "When the Windows desktop appears, choose “Set up Windows automatically”. "
+    "This app installs iCloud for Windows, waits while you sign in, creates the "
+    "SMB share and installs the bridge agent, then hands over to “Check setup "
+    "and connect”. Nothing on the iCloud mounts is read until that succeeds.\n\n"
+    "Signing in to iCloud in the VM — including two-factor authentication, and "
+    "leaving iCloud Drive and Files On-Demand switched on — is the only step "
+    "you do yourself."
+)
+
+#: The documented sequence for configuring the guest by hand. Kept, behind the
+#: Setup tab's **Show manual steps** toggle: an unusual VM must never become a
+#: dead-end app state.
+PROVISIONING_MANUAL_STEPS = (
+    "To configure the guest yourself instead, run these in the VM, in order "
     "(they are in {provision}):\n"
     "  1. 02-install-icloud.ps1 — installs iCloud for Windows\n"
     "  2. sign in to iCloud in the guest, including two-factor authentication\n"
@@ -45,8 +58,63 @@ PROVISIONING_INTRO = (
     "  4. 04-bridge-agent.ps1 — installs the bridge agent, as Administrator\n\n"
     "Then, on this computer:\n"
     "  {host_command}\n\n"
-    "Finally choose “Check setup and connect”. Nothing on the iCloud mounts is "
-    "read until that succeeds."
+    "Finally choose “Check setup and connect”."
+)
+
+# ------------------------- app-driven guest provisioning (D40-D44, §4.1/§4.2) --
+
+#: Status poll interval while a run is active. At most one Docker poll worker is
+#: ever in flight (`_prov_polling`), so a slow daemon delays the next read
+#: rather than queueing a second one.
+PROVISION_POLL_MS = 3000
+#: How often "is Windows itself up yet?" is retried before a run can be staged.
+PROVISION_PROBE_RETRY_MS = 15000
+#: How long a staged run may go unacknowledged before the one-time guest
+#: bootstrap is offered. Not an error: a VM created before this feature simply
+#: has no watcher task yet (§4.1).
+PROVISION_BOOTSTRAP_HINT_SECONDS = 90.0
+
+#: Run once in an elevated PowerShell *inside* the VM. Shown, never run: this
+#: app holds no guest-admin credentials, and the watcher registers itself (D40).
+GUEST_BOOTSTRAP_COMMAND = (
+    r"powershell -ExecutionPolicy Bypass -NoProfile -File "
+    r"\\host.lan\Provision\watcher.ps1 -Install")
+GUEST_BOOTSTRAP_NOTE = (
+    "The VM has not picked this up yet, and this app keeps waiting. A VM "
+    "created before automated provisioning has no watcher task, so run this "
+    "once in an elevated PowerShell inside the VM — the request already staged "
+    "here is then picked up with no further click.")
+
+PROVISION_WINDOWS_INSTALLING = (
+    "Windows is still installing — this app cannot reach it yet. Watch the VM "
+    "screen; the setup starts by itself once Windows is up.")
+
+#: Substrings that mean the share *credential* was rejected, as opposed to a
+#: timeout, a name-resolution failure, a mount problem, or a guest that is not
+#: up yet. Windows never reveals an account password (§4.2), so this is the only
+#: connect failure that justifies offering to set it again — a generic failure
+#: must never trigger a password reset.
+CREDENTIAL_FAILURE_MARKERS = (
+    "nt_status_logon_failure",
+    "nt_status_wrong_password",
+    "nt_status_account_disabled",
+    "nt_status_account_locked_out",
+    "nt_status_password_expired",
+    "nt_status_password_must_change",
+    "logon failure",
+    "permission denied",
+    "access denied",
+    "bad credentials",
+    "authentication failure",
+)
+
+CREDENTIAL_FAILURE_EXPLANATION = (
+    "The guest reported every part of its setup as correct, but this host could "
+    "not authenticate to the share. Windows never reveals the account password, "
+    "so neither this app nor the guest checks can tell whether the one in the VM "
+    "matches the one this host mounts with — connecting is the only proof, and "
+    "it just failed. Choose “Retry and reset share password…” to set both ends "
+    "from an .env file you pick."
 )
 
 #: D38 busy surfaces: the base wording each long operation shows above its
@@ -183,6 +251,36 @@ class Application(QObject):
         #: absent or different container.
         self._record: firstrun.ProvisioningRecord | None = None
         self._record_state = firstrun.RECORD_ABSENT
+        #: App-driven guest provisioning (D40-D44). `_prov_run_id` is the run
+        #: this app is watching and `_prov_status` its last classified reading;
+        #: everything else is presentation or a one-in-flight guard. The env
+        #: path is held for this process only and never written anywhere (D41).
+        self._prov_run_id = ""
+        self._prov_status: guestprov.Status | None = None
+        self._prov_busy = False          # a probe/stage/secret worker in flight
+        self._prov_polling = False       # exactly one Docker poll worker at a time
+        self._prov_reset_credential = False
+        self._prov_env_path = ""
+        self._prov_secret_sent = False
+        self._prov_note = ""
+        self._prov_warning = ""
+        self._prov_error = ""
+        self._prov_staged_at = 0.0
+        self._prov_phase_since = 0.0
+        self._prov_resume = firstrun.RESUME_NO_RUN
+        #: Set when a converged run's authenticated connect failed for a
+        #: credential-specific reason, which is the only failure that offers a
+        #: password reset (§4.2).
+        self._prov_offer_reset = False
+        #: A reprovision whose success still has to be corroborated by a fresh
+        #: bridge gather before the record may be cleared (D43).
+        self._prov_verify_pending = False
+        self._prov_timer = QTimer(self)
+        self._prov_timer.setInterval(PROVISION_POLL_MS)
+        self._prov_timer.timeout.connect(self._poll_provisioning)
+        self._prov_probe_timer = QTimer(self)
+        self._prov_probe_timer.setSingleShot(True)
+        self._prov_probe_timer.timeout.connect(self._probe_guest_os)
         #: Latching red-incident state for desktop notifications. Only the normal
         #: monitoring state feeds it; every transitional and intentional state
         #: resets it so an expected red never announces itself as a fault.
@@ -200,6 +298,10 @@ class Application(QObject):
         self._window.connect_requested.connect(self._on_connect_requested)
         self._window.env_file_selected.connect(self._on_env_file_selected)
         self._window.discard_record_requested.connect(self._on_discard_record)
+        self._window.provision_requested.connect(self._on_provision_requested)
+        self._window.provision_retry_requested.connect(self._on_provision_retry)
+        self._window.provision_env_selected.connect(self._on_provision_env_selected)
+        self._window.reprovision_requested.connect(self._on_reprovision_requested)
         self._window.diagnostics_facts = self._diagnostic_facts
 
         self._tray: TrayIcon | None = None
@@ -210,6 +312,7 @@ class Application(QObject):
             self._tray.retry_start_requested.connect(self._on_retry_start_requested)
             self._tray.power_off_requested.connect(self._on_power_off_requested)
             self._tray.start_requested.connect(self._on_start_requested)
+            self._tray.reprovision_requested.connect(self._on_reprovision_requested)
             self._tray.show()
             self._window.hide_on_close = True
 
@@ -428,10 +531,22 @@ class Application(QObject):
             record_state = firstrun.classify_record(record, status.state, container_id)
             if record_error:
                 record_state = firstrun.RECORD_MALFORMED
+            # D43: a record naming a guest run is reattached by *matching* its
+            # run ID, and the container's start token is what separates "the
+            # container restarted" from "the watcher is merely quiet". Both are
+            # Docker/`docker exec` work, never CIFS.
+            prov_status: guestprov.Status | None = None
+            resume = firstrun.RESUME_NO_RUN
+            if record is not None and record.guest_run_id and \
+                    record_state == firstrun.RECORD_MATCHES:
+                started_token = firstrun.inspect_container_started_at()
+                prov_status = guestprov.poll(power.docker_runner, record.guest_run_id)
+                resume = firstrun.classify_resume(
+                    record, prov_status, container_started_at=started_token)
             # Keep the classification, not just the plan: it is what decides
             # which power action the controls offer (D30).
             return (status, power.plan_startup(marker, status), marker, bundle,
-                    record, record_state, record_error)
+                    record, record_state, record_error, prov_status, resume)
 
         self.run_async(work,
                        lambda result: self._on_plan(result, token),
@@ -440,7 +555,8 @@ class Application(QObject):
     def _on_plan(self, result, token: int) -> None:
         if not lifecycle.accepts(self._model, token):
             return
-        status, plan, marker, bundle, record, record_state, record_error = result
+        (status, plan, marker, bundle, record, record_state, record_error,
+         prov_status, resume) = result
         self._container_state = status.state
         self._marker_present = marker
         self._bundle = bundle
@@ -452,9 +568,11 @@ class Application(QObject):
         if record_state == firstrun.RECORD_MATCHES:
             self._setup_detail = (
                 "Setup was interrupted while Windows was installing. Nothing on "
-                "the iCloud shares has been read. Continue the guest steps below, "
-                "then choose Check setup and connect.")
+                "the iCloud shares has been read. Carry on below, then choose "
+                "Check setup and connect.")
             self._dispatch(lifecycle.Event.STARTUP_RESUME_PROVISIONING)
+            if record is not None and record.guest_run_id:
+                self._resume_provisioning_run(record, prov_status, resume)
             return
         if record_state == firstrun.RECORD_CONTAINER_GONE:
             self._setup_detail = (
@@ -583,12 +701,14 @@ class Application(QObject):
         else:
             paths = (f"Compose file: {bundle.compose_file}\n"
                      f"Provisioning scripts: {bundle.provision_dir}")
+        manual = ""
         if provisioning:
             title = "Provisioning Windows"
             if self._busy_kind == BUSY_PROVISIONING and self._busy_since is not None:
                 title = (f"Provisioning Windows — "
                          f"{self._elapsed(time.monotonic() - self._busy_since)}")
-            intro = PROVISIONING_INTRO.format(
+            intro = PROVISIONING_INTRO
+            manual = PROVISIONING_MANUAL_STEPS.format(
                 provision=bundle.provision_dir if bundle else "the provision directory",
                 host_command=self._host_setup_command())
         else:
@@ -605,7 +725,10 @@ class Application(QObject):
             show_connect=provisioning,
             detail=self._setup_detail, busy=self._setup_busy,
             show_discard=self._record_state in (firstrun.RECORD_CONTAINER_GONE,
-                                                firstrun.RECORD_DIFFERENT))
+                                                firstrun.RECORD_DIFFERENT),
+            manual=manual, show_provision=provisioning,
+            can_provision=self._can_provision())
+        self._render_provisioning(provisioning)
 
     def _host_setup_command(self) -> str:
         """The host-side command that matches how this GUI was installed."""
@@ -728,6 +851,597 @@ class Application(QObject):
             self._render_setup()
 
         self.run_async(work, done, failed)
+
+    # ----------------------- app-driven guest provisioning (D40-D44, §4.1) --
+    # Two doors lead into a run — **Set up Windows automatically** on the
+    # provisioning screen and **Re-run Windows provisioning…** from monitoring
+    # — and they differ only in the mode the record and the reducer carry (D43).
+    # Everything below is Docker and local files; `lifecycle.py` stays a pure
+    # reducer, so entering and leaving a run is always an event, never a direct
+    # assignment to the phase.
+
+    def _can_provision(self) -> bool:
+        """Whether a *first* run may be started from the provisioning screen."""
+        return (self._model.phase is lifecycle.Phase.PROVISIONING
+                and self._bundle is not None
+                and self._container_state == "running"
+                and not self._prov_busy and not self._prov_run_id)
+
+    def _can_reprovision(self) -> bool:
+        """The one enablement rule for the D35/D40-D44 recovery action.
+
+        Shared by the tray item, the Status-tab button and the skew banner's
+        button, and deliberately open while the bridge protocol is `skewed` or
+        `incompatible`: that gate closes ordinary bridge writes, and this action
+        is exactly what its banner points at. It needs no guest state of its own.
+        """
+        return (self._model.phase is lifecycle.Phase.RUNNING
+                and self._container_state == "running"
+                and not self._prov_busy)
+
+    def _on_provision_requested(self) -> None:
+        """D31's provisioning screen: set the guest up from this app."""
+        if not self._can_provision():
+            return
+        if not self._confirm_provision():
+            return
+        self._dispatch(lifecycle.Event.PROVISION_BEGIN_FIRST_RUN)
+        # A first run establishes the selected credential even when a partly
+        # configured VM already has an account: this app has no way to learn the
+        # existing password, and the operator has just chosen one (D44).
+        self._begin_provisioning_run(reset_share_credential=True)
+
+    def _on_reprovision_requested(self) -> None:
+        """Monitoring's confirmed guest repair — D35's recovery, and the
+        post-feature-update step."""
+        if not self._can_reprovision():
+            return
+        confirmed, reset = self._confirm_reprovision()
+        if not confirmed:
+            return
+        # The reducer quiesces bridge I/O and stops polling for the duration;
+        # the systemd mounts stay mounted, which the confirmation says plainly.
+        self._dispatch(lifecycle.Event.PROVISION_BEGIN_REPROVISION)
+        self._begin_provisioning_run(reset_share_credential=reset)
+
+    def _on_provision_retry(self) -> None:
+        """A fresh run that re-probes everything, rather than resuming.
+
+        Offered after a failure, after a container restart, and instead of
+        silently abandoning a run that may still be live. The mode comes from
+        the **record**, so a retried re-provisioning never becomes a first run.
+        """
+        if self._model.phase is not lifecycle.Phase.PROVISIONING or self._prov_busy:
+            return
+        label = self._retry_label()
+        if not label or not self._confirm_provision_retry(label):
+            return
+        # The old run's inbox content goes before a new trigger can exist; its
+        # status stays, because the record is not cleared yet (D43).
+        self._cleanup_run(self._prov_run_id)
+        mode = (self._record.mode if self._record is not None
+                else self._model.provisioning_mode)
+        reset = self._prov_reset_credential or self._prov_offer_reset
+        self._dispatch(lifecycle.Event.PROVISION_BEGIN_FIRST_RUN
+                       if mode == lifecycle.MODE_FIRST_RUN
+                       else lifecycle.Event.PROVISION_BEGIN_REPROVISION)
+        self._begin_provisioning_run(reset_share_credential=reset)
+
+    def _begin_provisioning_run(self, *, reset_share_credential: bool,
+                                run_id: str = "") -> None:
+        """Start (or re-stage) one run.  Must follow a PROVISION_BEGIN_* event.
+
+        ``run_id`` is supplied only when D43 says to re-stage the run already in
+        the record: nothing acknowledged it, so it cannot have been consumed,
+        and reusing the ID is what keeps one record naming one run.
+        """
+        self._prov_timer.stop()
+        self._prov_probe_timer.stop()
+        self._prov_run_id = run_id
+        self._prov_status = None
+        self._prov_reset_credential = reset_share_credential
+        self._prov_secret_sent = False
+        self._prov_env_path = ""
+        self._prov_offer_reset = False
+        self._prov_error = ""
+        self._prov_warning = ""
+        self._prov_note = ""
+        self._prov_staged_at = 0.0
+        self._prov_phase_since = 0.0
+        self._prov_resume = firstrun.RESUME_NO_RUN
+        # A new run owns the record from here on, so a corroboration still owed
+        # to the previous one must not be allowed to clear it.
+        self._prov_verify_pending = False
+        self._probe_guest_os()
+
+    def _probe_guest_os(self) -> None:
+        """Tell "Windows is still installing" from "the watcher is quiet".
+
+        Two situations whose correct advice is opposite, so the run is not
+        staged until the container is really running *and* Windows itself
+        answers; the probe simply repeats on a timer until both are true.
+        """
+        if self._model.phase is not lifecycle.Phase.PROVISIONING or self._prov_busy:
+            return
+        token = self._model.token
+        self._prov_busy = True
+
+        def work():
+            container = power.inspect_container()
+            if container.state != "running":
+                return container.state, False
+            return container.state, guestprov.guest_os_ready()
+
+        def done(result) -> None:
+            container_state, ready = result
+            self._prov_busy = False
+            if not lifecycle.accepts(self._model, token):
+                return
+            self._container_state = container_state
+            if container_state != "running":
+                self._prov_note = (
+                    "The Windows VM is not running, so nothing can be set up in "
+                    "it yet. Start it from the VM screen, or create it again.")
+                self._prov_probe_timer.start(PROVISION_PROBE_RETRY_MS)
+                self._sync_power_controls()
+                self._render_setup()
+                return
+            if ready:
+                self._prov_note = ""
+                self._stage_run(token)
+                return
+            self._prov_note = PROVISION_WINDOWS_INSTALLING
+            self._prov_probe_timer.start(PROVISION_PROBE_RETRY_MS)
+            self._render_setup()
+
+        def failed(message: str) -> None:
+            self._prov_busy = False
+            if not lifecycle.accepts(self._model, token):
+                return
+            self._prov_note = (f"Could not check whether Windows is up ({message}); "
+                               "trying again shortly.")
+            self._prov_probe_timer.start(PROVISION_PROBE_RETRY_MS)
+            self._render_setup()
+
+        self.run_async(work, done, failed)
+        self._render_setup()
+
+    def _stage_run(self, token: int) -> None:
+        """Record the run, build the channel, stage the payload, write the trigger."""
+        bundle = self._bundle
+        if bundle is None:
+            self._prov_error = ("The provisioning scripts that ship with this app "
+                                "could not be found.")
+            self._dispatch(lifecycle.Event.PROVISION_FAILED, token)
+            return
+        run_id = self._prov_run_id or guestprov.new_run_id()
+        self._prov_run_id = run_id
+        reset = self._prov_reset_credential
+        mode = self._model.provisioning_mode
+        previous = self._record
+        started_at = (previous.started_at if previous is not None
+                      else datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        self._prov_busy = True
+
+        def work():
+            record = firstrun.ProvisioningRecord(
+                started_at=started_at, phase=firstrun.RECORD_PHASE_STAGING,
+                container_id=firstrun.inspect_container_id(), mode=mode,
+                container_started_at=firstrun.inspect_container_started_at(),
+                guest_run_id=run_id, reset_share_credential=reset)
+            # Durable *before* anything can create a trigger: there must be no
+            # window in which a trigger exists with no record naming its run.
+            # It moves to `triggered` only when a matching status proves the
+            # guest saw it (D43, `record_after_status`).
+            firstrun.write_provisioning_record(record)
+            guestprov.ensure_channel()
+            guestprov.stage(bundle, run_id, reset)
+            return record
+
+        def done(record: firstrun.ProvisioningRecord) -> None:
+            self._prov_busy = False
+            if not lifecycle.accepts(self._model, token):
+                return
+            self._record = record
+            self._record_state = firstrun.RECORD_MATCHES
+            self._prov_staged_at = time.monotonic()
+            self._prov_phase_since = self._prov_staged_at
+            self._start_provision_polling()
+
+        def failed(message: str) -> None:
+            self._prov_busy = False
+            if not lifecycle.accepts(self._model, token):
+                return
+            self._prov_error = message
+            self._dispatch(lifecycle.Event.PROVISION_FAILED, token)
+
+        self.run_async(work, done, failed)
+        self._render_setup()
+
+    def _start_provision_polling(self) -> None:
+        self._prov_timer.start()
+        self._poll_provisioning()
+
+    def _poll_provisioning(self) -> None:
+        """One status read every three seconds, one Docker worker at a time."""
+        if self._model.phase is not lifecycle.Phase.PROVISIONING:
+            self._prov_timer.stop()
+            return
+        if self._prov_polling or not self._prov_run_id:
+            return
+        self._prov_polling = True
+        run_id = self._prov_run_id
+        token = self._model.token
+
+        def done(status: guestprov.Status) -> None:
+            self._prov_polling = False
+            if not lifecycle.accepts(self._model, token):
+                return
+            self._on_provision_status(status, token)
+
+        def failed(message: str) -> None:
+            self._prov_polling = False
+            if not lifecycle.accepts(self._model, token):
+                return
+            self._prov_warning = f"Could not read the VM's progress: {message}"
+            self._render_setup()
+
+        self.run_async(lambda: guestprov.poll(power.docker_runner, run_id),
+                       done, failed)
+
+    def _on_provision_status(self, status: guestprov.Status, token: int) -> None:
+        """Apply one classified reading.  The document is untrusted input.
+
+        It can make this surface show a wrong warning; it can never make the app
+        run something, and a status belonging to another run is "no
+        acknowledgement yet" rather than progress (§4.1).
+        """
+        previous = self._prov_status
+        self._prov_status = status
+        now = time.monotonic()
+        if not status.acknowledged:
+            self._prov_warning = status.reason
+            self._render_setup()
+            return
+
+        if previous is None or previous.phase != status.phase:
+            self._prov_phase_since = now
+        self._update_record_from_status(status)
+        self._prov_warning = guestprov.stall_reason(
+            status.phase, phase_elapsed=now - self._prov_phase_since,
+            since_update=max(0.0, time.time() - status.mtime) if status.mtime else 0.0)
+
+        if status.failed:
+            self._prov_timer.stop()
+            self._prov_error = status.error
+            self._cleanup_run(status.run_id)
+            self._dispatch(lifecycle.Event.PROVISION_FAILED, token)
+            return
+        if status.phase == guestprov.PHASE_DONE:
+            self._prov_timer.stop()
+            self._cleanup_run(status.run_id)
+            self._on_provision_done(token)
+            return
+        self._render_setup()
+
+    def _on_provision_done(self, token: int) -> None:
+        reprovision = self._model.provisioning_mode == lifecycle.MODE_REPROVISION
+        if reprovision:
+            # D43: success is not claimed until a fresh gather has seen the
+            # supported protocol and the bundled agent build, so the record
+            # survives until then.
+            self._prov_verify_pending = True
+            self._setup_detail = ""
+        else:
+            self._setup_detail = (
+                "Windows setup finished. Choose “Check setup and connect” to "
+                "mount the shares — that is the first time anything on the "
+                "iCloud mounts is read.")
+        self._dispatch(lifecycle.Event.PROVISION_SUCCEEDED, token)
+        if self._model.phase is not lifecycle.Phase.PROVISIONING:
+            self._reset_provisioning_state()
+
+    def _reset_provisioning_state(self) -> None:
+        """Forget the finished run.  The record is cleared separately."""
+        self._prov_timer.stop()
+        self._prov_probe_timer.stop()
+        self._prov_run_id = ""
+        self._prov_status = None
+        self._prov_secret_sent = False
+        self._prov_env_path = ""
+        self._prov_note = ""
+        self._prov_warning = ""
+        self._prov_error = ""
+        self._prov_offer_reset = False
+        self._prov_staged_at = 0.0
+        self._prov_resume = firstrun.RESUME_NO_RUN
+
+    def _verify_reprovision(self, snapshot: health.Snapshot) -> None:
+        """Corroborate a finished re-provisioning before clearing the record."""
+        if not self._prov_verify_pending:
+            return
+        state = snapshot.compatibility.state
+        if state == bridge.COMPAT_UNKNOWN:
+            return          # no status document yet; keep waiting for an answer
+        self._prov_verify_pending = False
+        if state == bridge.COMPAT_CURRENT:
+            self._clear_provisioning_record()
+            return
+        # Finished, but not with the agent this app ships. The D35 banner says
+        # what is wrong; the record stays, because the transaction did not do
+        # what it set out to do.
+        self._window.show_notice(
+            "Windows provisioning finished, but the guest agent still does not "
+            f"match this app: {snapshot.compatibility.detail}")
+
+    def _on_provision_env_selected(self, path: str) -> None:
+        """Deliver ``SHARE_PASS`` once, at the moment the guest asks for it (D41).
+
+        The value never reaches this method: `guestprov` re-reads the file the
+        operator just chose and streams the bytes into the container over stdin.
+        """
+        status = self._prov_status
+        if not path or not self._prov_run_id or self._prov_busy:
+            return
+        if self._prov_secret_sent:
+            return
+        if status is None or not status.acknowledged or \
+                status.phase != guestprov.PHASE_WAITING_FOR_SECRET:
+            return
+        run_id = self._prov_run_id
+        token = self._model.token
+        self._prov_busy = True
+
+        def done(delivered: bool) -> None:
+            self._prov_busy = False
+            if not lifecycle.accepts(self._model, token):
+                return
+            self._prov_env_path = path
+            self._prov_secret_sent = True
+            self._prov_note = (
+                "The share password was sent to the VM." if delivered else
+                "The VM already had this run's password; nothing was re-sent.")
+            self._render_setup()
+
+        def failed(message: str) -> None:
+            self._prov_busy = False
+            if not lifecycle.accepts(self._model, token):
+                return
+            # Deliberately not the stall warning, which the next poll rewrites:
+            # the guest is still waiting, and this has to stay on screen until
+            # the operator picks a file that works.
+            self._prov_note = f"The share password was not delivered: {message}"
+            self._render_setup()
+
+        self.run_async(lambda: guestprov.deliver_secret(path, run_id), done, failed)
+        self._render_setup()
+
+    def _resume_provisioning_run(self, record: firstrun.ProvisioningRecord,
+                                 status: guestprov.Status | None,
+                                 resume: str) -> None:
+        """Reattach to the run in the record after a restart (D43).
+
+        Every outcome here is no-CIFS: they choose between polling, re-staging
+        and asking, never between mounting and not mounting.
+        """
+        # The reducer is the only way the mode is set, so replay the record's
+        # own mode rather than inheriting the default.
+        self._dispatch(lifecycle.Event.PROVISION_BEGIN_FIRST_RUN
+                       if record.mode == lifecycle.MODE_FIRST_RUN
+                       else lifecycle.Event.PROVISION_BEGIN_REPROVISION)
+        self._prov_run_id = record.guest_run_id
+        self._prov_reset_credential = record.reset_share_credential
+        self._prov_status = status
+        self._prov_resume = resume
+        self._prov_staged_at = time.monotonic()
+        self._prov_phase_since = self._prov_staged_at
+        self._prov_secret_sent = False
+        self._prov_env_path = ""
+        self._prov_error = ""
+        self._prov_warning = ""
+        self._prov_note = ""
+        self._prov_offer_reset = False
+
+        if resume == firstrun.RESUME_FAILED:
+            self._prov_error = (status.error if status is not None else
+                                "the run reported an error")
+            self._setup_detail = ""
+            self._render_setup()
+            return
+        if resume == firstrun.RESUME_DONE:
+            self._setup_detail = (
+                "The Windows setup this app was running finished while it was "
+                "closed. Choose “Check setup and connect” to mount the shares.")
+            self._render_setup()
+            return
+        if resume == firstrun.RESUME_RETRY_STAGE:
+            # Nothing acknowledged this run, so nothing can have consumed it:
+            # re-stage the *same* run ID rather than inventing a second one.
+            self._setup_detail = (
+                "This app was interrupted before the VM was asked to start. "
+                "Asking again now; nothing in the VM has been changed.")
+            self._begin_provisioning_run(
+                reset_share_credential=record.reset_share_credential,
+                run_id=record.guest_run_id)
+            return
+        if resume == firstrun.RESUME_NEEDS_SECRET:
+            self._setup_detail = ""
+            self._start_provision_polling()
+            return
+        if resume == firstrun.RESUME_CONFIRM_NEW_RUN:
+            # The container restarted, so the read-only inbox this run was
+            # staged into is gone. Adopting an uncorrelated status is exactly
+            # what D43 forbids; offer a fresh, idempotent run instead.
+            self._setup_detail = (
+                "The Windows VM restarted while this app was closed, so the "
+                "setup request it was waiting on is gone. Nothing in the VM has "
+                "been changed; start a new run when you are ready.")
+            self._render_setup()
+            return
+        if resume == firstrun.RESUME_POLL_OR_ABANDON:
+            self._setup_detail = (
+                "This app is waiting for the VM to report on the setup it "
+                "started earlier. It may still be working; abandoning the run "
+                "is an explicit choice.")
+        else:
+            self._setup_detail = ""
+        self._start_provision_polling()
+
+    def _update_record_from_status(self, status: guestprov.Status) -> None:
+        """Move the record forward — only from a status that is *ours* (D43)."""
+        record = self._record
+        if record is None:
+            return
+        updated = firstrun.record_after_status(record, status)
+        if updated == record:
+            return
+        self._record = updated
+        try:
+            firstrun.write_provisioning_record(updated)
+        except (backup.BackupError, ValueError):
+            # The run is what matters; a record this app cannot rewrite is a
+            # nuisance on the next launch, not a reason to stop watching now.
+            pass
+
+    def _cleanup_run(self, run_id: str) -> None:
+        """Best-effort removal of a run's inbox content and any secret.
+
+        Never the status: D43 needs the matching terminal document to survive
+        until the record has been cleared. A failure here is not worth a dialog,
+        because the next staging pass empties the inbox anyway.
+        """
+        if not run_id:
+            return
+        self.run_async(lambda: guestprov.cleanup(power.docker_runner, run_id),
+                       lambda _ran: None, lambda _message: None)
+
+    # -------------------------------------------- provisioning presentation --
+
+    def _retry_label(self) -> str:
+        """Which fresh-run action this surface offers, if any."""
+        if self._prov_offer_reset:
+            return "Retry and reset share password…"
+        if self._prov_error:
+            return "Try inspection and repair again"
+        if self._prov_resume == firstrun.RESUME_CONFIRM_NEW_RUN:
+            return "Start a new setup run…"
+        if self._prov_resume == firstrun.RESUME_POLL_OR_ABANDON:
+            return "Abandon and start a new run…"
+        return ""
+
+    def _credential_follow_up(self) -> str:
+        """The host-side command a deliberately changed password needs."""
+        if not self._prov_secret_sent or not self._prov_env_path:
+            return ""
+        return f'sudo icloud-bridge-configure --env-file "{self._prov_env_path}"'
+
+    def _render_provisioning(self, provisioning: bool) -> None:
+        status = self._prov_status
+        if not provisioning or not (self._prov_run_id or self._prov_busy
+                                    or self._prov_note):
+            self._window.update_provisioning(visible=False)
+            return
+        acknowledged = status is not None and status.acknowledged
+        unacknowledged = bool(self._prov_run_id) and not acknowledged
+        waiting_secret = (acknowledged
+                          and status.phase == guestprov.PHASE_WAITING_FOR_SECRET)
+        self._window.update_provisioning(
+            visible=True,
+            phase=(status.phase if status is not None else guestprov.PHASE_ABSENT),
+            detail=(status.detail if acknowledged else ""),
+            elapsed=(self._elapsed(time.monotonic() - self._busy_since)
+                     if self._busy_since is not None else ""),
+            checks=(dict(status.checks) if acknowledged else {}),
+            work=(status.work if acknowledged else ()),
+            reset_credential=self._prov_reset_credential,
+            note=self._prov_note, warning=self._prov_warning,
+            error=self._prov_error,
+            show_bootstrap=(unacknowledged and bool(self._prov_staged_at)
+                            and (time.monotonic() - self._prov_staged_at)
+                            > PROVISION_BOOTSTRAP_HINT_SECONDS),
+            bootstrap=GUEST_BOOTSTRAP_COMMAND, bootstrap_note=GUEST_BOOTSTRAP_NOTE,
+            show_env_button=(waiting_secret and not self._prov_secret_sent),
+            env_reselect=(self._prov_resume == firstrun.RESUME_NEEDS_SECRET
+                          and not self._prov_secret_sent),
+            follow_up=self._credential_follow_up(),
+            retry_label=self._retry_label(), busy=self._prov_busy)
+
+    # ---------------------------------------------- provisioning dialogs --
+
+    def _confirm_provision(self) -> bool:
+        self.show_window()
+        box = QMessageBox(self._window)
+        box.setWindowTitle("Set up Windows?")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("Let this app set the Windows VM up?")
+        box.setInformativeText(
+            "It installs iCloud for Windows, waits while you sign in to iCloud "
+            "on the VM screen, creates the SMB share and installs the bridge "
+            "agent. It inspects the VM first and changes only what does not "
+            "already match.\n\n"
+            "You will be asked to pick your .env file when the VM needs the "
+            "share password; that password is set on the VM's “syncshare” "
+            "account and must match the one this host mounts with.")
+        run = box.addButton("Set up Windows", QMessageBox.ButtonRole.AcceptRole)
+        cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        box.exec()
+        return box.clickedButton() is run
+
+    def _confirm_reprovision(self) -> tuple[bool, bool]:
+        """``(confirmed, reset the share password)`` for a re-provisioning run.
+
+        The reset option is deliberately **unchecked**: the ordinary repair —
+        including D35's agent update — preserves a working share password and
+        never asks for the env file at all (D44).
+        """
+        self.show_window()
+        box = QMessageBox(self._window)
+        box.setWindowTitle("Re-run Windows provisioning?")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("Inspect the Windows VM and repair what no longer matches?")
+        box.setInformativeText(
+            "This app stops reading the bridge while the VM is being repaired, "
+            "and elevated scripts in the VM may change the share, its "
+            "permissions and the bridge agent.\n\n"
+            "/mnt/icloud and /mnt/icloud_bridge stay mounted — this app does not "
+            "unmount them and cannot stop another program from using them. "
+            "Close any files, transfers and shells under /mnt/icloud* before "
+            "continuing.\n\n"
+            "The VM is inspected first and only what has drifted is repaired.")
+        reset = QCheckBox("Reset share password from an env file")
+        reset.setChecked(False)
+        reset.setToolTip(
+            "Leave this off unless the share password itself is wrong: the "
+            "repair otherwise keeps the working password, and never asks for "
+            "your .env file.")
+        box.setCheckBox(reset)
+        run = box.addButton("Re-run provisioning", QMessageBox.ButtonRole.AcceptRole)
+        cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        box.exec()
+        return box.clickedButton() is run, reset.isChecked()
+
+    def _confirm_provision_retry(self, label: str) -> bool:
+        self.show_window()
+        box = QMessageBox(self._window)
+        box.setWindowTitle("Start another setup run?")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(f"{label.rstrip('…')}?")
+        box.setInformativeText(
+            "This starts a completely new run: the VM is inspected again from "
+            "scratch and only what is still wrong is repaired. It does not "
+            "resume after the step that failed."
+            + ("\n\nThe share password will be set again, so you will be asked "
+               "for your .env file." if self._prov_offer_reset else ""))
+        run = box.addButton("Start a new run", QMessageBox.ButtonRole.AcceptRole)
+        cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        box.exec()
+        return box.clickedButton() is run
 
     # ------------------------------------------------------ effect handlers --
     # Each of these does one imperative thing the reducer asked for. They are
@@ -981,14 +1695,42 @@ class Application(QObject):
             # D39: the only automatic clear. Setup is finished when the bridge
             # has actually powered on, not when Compose returned.
             self._clear_provisioning_record()
+            self._reset_provisioning_state()
             self._dispatch(lifecycle.Event.POWER_ON_SUCCEEDED)
             return
         if result.timed_out:
             self._abort_message = result.message
             self._dispatch(lifecycle.Event.POWER_TRANSITION_UNKNOWN)
             return
+        if self._credential_connect_failure(result.message):
+            # The guest converged and this host still could not authenticate:
+            # the one failure Windows cannot diagnose for us (§4.2). Go back to
+            # the provisioning surface — the record is still on disk and this is
+            # still that transaction — and offer to set the password again.
+            self._prov_offer_reset = True
+            self._prov_note = CREDENTIAL_FAILURE_EXPLANATION
+            self._prov_warning = result.message
+            self._setup_detail = ""
+            self._dispatch(lifecycle.Event.STARTUP_RESUME_PROVISIONING)
+            return
         self._start_error = result.message
         self._dispatch(lifecycle.Event.POWER_ON_FAILED)
+
+    def _credential_connect_failure(self, message: str) -> bool:
+        """Whether a failed connect blames the share *credential* specifically.
+
+        Only after a run whose own checklist converged, and only for a message
+        that names an authentication failure: a timeout, a name-resolution
+        problem, a mount failure or a guest that is not ready yet must never
+        trigger an offer to reset a working password.
+        """
+        status = self._prov_status
+        if self._record is None or status is None or not status.acknowledged:
+            return False
+        if status.phase != guestprov.PHASE_DONE:
+            return False
+        lowered = (message or "").lower()
+        return any(marker in lowered for marker in CREDENTIAL_FAILURE_MARKERS)
 
     def _on_start_exception(self, message: str, token: int) -> None:
         if not lifecycle.accepts(self._model, token):
@@ -1005,6 +1747,13 @@ class Application(QObject):
         self._window.set_power_action(action)
         if self._tray is not None:
             self._tray.set_power_action(action)
+        # D35's recovery is not a power action and does not follow that table:
+        # it stays available exactly while a run could start, including while
+        # the bridge protocol is skewed or incompatible.
+        available = self._can_reprovision()
+        self._window.set_reprovision_available(available)
+        if self._tray is not None:
+            self._tray.set_reprovision_available(available)
 
     def _classify_container(self) -> None:
         """Refresh the Docker classification behind the power controls.
@@ -1108,9 +1857,20 @@ class Application(QObject):
                 self._dispatch(lifecycle.Event.QUIT_CONFIRMED_GUI_ONLY)
             return
         if kind == lifecycle.QUIT_NOTHING_MOUNTED:
-            # Nothing is mounted, and a half-installed Windows guest must not be
-            # torn down by quitting the app that is guiding the install (D31).
+            # A half-installed Windows guest must not be torn down by quitting
+            # the app that is guiding the install (D31), and neither must one
+            # whose share and agent are being rewritten. The token is the same
+            # in both provisioning modes, but the *wording* cannot be: during a
+            # re-provisioning the shares really are still mounted (D43).
+            reprovisioning = (self._model.phase is lifecycle.Phase.PROVISIONING
+                              and self._model.provisioning_mode
+                              == lifecycle.MODE_REPROVISION)
             if self._confirm_simple_quit(
+                    "The Windows VM is being repaired, so this app will not "
+                    "disconnect anything. /mnt/icloud and /mnt/icloud_bridge "
+                    "stay mounted and the VM keeps working; start this app "
+                    "again to see how the run ended."
+                    if reprovisioning else
                     "Setup is not finished, so there is nothing mounted to "
                     "disconnect. Any VM that has already been created keeps "
                     "running; start this app again to continue."):
@@ -1282,6 +2042,10 @@ class Application(QObject):
             self._force_pending = False
             return
         self._window.apply_snapshot(snapshot)
+        # D43: a re-provisioning is finished when a *fresh* gather has seen the
+        # supported protocol and the bundled agent build — not when the guest
+        # said `done`.
+        self._verify_reprovision(snapshot)
         if self._tray is not None:
             self._tray.update_state(snapshot.overall, snapshot.checks)
         self._announce(snapshot.overall, snapshot.checks)

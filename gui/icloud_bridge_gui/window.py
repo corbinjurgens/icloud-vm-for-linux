@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import (__version__, backup, bridge, diagnostics, filtering, firstrun,
-               health, listing, power, sizes)
+               guestprov, health, listing, power, sizes)
 from .tray import VM_VIEWER_URL, open_externally
 
 ROLE_PATH = Qt.ItemDataRole.UserRole
@@ -44,6 +44,146 @@ SETUP_COLORS = {
     firstrun.WARN: DOT_COLORS[health.YELLOW],
     firstrun.FAIL: DOT_COLORS[health.RED],
 }
+
+# ------------------------- app-driven guest provisioning (D40-D44, §4.1/§4.2) --
+# Every word and colour below is this app's own.  The guest supplies a state
+# name from a closed enum, a work ID from a closed enum, and one bounded human
+# line; it never supplies a label, never picks an icon, and never decides what
+# code runs.  `detail` is displayed and nothing else.
+
+#: The fixed checklist of §4.2, keyed exactly as `guestprov.CHECK_KEYS`.
+PROVISION_CHECK_NAMES = {
+    "icloudPackage": "iCloud for Windows",
+    "syncRoot": "iCloud Drive folder",
+    "shareAccount": "Share account",
+    "shareCredential": "Share password",
+    "dataShare": "iCloud share",
+    "bridgeBoundary": "Bridge share and permissions",
+    "agentInstall": "Bridge agent files",
+    "agentRuntime": "Bridge agent running",
+}
+
+#: The fixed work IDs of §4.1.
+PROVISION_WORK_NAMES = {
+    "install-icloud": "Install iCloud for Windows",
+    "wait-for-signin": "Wait for you to sign in to iCloud",
+    "create-share-account": "Create the share account",
+    "reset-share-credential": "Set the share password",
+    "repair-data-share": "Repair the iCloud share",
+    "repair-bridge-boundary": "Repair the bridge share and permissions",
+    "update-agent": "Update bridge agent",
+}
+
+#: Which work item owns each check, so a row can say what is planned for it.
+PROVISION_CHECK_WORK = {
+    "icloudPackage": "install-icloud",
+    "syncRoot": "wait-for-signin",
+    "shareAccount": "create-share-account",
+    "shareCredential": "reset-share-credential",
+    "dataShare": "repair-data-share",
+    "bridgeBoundary": "repair-bridge-boundary",
+    "agentInstall": "update-agent",
+    "agentRuntime": "update-agent",
+}
+
+#: Five classes that must be told apart at a glance: ready, work needed,
+#: waiting for the operator, blocked, and the credential — which is
+#: `unverifiable` by construction and must never look like a green claim
+#: (§4.2).  Monochrome glyphs as well as colour, so the distinction survives a
+#: colour-blind reader and a monochrome screenshot.
+PROVISION_READY = "ready"
+PROVISION_WORK = "work"
+PROVISION_WAIT = "wait"
+PROVISION_BLOCKED = "blocked"
+PROVISION_CREDENTIAL = "credential"
+PROVISION_PENDING = "pending"
+
+PROVISION_GLYPHS = {
+    PROVISION_READY: "●",
+    PROVISION_WORK: "▲",
+    PROVISION_WAIT: "▶",
+    PROVISION_BLOCKED: "■",
+    PROVISION_CREDENTIAL: "◆",
+    PROVISION_PENDING: "○",
+}
+PROVISION_COLORS = {
+    PROVISION_READY: DOT_COLORS[health.GREEN],
+    PROVISION_WORK: DOT_COLORS[health.YELLOW],
+    PROVISION_WAIT: LINK_COLOR,
+    PROVISION_BLOCKED: DOT_COLORS[health.RED],
+    # Deliberately neither green nor red: Windows cannot read a password back,
+    # so this row is never a verdict on whether the password is right.
+    PROVISION_CREDENTIAL: "#6a3fa0",
+    PROVISION_PENDING: "#8b8e91",
+}
+
+#: What each phase means, in this app's words.  Includes the three host-side
+#: classifications `guestprov` returns instead of a guest phase.
+PROVISION_PHASE_TEXT = {
+    guestprov.PHASE_STAGING: "Copying the provisioning scripts into the VM",
+    guestprov.PHASE_INSPECTING: "Checking what the VM already has",
+    guestprov.PHASE_INSTALLING_ICLOUD: "Installing iCloud for Windows",
+    guestprov.PHASE_LAUNCHING_ICLOUD: "Starting iCloud for Windows",
+    guestprov.PHASE_WAITING_FOR_SIGNIN: "Waiting for you to sign in to iCloud",
+    guestprov.PHASE_WAITING_FOR_SECRET: "Waiting for the share password",
+    guestprov.PHASE_CREATING_SHARE: "Creating the iCloud share",
+    guestprov.PHASE_INSTALLING_BRIDGE_BOUNDARY:
+        "Setting up the bridge share and permissions",
+    guestprov.PHASE_INSTALLING_AGENT: "Installing the bridge agent",
+    guestprov.PHASE_VERIFYING: "Checking the result",
+    guestprov.PHASE_DONE: "Windows setup finished",
+    guestprov.PHASE_ABSENT: "Waiting for the VM to pick up this request",
+    guestprov.PHASE_STALE: "Waiting for the VM to pick up this request",
+    guestprov.PHASE_UNREADABLE: "The VM's progress report could not be read",
+}
+
+#: The administrator-only copy the orchestrator keeps for a diagnosed failure
+#: (D42).  It is never an execution source for the app and never `C:\\OEM`.
+PROVISION_FALLBACK_DIR = r"C:\ProgramData\icloud-bridge-provision\current"
+#: The protected manual fallback for the component that failed, by phase.
+PROVISION_FALLBACK_SCRIPTS = {
+    guestprov.PHASE_WAITING_FOR_SECRET: "03-create-share.ps1",
+    guestprov.PHASE_CREATING_SHARE: "03-create-share.ps1",
+    guestprov.PHASE_INSTALLING_BRIDGE_BOUNDARY: "04-bridge-agent.ps1 -Scope Boundary",
+    guestprov.PHASE_INSTALLING_AGENT: "04-bridge-agent.ps1 -Scope Agent",
+    guestprov.PHASE_VERIFYING: "04-bridge-agent.ps1 -Scope All",
+}
+PROVISION_FALLBACK_NOTES = {
+    guestprov.PHASE_INSTALLING_ICLOUD:
+        "Manual fallback: in the VM, install “iCloud” from the Microsoft Store "
+        "yourself, then try the inspection again.",
+    guestprov.PHASE_LAUNCHING_ICLOUD:
+        "Manual fallback: in the VM, start iCloud for Windows yourself, then try "
+        "the inspection again.",
+    guestprov.PHASE_WAITING_FOR_SIGNIN:
+        "Manual fallback: open the VM screen and sign in to iCloud, leaving "
+        "iCloud Drive and Files On-Demand switched on.",
+    guestprov.PHASE_INSPECTING:
+        "Nothing in the VM was changed. Open the VM screen to look at the item "
+        "above, then try the inspection again.",
+}
+
+PROVISION_SIGNIN_CARD = (
+    "Sign in to iCloud in the VM now. Open the VM screen, sign in with your "
+    "Apple ID (including two-factor authentication), and leave iCloud Drive and "
+    "Files On-Demand switched on. This app carries on by itself as soon as the "
+    "iCloud Drive folder appears — there is nothing to click here."
+)
+PROVISION_SECRET_CARD = (
+    "The VM is waiting for the share password. Choose the .env file holding "
+    "SHARE_PASS; its value is sent straight into the VM and is never stored, "
+    "logged, or shown by this app.\n"
+    "This sets the guest “syncshare” account password, which must match the "
+    "credentials this host mounts with. This app cannot read "
+    "/etc/credentials-icloud (it is root-only), so if you are deliberately "
+    "choosing a different password, run the command shown afterwards to update "
+    "the host as well."
+)
+PROVISION_SECRET_RESELECT = (
+    "This app never stores the path of your .env file, or anything in it, so "
+    "after a restart it has to be selected again. The password itself is "
+    "re-sent, not recovered."
+)
 
 EXCLUDE_WARNING = (
     "These items will disappear from /mnt/icloud on this computer. Windows will "
@@ -137,6 +277,14 @@ class MainWindow(QMainWindow):
     #: D39: forget an interrupted-provisioning record Docker has disproved.
     discard_record_requested = Signal()
     env_file_selected = Signal(str)
+    #: D40-D44 app-driven guest provisioning. `reprovision_requested` has three
+    #: emitters — the Status-tab button, the skew/incompatible banner's button
+    #: and the tray menu — because D35 asks for one action with one set of
+    #: enablement rules, not one implementation per surface.
+    provision_requested = Signal()
+    provision_retry_requested = Signal()
+    provision_env_selected = Signal(str)
+    reprovision_requested = Signal()
 
     def __init__(self, run_async: Callable[..., None]) -> None:
         super().__init__()
@@ -229,13 +377,28 @@ class MainWindow(QMainWindow):
         # The D35 protocol/agent-build banner. Its own widget for the same
         # reason as the notice: skew persists across snapshots and must survive
         # whatever the lifecycle banner is currently saying. Selectable so the
-        # operator can copy the recovery command out of it.
+        # operator can copy the diagnostic out of it.
+        self._protocol_box = QWidget()
+        protocol_layout = QVBoxLayout(self._protocol_box)
+        protocol_layout.setContentsMargins(0, 0, 0, 0)
+        protocol_layout.setSpacing(2)
         self._protocol = QLabel("")
         self._protocol.setWordWrap(True)
         self._protocol.setContentsMargins(10, 6, 10, 6)
         self._protocol.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self._protocol.hide()
-        central_layout.addWidget(self._protocol)
+        protocol_layout.addWidget(self._protocol)
+        # D35's recovery is one confirmed action, not a copyable instruction and
+        # not a different code path per state: this button, the Status-tab
+        # button and the tray item all emit the same signal.
+        banner_buttons = QHBoxLayout()
+        banner_buttons.setContentsMargins(10, 0, 10, 6)
+        self._protocol_button = QPushButton("Re-run Windows provisioning…")
+        self._protocol_button.clicked.connect(self.reprovision_requested.emit)
+        banner_buttons.addWidget(self._protocol_button)
+        banner_buttons.addStretch(1)
+        protocol_layout.addLayout(banner_buttons)
+        self._protocol_box.hide()
+        central_layout.addWidget(self._protocol_box)
 
         self._tabs = QTabWidget()
         self._tabs.addTab(self._build_status_tab(), "Status")
@@ -298,6 +461,18 @@ class MainWindow(QMainWindow):
         self._setup_checks_layout.setSpacing(4)
         layout.addWidget(self._setup_checks)
 
+        layout.addWidget(self._build_provisioning_box())
+
+        # The manual guest sequence the provisioning state has always shown. The
+        # app now drives that sequence itself, so it collapses behind a toggle
+        # rather than disappearing: an unusual VM must never become a dead end.
+        self._setup_manual_text = QLabel("")
+        self._setup_manual_text.setWordWrap(True)
+        self._setup_manual_text.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._setup_manual_text.hide()
+        layout.addWidget(self._setup_manual_text)
+
         self._setup_detail = QLabel("")
         self._setup_detail.setWordWrap(True)
         self._setup_detail.setTextInteractionFlags(
@@ -315,6 +490,16 @@ class MainWindow(QMainWindow):
         self._setup_create.clicked.connect(self.create_vm_requested.emit)
         self._setup_create.setEnabled(False)
         buttons.addWidget(self._setup_create)
+        # D40-D44: the confirmed first run. It stages this app's own scripts and
+        # watches their effects; the only step left inside the VM is the Apple
+        # sign-in.
+        self._setup_provision = QPushButton("Set up Windows automatically")
+        self._setup_provision.setToolTip(
+            "Install iCloud for Windows, wait while you sign in, create the SMB "
+            "share and install the bridge agent.")
+        self._setup_provision.clicked.connect(self.provision_requested.emit)
+        self._setup_provision.hide()
+        buttons.addWidget(self._setup_provision)
         setup_vm = QPushButton("Open VM screen")
         setup_vm.clicked.connect(lambda: open_externally(VM_VIEWER_URL))
         buttons.addWidget(setup_vm)
@@ -332,9 +517,318 @@ class MainWindow(QMainWindow):
         self._setup_discard.clicked.connect(self.discard_record_requested.emit)
         self._setup_discard.hide()
         buttons.addWidget(self._setup_discard)
+        self._setup_manual = QPushButton("Show manual steps")
+        self._setup_manual.setCheckable(True)
+        self._setup_manual.setToolTip(
+            "The documented sequence you can run in the VM yourself, if you "
+            "would rather not let the app do it.")
+        self._setup_manual.toggled.connect(self._toggle_manual_steps)
+        self._setup_manual.hide()
+        buttons.addWidget(self._setup_manual)
         buttons.addStretch(1)
         layout.addLayout(buttons)
         return page
+
+    def _toggle_manual_steps(self, shown: bool) -> None:
+        self._setup_manual.setText("Hide manual steps" if shown
+                                   else "Show manual steps")
+        self._setup_manual_text.setVisible(shown and bool(
+            self._setup_manual_text.text()))
+
+    # ------------------------------------- the provisioning run (D40-D44) --
+
+    def _build_provisioning_box(self) -> QWidget:
+        """The run surface: busy line, instruction card, plan, and checklist."""
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 6, 0, 0)
+        layout.setSpacing(4)
+
+        # D38 conventions: the phase and its elapsed time, never a percentage,
+        # never an estimate, and no control that would interrupt the guest run.
+        self._prov_busy_label = QLabel("")
+        self._prov_busy_label.setWordWrap(True)
+        font = self._prov_busy_label.font()
+        font.setBold(True)
+        self._prov_busy_label.setFont(font)
+        layout.addWidget(self._prov_busy_label)
+
+        self._prov_note = QLabel("")
+        self._prov_note.setWordWrap(True)
+        self._prov_note.hide()
+        layout.addWidget(self._prov_note)
+
+        self._prov_instruction = QLabel("")
+        self._prov_instruction.setWordWrap(True)
+        self._prov_instruction.setContentsMargins(10, 6, 10, 6)
+        self._prov_instruction.setStyleSheet(
+            f"background: #eef4fb; color: {PROVISION_COLORS[PROVISION_WAIT]};")
+        self._prov_instruction.hide()
+        layout.addWidget(self._prov_instruction)
+
+        self._prov_work_label = QLabel("")
+        self._prov_work_label.setWordWrap(True)
+        self._prov_work_label.hide()
+        layout.addWidget(self._prov_work_label)
+
+        self._prov_rows = QWidget()
+        self._prov_rows_layout = QVBoxLayout(self._prov_rows)
+        self._prov_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._prov_rows_layout.setSpacing(2)
+        layout.addWidget(self._prov_rows)
+
+        self._prov_warning = QLabel("")
+        self._prov_warning.setWordWrap(True)
+        self._prov_warning.setStyleSheet(f"color: {DOT_COLORS[health.YELLOW]};")
+        self._prov_warning.hide()
+        layout.addWidget(self._prov_warning)
+
+        self._prov_error = QLabel("")
+        self._prov_error.setWordWrap(True)
+        self._prov_error.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._prov_error.setStyleSheet(f"color: {DOT_COLORS[health.RED]};")
+        self._prov_error.hide()
+        layout.addWidget(self._prov_error)
+
+        # Three copyable one-liners, each in the Setup tab's existing command
+        # row style: the one-time guest bootstrap, the protected manual fallback
+        # for a failed component, and the host-side credential follow-up.
+        self._prov_bootstrap = self._build_command_row(layout)
+        self._prov_fallback = self._build_command_row(layout)
+        self._prov_follow_up = self._build_command_row(layout)
+
+        row = QHBoxLayout()
+        self._prov_env_button = QPushButton("Choose .env file for the password…")
+        self._prov_env_button.clicked.connect(self._choose_provision_env)
+        self._prov_env_button.hide()
+        row.addWidget(self._prov_env_button)
+        self._prov_retry_button = QPushButton("Try inspection and repair again")
+        self._prov_retry_button.clicked.connect(
+            self.provision_retry_requested.emit)
+        self._prov_retry_button.hide()
+        row.addWidget(self._prov_retry_button)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        self._prov_box = box
+        box.hide()
+        return box
+
+    @staticmethod
+    def _build_command_row(layout) -> tuple[QLabel, QLabel]:
+        """A note plus the monospace command it explains; both start hidden."""
+        note = QLabel("")
+        note.setWordWrap(True)
+        note.hide()
+        layout.addWidget(note)
+        command = QLabel("")
+        command.setContentsMargins(16, 0, 0, 0)
+        command.setStyleSheet("font-family: monospace;")
+        command.setWordWrap(True)
+        command.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        command.setToolTip("Select and copy this — the GUI never runs it for you")
+        command.hide()
+        layout.addWidget(command)
+        return note, command
+
+    @staticmethod
+    def _set_command_row(row: tuple[QLabel, QLabel], note: str, command: str) -> None:
+        note_label, command_label = row
+        note_label.setText(note)
+        note_label.setVisible(bool(note))
+        command_label.setText(command)
+        command_label.setVisible(bool(command))
+
+    def _choose_provision_env(self) -> None:
+        """Pick the env file whose ``SHARE_PASS`` the VM is waiting for (D41).
+
+        A selection made in *this* process, every time: the path is never
+        persisted, so there is nothing to recover after a restart.
+        """
+        start = (os.path.dirname(self._env_path) if self._env_path
+                 else os.path.expanduser("~"))
+        chosen, _filter = QFileDialog.getOpenFileName(
+            self, "Choose the .env file holding SHARE_PASS", start,
+            "Environment files (.env *.env);;All files (*)")
+        if chosen:
+            self.provision_env_selected.emit(chosen)
+
+    def update_provisioning(self, *, visible: bool, phase: str = "",
+                            detail: str = "", elapsed: str = "",
+                            checks: dict | None = None, work=(),
+                            reset_credential: bool = False,
+                            note: str = "", warning: str = "", error: str = "",
+                            show_bootstrap: bool = False, bootstrap: str = "",
+                            bootstrap_note: str = "",
+                            show_env_button: bool = False,
+                            env_reselect: bool = False, follow_up: str = "",
+                            retry_label: str = "", busy: bool = False) -> None:
+        """Render one reading of a provisioning run.  Presentation only.
+
+        ``phase`` is the *host's* classification from :class:`guestprov.Status`,
+        so it is either a real guest phase or one of the absent/unreadable/stale
+        markers; ``detail`` is the guest's own bounded line and is displayed,
+        never parsed.
+        """
+        self._prov_box.setVisible(visible)
+        if not visible:
+            return
+
+        title = PROVISION_PHASE_TEXT.get(phase, "Setting up Windows")
+        if elapsed:
+            title = f"{title} — {elapsed}"
+        # The guest's own one-line `detail` rides along as text and nothing
+        # else: it is untrusted output from a guest-writable file (§4.1).
+        self._prov_busy_label.setText(f"{title}\n{detail}" if detail else title)
+
+        self._prov_note.setText(note)
+        self._prov_note.setVisible(bool(note))
+
+        instruction = ""
+        if phase == guestprov.PHASE_WAITING_FOR_SIGNIN:
+            instruction = PROVISION_SIGNIN_CARD
+        elif phase == guestprov.PHASE_WAITING_FOR_SECRET:
+            instruction = PROVISION_SECRET_CARD
+            if env_reselect:
+                instruction = f"{instruction}\n{PROVISION_SECRET_RESELECT}"
+        self._prov_instruction.setText(instruction)
+        self._prov_instruction.setVisible(bool(instruction))
+
+        planned = [PROVISION_WORK_NAMES[item] for item in work
+                   if item in PROVISION_WORK_NAMES]
+        if planned:
+            self._prov_work_label.setText("Planned: " + "; ".join(planned))
+        elif checks and phase not in (guestprov.PHASE_STAGING,
+                                      guestprov.PHASE_INSPECTING):
+            self._prov_work_label.setText("Planned: nothing — every part of the "
+                                          "VM already matches this app.")
+        else:
+            self._prov_work_label.setText("")
+        self._prov_work_label.setVisible(bool(self._prov_work_label.text()))
+
+        while self._prov_rows_layout.count():
+            item = self._prov_rows_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        for key in guestprov.CHECK_KEYS:
+            state = (checks or {}).get(key)
+            if state is None:
+                continue
+            kind, text = self._provision_row_text(
+                key, state, planned=tuple(work), phase=phase,
+                reset_credential=reset_credential)
+            self._prov_rows_layout.addWidget(
+                self._build_provision_row(PROVISION_CHECK_NAMES[key], kind, text))
+
+        self._prov_warning.setText(warning)
+        self._prov_warning.setVisible(bool(warning))
+
+        if error:
+            # Name the failing phase when the guest reached one; a run that fell
+            # over before any status arrived has no phase to blame.
+            self._prov_error.setText(
+                f"{PROVISION_PHASE_TEXT[phase]} failed: {error}"
+                if phase in guestprov.PHASES else
+                f"Windows setup could not continue: {error}")
+            self._prov_error.show()
+            script = PROVISION_FALLBACK_SCRIPTS.get(phase, "")
+            if script:
+                self._set_command_row(
+                    self._prov_fallback,
+                    "Manual fallback: run this in an elevated PowerShell inside "
+                    "the VM. It is the protected copy of the script this run "
+                    "used.",
+                    "powershell -ExecutionPolicy Bypass -NoProfile -File "
+                    f"{PROVISION_FALLBACK_DIR}\\{script}")
+            else:
+                self._set_command_row(
+                    self._prov_fallback,
+                    PROVISION_FALLBACK_NOTES.get(phase, ""), "")
+        else:
+            self._prov_error.hide()
+            self._set_command_row(self._prov_fallback, "", "")
+
+        self._set_command_row(self._prov_bootstrap,
+                              bootstrap_note if show_bootstrap else "",
+                              bootstrap if show_bootstrap else "")
+        self._set_command_row(
+            self._prov_follow_up,
+            ("If that password differs from the one this host mounts with, run "
+             "this on this computer too — the GUI cannot read the root-only "
+             "/etc/credentials-icloud and has not changed it." if follow_up
+             else ""),
+            follow_up)
+
+        self._prov_env_button.setVisible(show_env_button)
+        self._prov_env_button.setEnabled(not busy)
+        self._prov_retry_button.setVisible(bool(retry_label))
+        self._prov_retry_button.setEnabled(not busy)
+        if retry_label:
+            self._prov_retry_button.setText(retry_label)
+
+    @staticmethod
+    def _provision_row_text(key: str, state: str, *, planned: tuple,
+                            phase: str, reset_credential: bool) -> tuple[str, str]:
+        """``(class, text)`` for one checklist row — all locally owned.
+
+        The password row is special by design (§4.2): Windows cannot read an
+        account password back, so it is always `unverifiable` and this app says
+        only whether the run reset it or preserved it.  It never renders green.
+        """
+        work = PROVISION_CHECK_WORK.get(key, "")
+        work_name = PROVISION_WORK_NAMES.get(work, "")
+        if state == "blocked":
+            return PROVISION_BLOCKED, "needs attention — nothing was changed"
+        if state == "unknown":
+            return PROVISION_BLOCKED, "could not be determined — nothing was changed"
+        if key == "shareCredential":
+            if state == "pending":
+                # Before the inspection has run, the honest thing to report is
+                # the *intent* — saying "reset during this run" of a run that
+                # has not touched the account yet would be a claim about the
+                # future.
+                return PROVISION_CREDENTIAL, (
+                    "will be set from the .env file you choose" if reset_credential
+                    else "will be left exactly as it is")
+            if reset_credential:
+                return PROVISION_CREDENTIAL, (
+                    "reset during this run — Windows never reveals a password, "
+                    "so this app cannot confirm it; connecting is the proof")
+            return PROVISION_CREDENTIAL, (
+                "preserved — Windows never reveals a password, so this app "
+                "cannot confirm it; connecting is the proof")
+        if state == "ok":
+            return PROVISION_READY, "ready"
+        if state == "pending":
+            return PROVISION_PENDING, "not checked yet"
+        if state == "unverifiable":
+            return PROVISION_CREDENTIAL, "cannot be verified from here"
+        if phase == guestprov.PHASE_WAITING_FOR_SIGNIN and work == "wait-for-signin":
+            return PROVISION_WAIT, "waiting for you — sign in on the VM screen"
+        if work in planned and work_name:
+            prefix = "missing" if state == "missing" else "needs repair"
+            return PROVISION_WORK, f"{prefix} — {work_name.lower()}"
+        return PROVISION_WORK, ("missing" if state == "missing" else "needs repair")
+
+    def _build_provision_row(self, name: str, kind: str, text: str) -> QWidget:
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        dot = QLabel(PROVISION_GLYPHS[kind])
+        dot.setFixedWidth(16)
+        dot.setStyleSheet(f"color: {PROVISION_COLORS[kind]};")
+        title = QLabel(name)
+        title.setMinimumWidth(170)
+        title.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        detail = QLabel(text)
+        detail.setWordWrap(True)
+        detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        row_layout.addWidget(dot)
+        row_layout.addWidget(title)
+        row_layout.addWidget(detail, 1)
+        return row
 
     def _choose_env_file(self) -> None:
         start = os.path.dirname(self._env_path) if self._env_path else os.path.expanduser("~")
@@ -357,7 +851,9 @@ class MainWindow(QMainWindow):
     def update_setup(self, *, title: str, intro: str, checks, paths: str,
                      env_path: str, can_create: bool, show_connect: bool,
                      detail: str = "", busy: bool = False,
-                     show_discard: bool = False) -> None:
+                     show_discard: bool = False, manual: str = "",
+                     show_provision: bool = False,
+                     can_provision: bool = False) -> None:
         """Render one assistant state.  Pure presentation of firstrun's answers."""
         self._env_path = env_path
         self._setup_title.setText(title)
@@ -365,6 +861,14 @@ class MainWindow(QMainWindow):
         self._setup_paths.setText(paths)
         self._env_label.setText(f"Configuration file: {env_path or '(none selected)'}")
         self._setup_create.setEnabled(can_create and not busy)
+        self._setup_provision.setVisible(show_provision)
+        self._setup_provision.setEnabled(can_provision and not busy)
+        self._setup_manual_text.setText(manual)
+        self._setup_manual.setVisible(bool(manual))
+        if not manual:
+            self._setup_manual.setChecked(False)
+        self._setup_manual_text.setVisible(bool(manual)
+                                           and self._setup_manual.isChecked())
         self._setup_recheck.setEnabled(not busy)
         self._setup_connect.setVisible(show_connect)
         self._setup_connect.setEnabled(not busy)
@@ -530,6 +1034,17 @@ class MainWindow(QMainWindow):
         self._power_button.clicked.connect(self._on_power_button)
         self._power_button.hide()
         buttons.addWidget(self._power_button)
+        # D35/D40-D44: the same confirmed action the tray item and the skew
+        # banner's button invoke. Deliberately available while the protocol is
+        # skewed or incompatible — that gate closes ordinary bridge writes, and
+        # this is what its banner points at.
+        self._reprovision_button = QPushButton("Re-run Windows provisioning…")
+        self._reprovision_button.setToolTip(
+            "Inspect the Windows VM and repair only what no longer matches this "
+            "app: the iCloud share, its permissions, and the bridge agent.")
+        self._reprovision_button.clicked.connect(self.reprovision_requested.emit)
+        self._reprovision_button.hide()
+        buttons.addWidget(self._reprovision_button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
 
@@ -719,13 +1234,13 @@ class MainWindow(QMainWindow):
             self._protocol.setText(
                 "The guest agent is not speaking this app's bridge protocol, so "
                 "nothing will be written to it.\n"
-                f"{compatibility.detail}")
+                f"{compatibility.detail} {bridge.UPDATE_AGENT_INSTRUCTION}")
         else:
-            self._protocol.hide()
+            self._protocol_box.hide()
             self._update_buttons()
             return
         self._protocol.setStyleSheet(self.PROTOCOL_STYLES[compatibility.state])
-        self._protocol.show()
+        self._protocol_box.show()
         self._update_buttons()
 
     def _refuse_incompatible(self) -> bool:
@@ -758,6 +1273,18 @@ class MainWindow(QMainWindow):
             "Unmount both shares and power off the Windows VM. This app keeps running."
             if action == power.ACTION_POWER_OFF else "")
         self._power_button.show()
+
+    def set_reprovision_available(self, available: bool) -> None:
+        """Offer (or withdraw) the D35/D40-D44 re-provision action.
+
+        One rule, decided by the controller, applied to both surfaces: the
+        Status-tab button appears only when the action is possible, while the
+        banner's button stays with its banner and is merely disabled — a banner
+        pointing at a control that is not there would be worse than one pointing
+        at a control that is greyed out.
+        """
+        self._reprovision_button.setVisible(available)
+        self._protocol_button.setEnabled(available)
 
     def _on_power_button(self) -> None:
         if self._power_action == power.ACTION_POWER_OFF:

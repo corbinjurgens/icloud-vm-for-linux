@@ -37,8 +37,8 @@ from icloud_bridge_gui import __main__ as app_module              # noqa: E402
 from icloud_bridge_gui import window as window_module             # noqa: E402
 
 _RealMessageBox = window_module.QMessageBox
-from icloud_bridge_gui import (backup, bridge, diagnostics, firstrun, health,  # noqa: E402
-                               lifecycle, listing, power)
+from icloud_bridge_gui import (backup, bridge, diagnostics, firstrun,  # noqa: E402
+                               guestprov, health, lifecycle, listing, power)
 
 
 # ------------------------------------------------------------------ fakes --
@@ -85,6 +85,7 @@ class FakeTray:
         self.busy: list[tuple] = []
         self.available: list[bool] = []
         self.actions: list[str] = []
+        self.reprovision: list[bool] = []
         self.states: list[tuple] = []
         self.shown = False
 
@@ -108,6 +109,9 @@ class FakeTray:
 
     def set_power_action(self, action):
         self.actions.append(action)
+
+    def set_reprovision_available(self, available):
+        self.reprovision.append(available)
 
     def update_state(self, overall, checks):
         self.states.append((overall, checks))
@@ -243,6 +247,40 @@ def fakes(monkeypatch, tmp_path):
     #: Docker call: a checkout that happens to have a real `icloud-windows`
     #: container must not change what these tests prove.
     state.container_id = Recorder("abc123")
+    state.container_started_at = Recorder("2026-07-27T09:00:00Z")
+
+    # D40-D44: the whole guest channel is faked. Nothing here may reach Docker,
+    # and no test ever supplies a real password — `deliver_secret` is a
+    # recorder, so the value the module would read is never produced at all.
+    state.run_ids = [f"{n:032x}" for n in range(1, 9)]
+    state.issued_run_ids: list[str] = []
+    state.guest_ready = Recorder(True)
+    state.ensure_channel = Recorder(None)
+    state.stage = Recorder(None)
+    state.deliver_secret = Recorder(True)
+    state.cleanup = Recorder(True)
+    #: What the next `poll` returns. Absent is the honest starting point: the
+    #: guest has not written anything for this run yet.
+    state.status = guestprov.Status(guestprov.PHASE_ABSENT)
+    state.polls: list[str] = []
+
+    def next_run_id() -> str:
+        state.issued_run_ids.append(state.run_ids[len(state.issued_run_ids)])
+        return state.issued_run_ids[-1]
+
+    def fake_poll(runner, run_id):
+        state.polls.append(run_id)
+        return state.status
+
+    monkeypatch.setattr(guestprov, "new_run_id", next_run_id)
+    monkeypatch.setattr(guestprov, "guest_os_ready", state.guest_ready)
+    monkeypatch.setattr(guestprov, "ensure_channel", state.ensure_channel)
+    monkeypatch.setattr(guestprov, "stage", state.stage)
+    monkeypatch.setattr(guestprov, "deliver_secret", state.deliver_secret)
+    monkeypatch.setattr(guestprov, "cleanup", state.cleanup)
+    monkeypatch.setattr(guestprov, "poll", fake_poll)
+    monkeypatch.setattr(firstrun, "inspect_container_started_at",
+                        state.container_started_at)
 
     monkeypatch.setattr(power, "inspect_container", state.inspect)
     monkeypatch.setattr(power, "marker_exists", state.marker)
@@ -260,15 +298,31 @@ def fakes(monkeypatch, tmp_path):
 
     # The modal confirmations: default to "yes, do it", overridable per test.
     state.answers = {"quit": "gui", "simple_quit": True, "power_off": True,
-                     "create_vm": True}
+                     "create_vm": True, "provision": True, "reprovision": True,
+                     "reset_credential": False, "provision_retry": True}
+    #: Every `_confirm_simple_quit` message, so the mode-dependent wording is
+    #: checkable without a modal.
+    state.quit_messages: list[str] = []
     monkeypatch.setattr(app_module.Application, "_ask_quit",
                         lambda self: state.answers["quit"])
-    monkeypatch.setattr(app_module.Application, "_confirm_simple_quit",
-                        lambda self, informative: state.answers["simple_quit"])
+
+    def simple_quit(self, informative):
+        state.quit_messages.append(informative)
+        return state.answers["simple_quit"]
+
+    monkeypatch.setattr(app_module.Application, "_confirm_simple_quit", simple_quit)
     monkeypatch.setattr(app_module.Application, "_confirm_power_off",
                         lambda self: state.answers["power_off"])
     monkeypatch.setattr(app_module.Application, "_confirm_create_vm",
                         lambda self: state.answers["create_vm"])
+    monkeypatch.setattr(app_module.Application, "_confirm_provision",
+                        lambda self: state.answers["provision"])
+    monkeypatch.setattr(
+        app_module.Application, "_confirm_reprovision",
+        lambda self: (state.answers["reprovision"],
+                      state.answers["reset_credential"]))
+    monkeypatch.setattr(app_module.Application, "_confirm_provision_retry",
+                        lambda self, label: state.answers["provision_retry"])
 
     state.quits = []
     monkeypatch.setattr(app_module.Application, "_quit_gui_only",
@@ -317,6 +371,8 @@ def controller(qapp, fakes, request):
     instance = built.get("instance")
     if instance is not None:
         instance._timer.stop()
+        instance._prov_timer.stop()
+        instance._prov_probe_timer.stop()
         if instance._drain_timer is not None:
             instance._drain_timer.stop()
         instance._window.quiesce()
@@ -330,7 +386,7 @@ def controller(qapp, fakes, request):
 def _connectable(tray):
     """Give the fake tray the signal objects the controller connects to."""
     for name in ("show_window_requested", "quit_requested", "retry_start_requested",
-                 "power_off_requested", "start_requested"):
+                 "power_off_requested", "start_requested", "reprovision_requested"):
         setattr(tray, name, _Signalish())
     return tray
 
@@ -1334,3 +1390,630 @@ def test_every_row_mutating_path_bumps_the_row_epoch(controller, fakes):
     before = window._row_epoch
     window._rebuild_tree()
     assert window._row_epoch > before, "_rebuild_tree replaces every row"
+
+
+# --------------------- D40-D44: app-driven guest provisioning (controller) --
+# Everything the guest channel would do is faked, so no test here reaches
+# Docker, a mount, or `sudo`, and no test ever produces a password: the module
+# that would read one is a recorder.
+
+#: The path this app must never send an operator back to for recovery (D42):
+#: `C:\OEM` is whatever the VM was installed with, and is not an execution
+#: source for anything.
+OEM_DIRECTORY = r"C:\OEM"
+
+
+def provision_status(phase, *, run_id=None, checks=None, work=(), error="",
+                     detail=""):
+    """One acknowledged reading of the guest's status, as `poll` classifies it."""
+    states = {key: "ok" for key in guestprov.CHECK_KEYS}
+    states["shareCredential"] = "unverifiable"
+    states.update(checks or {})
+    return guestprov.Status(
+        phase=phase, detail=detail, error=error, acknowledged=True,
+        run_id=run_id or f"{1:032x}", checks=states, work=tuple(work),
+        updated_at="2026-07-27T09:00:00Z", mtime=time.time(),
+        document_phase=phase)
+
+
+def provisioning_controller(controller, fakes, record=None):
+    """A controller on D31's provisioning screen, with a VM already created."""
+    firstrun.write_provisioning_record(record or firstrun.ProvisioningRecord(
+        started_at="2026-07-27T09:00:00Z",
+        phase=firstrun.RECORD_PHASE_PROVISIONING, container_id="abc123"))
+    app = controller()
+    assert pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.PROVISIONING)
+    assert pump(2.0, until=lambda: app._active == 0 and not app._prov_polling)
+    return app, app._window
+
+
+def start_first_run(app, fakes):
+    """Press **Set up Windows automatically** and wait for the trigger."""
+    app._on_provision_requested()
+    assert pump(3.0, until=lambda: fakes.stage.count == 1)
+    assert pump(2.0, until=lambda: not app._prov_polling)
+
+
+def deliver_status(app, fakes, status):
+    """Hand the controller one status reading, as its 3 s poll would.
+
+    Waits for any poll already in flight first: that one captured the *previous*
+    status, and letting it land afterwards would deliver the two out of order.
+    """
+    assert pump(2.0, until=lambda: not app._prov_polling)
+    fakes.status = status
+    before = len(fakes.polls)
+    app._poll_provisioning()
+    assert pump(3.0, until=lambda: len(fakes.polls) > before
+                and not app._prov_polling)
+    pump(0.2)
+
+
+def provision_rows(window):
+    """``{check name: (glyph, text)}`` for the rendered checklist."""
+    rows = {}
+    for index in range(window._prov_rows_layout.count()):
+        row = window._prov_rows_layout.itemAt(index).widget().layout()
+        rows[row.itemAt(1).widget().text()] = (row.itemAt(0).widget().text(),
+                                               row.itemAt(2).widget().text())
+    return rows
+
+
+def recovery_text(app, window) -> str:
+    """Every string this app currently offers as a way out of a broken guest."""
+    labels = [window._protocol, window._sync_error, window._banner,
+              window._setup_intro, window._setup_manual_text,
+              window._setup_detail, window._prov_busy_label, window._prov_note,
+              window._prov_instruction, window._prov_warning, window._prov_error,
+              *window._prov_bootstrap, *window._prov_fallback,
+              *window._prov_follow_up]
+    return "\n".join([bridge.UPDATE_AGENT_INSTRUCTION, bridge.SKEW_BANNER,
+                      app._setup_detail, *(label.text() for label in labels)])
+
+
+def test_no_active_recovery_ui_names_the_oem_directory(controller, fakes):
+    """D35/D42: recovery is this app's own action, never a stale OEM copy."""
+    app, window = provisioning_controller(controller, fakes)
+    start_first_run(app, fakes)
+    window._setup_manual.setChecked(True)           # the manual fallback too
+
+    # An unacknowledged run, which is where the bootstrap hint appears.
+    app._prov_staged_at = (time.monotonic()
+                           - app_module.PROVISION_BOOTSTRAP_HINT_SECONDS - 1)
+    app._render_setup()
+    collected = [recovery_text(app, window)]
+
+    # A failed component, which is where a manual fallback is offered.
+    deliver_status(app, fakes, provision_status(
+        guestprov.PHASE_INSTALLING_AGENT, work=("update-agent",),
+        checks={"agentInstall": "drifted"},
+        error="the bridge agent task did not start"))
+    collected.append(recovery_text(app, window))
+
+    for text in collected:
+        assert OEM_DIRECTORY not in text
+    assert "Re-run Windows provisioning" in bridge.SKEW_BANNER
+    assert window_module.PROVISION_FALLBACK_DIR in window._prov_fallback[1].text()
+
+
+def test_an_incompatible_bridge_keeps_writes_closed_but_offers_re_provisioning(
+        controller, fakes):
+    """D35's gate exempts exactly one action: the one its banner points at."""
+    app, window = running_controller(controller, fakes)
+    window.apply_snapshot(snapshot_with(
+        bridge.Compatibility(bridge.COMPAT_INCOMPATIBLE, None, "version 2")))
+    app._sync_power_controls()
+
+    assert not window._apply_button.isEnabled()
+    assert not window._restore_button.isEnabled()
+    assert not window._can_restore()
+    assert OEM_DIRECTORY not in window._protocol.text()
+    # …while the explicit recovery stays available on every surface.
+    assert not window._reprovision_button.isHidden()
+    assert window._protocol_button.isEnabled()
+    assert app._tray.reprovision[-1] is True
+
+    app._tray.reprovision_requested.emit()
+    assert pump(3.0, until=lambda: fakes.stage.count == 1)
+    assert app._model.phase is lifecycle.Phase.PROVISIONING
+    assert app._model.provisioning_mode == lifecycle.MODE_REPROVISION
+
+
+def test_a_re_provision_quiesces_gui_io_without_unmounting_anything(controller,
+                                                                    fakes):
+    app, window = running_controller(controller, fakes)
+    app._on_reprovision_requested()
+    assert pump(3.0, until=lambda: fakes.stage.count == 1)
+    assert window._io_paused is True
+    assert not app._timer.isActive()
+    assert fakes.power_off.count == 0        # the mounts are deliberately left up
+
+
+def test_an_agent_only_plan_never_asks_for_the_share_password(controller, fakes):
+    """D44: an agent-build mismatch must not reset a working share password."""
+    app, window = running_controller(controller, fakes)
+    fakes.answers["reset_credential"] = False
+    app._on_reprovision_requested()
+    assert pump(3.0, until=lambda: fakes.stage.count == 1)
+    (_bundle, _run_id, reset), _kwargs = fakes.stage.calls[0]
+    assert reset is False
+
+    for phase in (guestprov.PHASE_INSPECTING, guestprov.PHASE_INSTALLING_AGENT,
+                  guestprov.PHASE_VERIFYING):
+        deliver_status(app, fakes, provision_status(
+            phase, work=("update-agent",),
+            checks={"agentInstall": "drifted", "agentRuntime": "drifted"}))
+        assert app._prov_status.phase != guestprov.PHASE_WAITING_FOR_SECRET
+        assert window._prov_env_button.isHidden()
+
+    assert window._prov_work_label.text() == "Planned: Update bridge agent"
+    rows = provision_rows(window)
+    assert rows["Share account"][1] == "ready"
+    assert rows["Share password"][1].startswith("preserved")
+    assert fakes.deliver_secret.count == 0
+
+
+def test_a_missing_account_asks_for_an_env_file_chosen_in_this_process(controller,
+                                                                       fakes):
+    app, window = provisioning_controller(controller, fakes)
+    start_first_run(app, fakes)
+    deliver_status(app, fakes, provision_status(
+        guestprov.PHASE_WAITING_FOR_SECRET,
+        work=("create-share-account", "reset-share-credential"),
+        checks={"shareAccount": "missing"}))
+
+    assert not window._prov_env_button.isHidden()
+    assert "syncshare" in window._prov_instruction.text()
+    assert "/etc/credentials-icloud" in window._prov_instruction.text()
+    assert fakes.deliver_secret.count == 0      # nothing until the operator picks
+
+    app._on_provision_env_selected("/home/tester/.env")
+    assert pump(3.0, until=lambda: fakes.deliver_secret.count == 1)
+    assert fakes.deliver_secret.calls[0][0][0] == "/home/tester/.env"
+    # Delivered once, never twice: replacing a file the orchestrator may be
+    # reading is how a half-written password reaches script 03.
+    app._on_provision_env_selected("/home/tester/.env")
+    pump(0.3)
+    assert fakes.deliver_secret.count == 1
+    assert window._prov_env_button.isHidden()
+    assert app._prov_timer.isActive()           # and polling never stopped
+    assert 'icloud-bridge-configure --env-file "/home/tester/.env"' in \
+        window._prov_follow_up[1].text()
+
+
+def test_an_explicit_password_reset_is_staged_and_said_out_loud(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    fakes.answers["reset_credential"] = True
+    app._on_reprovision_requested()
+    assert pump(3.0, until=lambda: fakes.stage.count == 1)
+    assert fakes.stage.calls[0][0][2] is True
+
+    deliver_status(app, fakes, provision_status(
+        guestprov.PHASE_CREATING_SHARE, work=("reset-share-credential",)))
+    rows = provision_rows(window)
+    assert rows["Share password"][1].startswith("reset during this run")
+
+
+def test_the_share_password_row_is_never_a_green_claim(controller, fakes):
+    """§4.2: Windows never reveals it, so this row can only say what was done."""
+    app, window = provisioning_controller(controller, fakes)
+    start_first_run(app, fakes)
+    deliver_status(app, fakes, provision_status(guestprov.PHASE_DONE))
+    glyph, text = provision_rows(window)["Share password"]
+    ready = window_module.PROVISION_GLYPHS[window_module.PROVISION_READY]
+    assert glyph != ready
+    assert glyph == window_module.PROVISION_GLYPHS[window_module.PROVISION_CREDENTIAL]
+    assert "reset during this run" in text
+    assert "cannot confirm" in text
+    # The rest of a converged checklist still reads as ready.
+    assert provision_rows(window)["Bridge agent running"] == (ready, "ready")
+
+
+def test_residual_drift_after_verifying_is_terminal_with_a_manual_fallback(
+        controller, fakes):
+    app, window = provisioning_controller(controller, fakes)
+    start_first_run(app, fakes)
+    deliver_status(app, fakes, provision_status(
+        guestprov.PHASE_VERIFYING, checks={"dataShare": "drifted"},
+        error="the iCloud share still points at the wrong path"))
+
+    assert not window._prov_error.isHidden()
+    assert "Checking the result failed" in window._prov_error.text()
+    assert "wrong path" in window._prov_error.text()
+    assert not app._prov_timer.isActive()       # terminal: no repair loop
+    assert "04-bridge-agent.ps1 -Scope All" in window._prov_fallback[1].text()
+    # The last trustworthy checklist is still on screen.
+    assert provision_rows(window)["iCloud share"][1].startswith("needs repair")
+    assert window._prov_retry_button.text() == "Try inspection and repair again"
+
+
+def test_a_malformed_status_is_a_warning_and_never_progress(controller, fakes):
+    app, window = provisioning_controller(controller, fakes)
+    start_first_run(app, fakes)
+    deliver_status(app, fakes, guestprov.Status(
+        guestprov.PHASE_UNREADABLE,
+        reason="the guest status does not carry the exact checklist"))
+
+    assert app._model.phase is lifecycle.Phase.PROVISIONING
+    assert app._prov_timer.isActive()           # polling continues
+    assert app._prov_error == ""
+    assert "checklist" in window._prov_warning.text()
+    assert provision_rows(window) == {}         # nothing claimed about the guest
+
+
+def test_a_blocked_check_stops_before_any_change_and_retry_starts_a_new_run(
+        controller, fakes):
+    app, window = provisioning_controller(controller, fakes)
+    start_first_run(app, fakes)
+    deliver_status(app, fakes, provision_status(
+        guestprov.PHASE_INSPECTING, checks={"syncRoot": "blocked"},
+        error="the iCloud Drive path is not a directory"))
+
+    rows = provision_rows(window)
+    assert rows["iCloud Drive folder"][1] == "needs attention — nothing was changed"
+    assert rows["iCloud Drive folder"][0] == \
+        window_module.PROVISION_GLYPHS[window_module.PROVISION_BLOCKED]
+    assert not app._prov_timer.isActive()
+    first_run_ids = list(fakes.issued_run_ids)
+
+    app._on_provision_retry()
+    assert pump(3.0, until=lambda: fakes.stage.count == 2)
+    assert fakes.issued_run_ids != first_run_ids     # a new run, not a resume
+    assert fakes.cleanup.count >= 1                  # the old run's inbox went
+    assert app._model.provisioning_mode == lifecycle.MODE_FIRST_RUN
+
+
+def test_the_record_names_the_run_before_a_trigger_can_exist(controller, fakes,
+                                                              monkeypatch):
+    """D43: no crash window in which a trigger exists with no record."""
+    app, window = provisioning_controller(controller, fakes)
+    seen = {}
+
+    def staging(bundle, run_id, reset):
+        seen["record"] = firstrun.read_provisioning_record()
+        seen["run_id"] = run_id
+
+    monkeypatch.setattr(guestprov, "stage", staging)
+    app._on_provision_requested()
+    assert pump(3.0, until=lambda: "record" in seen)
+
+    record = seen["record"]
+    assert record is not None
+    assert record.guest_run_id == seen["run_id"]
+    assert record.phase == firstrun.RECORD_PHASE_STAGING
+    assert record.mode == lifecycle.MODE_FIRST_RUN
+    assert record.reset_share_credential is True
+
+    # …and only a matching status moves it on.
+    deliver_status(app, fakes, provision_status(guestprov.PHASE_INSPECTING))
+    assert firstrun.read_provisioning_record().phase == \
+        firstrun.RECORD_PHASE_TRIGGERED
+
+
+def test_a_status_for_another_run_never_replaces_the_saved_one(controller, fakes):
+    app, window = provisioning_controller(controller, fakes)
+    start_first_run(app, fakes)
+    saved = firstrun.read_provisioning_record()
+    deliver_status(app, fakes, guestprov.Status(
+        guestprov.PHASE_STALE, run_id=f"{7:032x}",
+        document_phase=guestprov.PHASE_DONE,
+        reason="the guest status belongs to a different run"))
+
+    assert firstrun.read_provisioning_record() == saved
+    assert app._model.phase is lifecycle.Phase.PROVISIONING
+    assert app._prov_timer.isActive()
+
+
+def test_only_one_status_poll_is_ever_in_flight(controller, fakes):
+    app, window = provisioning_controller(controller, fakes)
+    start_first_run(app, fakes)
+    before = len(fakes.polls)
+
+    app._prov_polling = True            # a Docker worker is still running
+    app._poll_provisioning()
+    pump(0.3)
+    assert len(fakes.polls) == before
+
+    app._prov_polling = False
+    app._poll_provisioning()
+    assert pump(2.0, until=lambda: len(fakes.polls) > before)
+
+
+def test_a_vm_that_is_still_installing_is_not_staged_yet(controller, fakes):
+    app, window = provisioning_controller(controller, fakes)
+    fakes.guest_ready.result = False
+
+    app._on_provision_requested()
+    assert pump(2.0, until=lambda: fakes.guest_ready.count == 1)
+    pump(0.3)
+    assert fakes.ensure_channel.count == 0
+    assert fakes.stage.count == 0
+    assert "still installing" in window._prov_note.text()
+    assert app._prov_probe_timer.isActive()
+
+    fakes.guest_ready.result = True
+    app._probe_guest_os()
+    assert pump(3.0, until=lambda: fakes.stage.count == 1)
+
+
+def test_an_unacknowledged_run_offers_the_one_time_bootstrap(controller, fakes):
+    app, window = provisioning_controller(controller, fakes)
+    start_first_run(app, fakes)
+    assert window._prov_bootstrap[1].isHidden()     # 90 s have not passed
+
+    app._prov_staged_at = (time.monotonic()
+                           - app_module.PROVISION_BOOTSTRAP_HINT_SECONDS - 1)
+    app._render_setup()
+    assert not window._prov_bootstrap[1].isHidden()
+    assert "watcher.ps1 -Install" in window._prov_bootstrap[1].text()
+    assert app._prov_timer.isActive()              # and polling keeps going
+    assert app._prov_error == ""                   # not an error
+
+
+def test_a_finished_first_run_hands_over_to_check_setup_and_connect(controller,
+                                                                    fakes):
+    app, window = provisioning_controller(controller, fakes)
+    start_first_run(app, fakes)
+    deliver_status(app, fakes, provision_status(guestprov.PHASE_DONE))
+
+    assert app._model.phase is lifecycle.Phase.PROVISIONING
+    assert not window._setup_connect.isHidden()
+    assert "Check setup and connect" in app._setup_detail
+    assert firstrun.read_provisioning_record() is not None
+    # `done` is a claim about the guest, not about the mounts: nothing has been
+    # read from them, and only Check setup and connect changes that (D31/D43).
+    assert window._io_paused is True
+    assert app._last_snapshot is None
+    assert not app._timer.isActive()
+
+
+def test_a_finished_reprovision_clears_the_record_only_after_a_fresh_gather(
+        controller, fakes):
+    app, window = running_controller(controller, fakes)
+    app._on_reprovision_requested()
+    assert pump(3.0, until=lambda: fakes.stage.count == 1)
+    deliver_status(app, fakes, provision_status(guestprov.PHASE_DONE))
+
+    assert pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.RUNNING)
+    assert app._prov_verify_pending is True
+    assert firstrun.read_provisioning_record() is not None
+
+    fakes.gather.result = snapshot_with(
+        bridge.Compatibility(bridge.COMPAT_CURRENT, bridge.AGENT_BUILD))
+    app._refresh(force=True)
+    assert pump(3.0, until=lambda: firstrun.read_provisioning_record() is None)
+    assert app._prov_verify_pending is False
+
+
+def test_a_reprovision_that_did_not_fix_the_skew_keeps_its_record(controller,
+                                                                  fakes):
+    app, window = running_controller(controller, fakes)
+    app._on_reprovision_requested()
+    assert pump(3.0, until=lambda: fakes.stage.count == 1)
+    deliver_status(app, fakes, provision_status(guestprov.PHASE_DONE))
+    assert pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.RUNNING)
+
+    fakes.gather.result = snapshot_with(
+        bridge.Compatibility(bridge.COMPAT_SKEWED, 99, "the guest agent is build 99"))
+    app._refresh(force=True)
+    assert pump(3.0, until=lambda: app._prov_verify_pending is False)
+    assert firstrun.read_provisioning_record() is not None
+    assert not window._notice.isHidden()
+
+
+# ------------------------------------- D43: reattaching after a GUI restart --
+
+def resumable_record(*, mode, phase=firstrun.RECORD_PHASE_TRIGGERED,
+                     run_id=None, guest_phase="", reset=False):
+    return firstrun.ProvisioningRecord(
+        started_at="2026-07-27T09:00:00Z", phase=phase, container_id="abc123",
+        mode=mode, container_started_at="2026-07-27T09:00:00Z",
+        guest_run_id=run_id or f"{1:032x}", guest_phase=guest_phase,
+        reset_share_credential=reset)
+
+
+def test_a_restart_during_a_first_run_reattaches_to_the_saved_run(controller,
+                                                                  fakes):
+    fakes.status = provision_status(guestprov.PHASE_WAITING_FOR_SIGNIN,
+                                    work=("wait-for-signin",),
+                                    checks={"syncRoot": "missing"})
+    fakes.gather.blocked = True
+    fakes.read_exclusions.blocked = True
+    app, window = provisioning_controller(
+        controller, fakes,
+        resumable_record(mode=lifecycle.MODE_FIRST_RUN,
+                         guest_phase=guestprov.PHASE_WAITING_FOR_SIGNIN))
+
+    assert app._model.provisioning_mode == lifecycle.MODE_FIRST_RUN
+    assert app._prov_run_id == f"{1:032x}"
+    assert fakes.stage.count == 0                # reattached, never re-staged
+    assert app._prov_timer.isActive()
+    assert PROVISION_SIGNIN in window._prov_instruction.text()
+    pump(0.3)
+    assert app._last_snapshot is None            # and no CIFS on the way back
+    assert window._io_paused is True
+
+
+PROVISION_SIGNIN = "Sign in to iCloud in the VM now."
+
+
+def test_a_restart_during_a_reprovision_resumes_in_reprovision_mode(controller,
+                                                                    fakes):
+    fakes.status = provision_status(guestprov.PHASE_INSTALLING_AGENT,
+                                    work=("update-agent",),
+                                    checks={"agentInstall": "drifted"})
+    fakes.gather.blocked = True
+    app, window = provisioning_controller(
+        controller, fakes, resumable_record(mode=lifecycle.MODE_REPROVISION))
+
+    assert app._model.phase is lifecycle.Phase.PROVISIONING
+    assert app._model.provisioning_mode == lifecycle.MODE_REPROVISION
+    assert app._prov_timer.isActive()
+    pump(0.3)
+    assert app._last_snapshot is None
+    assert window._io_paused is True
+
+    # …and success now returns to monitoring rather than to Check setup.
+    deliver_status(app, fakes, provision_status(guestprov.PHASE_DONE))
+    fakes.gather.blocked = False
+    assert pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.RUNNING)
+
+
+def test_a_restart_at_waiting_for_secret_asks_for_the_env_file_again(controller,
+                                                                     fakes):
+    fakes.status = provision_status(guestprov.PHASE_WAITING_FOR_SECRET,
+                                    work=("create-share-account",),
+                                    checks={"shareAccount": "missing"})
+    app, window = provisioning_controller(
+        controller, fakes,
+        resumable_record(mode=lifecycle.MODE_FIRST_RUN, reset=True,
+                         guest_phase=guestprov.PHASE_WAITING_FOR_SECRET))
+
+    assert app._prov_resume == firstrun.RESUME_NEEDS_SECRET
+    assert not window._prov_env_button.isHidden()
+    assert "never stores the path" in window._prov_instruction.text()
+
+    app._on_provision_env_selected("/home/tester/.env")
+    assert pump(3.0, until=lambda: fakes.deliver_secret.count == 1)
+    assert fakes.deliver_secret.calls[0][0][1] == f"{1:032x}"
+
+
+def test_a_crash_before_the_trigger_re_stages_the_same_run(controller, fakes):
+    """D43: nothing acknowledged it, so it cannot have been consumed."""
+    fakes.status = guestprov.Status(guestprov.PHASE_ABSENT)
+    app, window = provisioning_controller(
+        controller, fakes,
+        resumable_record(mode=lifecycle.MODE_FIRST_RUN, run_id=f"{5:032x}",
+                         phase=firstrun.RECORD_PHASE_STAGING, reset=True))
+
+    assert pump(3.0, until=lambda: fakes.stage.count == 1)
+    (_bundle, run_id, reset), _kwargs = fakes.stage.calls[0]
+    assert run_id == f"{5:032x}"
+    assert reset is True
+    assert fakes.issued_run_ids == []            # no second UUID was minted
+
+
+def test_a_restarted_container_offers_a_confirmed_new_run(controller, fakes):
+    fakes.status = guestprov.Status(guestprov.PHASE_ABSENT)
+    fakes.container_started_at.result = "2026-07-27T11:00:00Z"
+    app, window = provisioning_controller(
+        controller, fakes, resumable_record(mode=lifecycle.MODE_FIRST_RUN))
+
+    assert app._prov_resume == firstrun.RESUME_CONFIRM_NEW_RUN
+    assert fakes.stage.count == 0                # nothing staged without asking
+    assert window._prov_retry_button.text() == "Start a new setup run…"
+    assert not app._prov_timer.isActive()
+
+    app._on_provision_retry()
+    assert pump(3.0, until=lambda: fakes.stage.count == 1)
+
+
+def test_a_missing_status_keeps_polling_and_abandoning_stays_explicit(controller,
+                                                                      fakes):
+    fakes.status = guestprov.Status(guestprov.PHASE_ABSENT)
+    app, window = provisioning_controller(
+        controller, fakes, resumable_record(mode=lifecycle.MODE_FIRST_RUN))
+
+    assert app._prov_resume == firstrun.RESUME_POLL_OR_ABANDON
+    assert app._prov_timer.isActive()
+    assert fakes.stage.count == 0
+    assert window._prov_retry_button.text() == "Abandon and start a new run…"
+
+
+# ------------------- the connect that follows a converged run (§4.2, D41) --
+
+def _ready_host(monkeypatch):
+    monkeypatch.setattr(firstrun, "check_host_setup", Recorder([]))
+    monkeypatch.setattr(firstrun, "check_container", Recorder([]))
+
+
+def test_a_credential_specific_connect_failure_offers_a_reset(controller, fakes,
+                                                              monkeypatch):
+    app, window = provisioning_controller(controller, fakes)
+    start_first_run(app, fakes)
+    deliver_status(app, fakes, provision_status(guestprov.PHASE_DONE))
+    _ready_host(monkeypatch)
+    fakes.power_on.result = power.HelperResult(
+        False, 5, "mount error(13): Permission denied (NT_STATUS_LOGON_FAILURE)")
+
+    app._on_connect_requested()
+    assert pump(3.0, until=lambda: app._prov_offer_reset)
+    assert app._model.phase is lifecycle.Phase.PROVISIONING
+    assert "never reveals the account password" in window._prov_note.text()
+    assert window._prov_retry_button.text() == "Retry and reset share password…"
+    assert firstrun.read_provisioning_record() is not None
+
+    # The reset is preselected, and still needs the operator's confirmation and
+    # their env-file choice at `waiting-for-secret`.
+    app._on_provision_retry()
+    assert pump(3.0, until=lambda: fakes.stage.count == 2)
+    assert fakes.stage.calls[1][0][2] is True
+    assert fakes.deliver_secret.count == 0
+
+
+def test_a_generic_connect_failure_never_offers_a_password_reset(controller,
+                                                                 fakes,
+                                                                 monkeypatch):
+    """A timeout, DNS or mount failure is not evidence about the password."""
+    app, window = provisioning_controller(controller, fakes)
+    start_first_run(app, fakes)
+    deliver_status(app, fakes, provision_status(guestprov.PHASE_DONE))
+    _ready_host(monkeypatch)
+    fakes.power_on.result = power.HelperResult(
+        False, 7, "The Windows VM is running but its iCloud shares did not "
+                  "become usable within 300s.")
+
+    app._on_connect_requested()
+    assert pump(3.0, until=lambda: app._model.phase is lifecycle.Phase.START_FAILED)
+    assert app._prov_offer_reset is False
+    assert firstrun.read_provisioning_record() is not None
+
+
+# ------------------------------------------------- quitting during a run --
+
+def test_quitting_a_first_run_says_nothing_is_mounted(controller, fakes):
+    app, window = provisioning_controller(controller, fakes)
+    start_first_run(app, fakes)
+    app._on_quit_requested()
+    assert "nothing mounted to disconnect" in fakes.quit_messages[-1]
+
+
+def test_quitting_a_reprovision_says_the_shares_stay_mounted(controller, fakes):
+    """The token is `nothing_mounted` in both modes; the wording cannot be."""
+    app, window = running_controller(controller, fakes)
+    app._on_reprovision_requested()
+    assert pump(3.0, until=lambda: fakes.stage.count == 1)
+
+    app._on_quit_requested()
+    assert "stay mounted" in fakes.quit_messages[-1]
+    assert fakes.power_off.count == 0
+    assert fakes.quits == [True]
+
+
+def test_a_vm_that_is_not_running_is_never_staged_into(controller, fakes):
+    """D30's classification gates this like every other mutating action."""
+    app, window = provisioning_controller(controller, fakes)
+    fakes.inspect.result = power.DockerStatus("stopped", raw="exited")
+    before = fakes.inspect.count
+
+    app._on_provision_requested()
+    assert pump(2.0, until=lambda: fakes.inspect.count > before)
+    pump(0.3)
+    assert fakes.guest_ready.count == 0
+    assert fakes.ensure_channel.count == 0
+    assert fakes.stage.count == 0
+    assert "not running" in window._prov_note.text()
+
+
+def test_the_password_row_reports_intent_until_it_has_been_inspected(controller,
+                                                                     fakes):
+    """A run that has not touched the account yet must not claim it reset it."""
+    app, window = provisioning_controller(controller, fakes)
+    start_first_run(app, fakes)
+    deliver_status(app, fakes, provision_status(
+        guestprov.PHASE_STAGING,
+        checks={key: "pending" for key in guestprov.CHECK_KEYS}))
+
+    glyph, text = provision_rows(window)["Share password"]
+    assert glyph == window_module.PROVISION_GLYPHS[window_module.PROVISION_CREDENTIAL]
+    assert text == "will be set from the .env file you choose"

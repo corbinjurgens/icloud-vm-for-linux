@@ -89,6 +89,10 @@ class TrayIcon(QObject):
     #: D30: power the whole bridge off/on without quitting the app.
     power_off_requested = Signal()
     start_requested = Signal()
+    #: D35/D40-D44: inspect the guest and repair what no longer matches this
+    #: app. The same controller action the Status tab and the skew banner
+    #: invoke, with the same enablement rule.
+    reprovision_requested = Signal()
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -127,6 +131,14 @@ class TrayIcon(QObject):
         self._action_start.triggered.connect(self.start_requested.emit)
         self._action_start.setVisible(False)
         menu.addAction(self._action_start)
+
+        # Guest repair (D35/D40-D44). Confirmed by the controller, and offered
+        # by exactly the same rule as the Status-tab button — including while
+        # the bridge protocol is skewed or incompatible.
+        self._action_reprovision = QAction("Re-run Windows provisioning…", menu)
+        self._action_reprovision.triggered.connect(self.reprovision_requested.emit)
+        self._action_reprovision.setVisible(False)
+        menu.addAction(self._action_reprovision)
 
         # First run: the assistant is a tab, so the tray's job is only to lead
         # there — never to offer Start for a VM that does not exist (D31).
@@ -209,6 +221,10 @@ class TrayIcon(QObject):
         self._action_retry.setVisible(action == power.ACTION_RETRY)
         self._action_setup.setVisible(action == power.ACTION_SETUP)
 
+    def set_reprovision_available(self, available: bool) -> None:
+        """Whether the guest-repair action is offered at all (D35/D40-D44)."""
+        self._action_reprovision.setVisible(available)
+
     def set_lifecycle_busy(self, busy: bool, *, allow_quit: bool = False) -> None:
         """Disable the actions that must not run mid-transition; keep VM screen.
 
@@ -222,6 +238,7 @@ class TrayIcon(QObject):
         if busy:
             # A transition owns the bridge; offer no way to start another.
             self.set_power_action(power.ACTION_NONE)
+            self.set_reprovision_available(False)
 
     def set_bridge_available(self, available: bool) -> None:
         """Whether the mounts are up: gates the actions that touch CIFS (D30).
