@@ -168,7 +168,7 @@ commit time per `CONTRIBUTING.md`). Draft text:
   resolves its sibling `agent.ps1` from `$PSScriptRoot` rather than trusting
   `C:\OEM`. After validation, the orchestrator transactionally refreshes an
   administrator-only `current` directory for the documented
-  manual fallback and D35 banner; `C:\OEM` may also be refreshed for operator
+  manual fallback; `C:\OEM` may also be refreshed for operator
   inspection but is never the elevated execution source. The installed watcher
   is refreshed in its protected directory for its **next task start**. The tiny
   watcher envelope (`version: 1`, fixed filenames, UUID run ID) is deliberately
@@ -198,11 +198,22 @@ commit time per `CONTRIBUTING.md`). Draft text:
   invalidates caches, and returns to monitoring. No status is trusted merely
   because it is the newest file.
 
-Also amend, in the same commit: the D31 register row (its "password never
-passes through the GUI" sentence gains "except as provided by D41"), the D39
-row per D43, the `firstrun.py` module docstring, and v2 plan section 4 gains a
-subsection specifying the protocol below (plans own decisions; this todo is not
-the spec of record once that lands).
+Also amend, in the same commit:
+
+- the D31 register row (its "password never passes through the GUI" sentence
+  gains "except as provided by D41");
+- the D39 register row, per D43;
+- the D35 register row and its E12 acceptance item (v2 plan section 8):
+  recovery for skew and incompatibility becomes an unconditional entry into
+  the confirmed **Re-run Windows provisioning…** action (see GUI wiring) —
+  not a decision about which guest script path exists, and never a `C:\OEM`
+  instruction. Rewrite the row's "stays a copyable instruction" rationale:
+  the GUI still holds no guest-admin credentials and still never updates
+  guest code silently — elevation lives in the guest watcher, and the update
+  happens only through this explicit confirmed action;
+- the `firstrun.py` module docstring;
+- v2 plan section 4 gains a subsection specifying the protocol below (plans
+  own decisions; this todo is not the spec of record once that lands).
 
 ## Protocol (exact formats)
 
@@ -333,9 +344,12 @@ New `provision/guest-setup.ps1` (the orchestrator; elevated; idempotent):
    copies of
    `03-create-share.ps1`, `04-bridge-agent.ps1`, `agent.ps1`, `watcher.ps1` and
    `guest-setup.ps1` under `C:\OEM` for inspection, but execute only the
-   siblings under the protected run directory. Documentation and the D35
-   banner must never tell the operator to elevate an unprotected convenience
-   copy once the protected `current` bundle exists.
+   siblings under the protected run directory. `current` is the protected
+   manual fallback for a diagnosed provisioning failure — something a failure
+   report may tell the operator to elevate by hand — not something the GUI
+   detects or references: D35 recovery routes through the app's re-provision
+   action, and no active recovery text names `C:\OEM` or any unprotected
+   copy.
 3. `installing-icloud`: skip if `Get-AppxPackage AppleInc.iCloud` returns a
    package; else `winget install --id 9PKTQ5699M62 --source msstore
    --accept-package-agreements --accept-source-agreements`, retried up to 5
@@ -505,8 +519,12 @@ Docker/file I/O; `lifecycle.py` remains a pure reducer.
   The manual instructions the state shows today remain reachable (collapsed
   or behind "Show manual steps").
 - Monitoring state: add a confirmed menu/Status-tab action **Re-run Windows
-  provisioning…**, enabled only when the container classification is running
-  and no other transaction is in flight. It quiesces bridge I/O and pauses
+  provisioning…**, enabled whenever the container classification is running
+  and no provisioning or power transaction is in flight — deliberately
+  including while the bridge protocol is `skewed` or `incompatible`. The D35
+  gate keeps ordinary bridge writes (Apply, Restore, list requests) closed in
+  the incompatible state; this explicit recovery action is exempt because it
+  is what the gate's banner points at. It quiesces bridge I/O and pauses
   GUI polling for the duration (existing `quiesce`/`set_io_paused` machinery),
   writes a `reprovision` record, and runs the same stage/poll flow. The
   confirmation must accurately say that the systemd mounts remain mounted and
@@ -523,6 +541,22 @@ Docker/file I/O; `lifecycle.py` remains a pure reducer.
   from a merely quiet watcher. A `reprovision` record is subject to the same
   startup-before-CIFS gate as a first-run record; otherwise a restarted app
   could mount while 03/04 are changing guest state.
+- D35 recovery flow: the skew/incompatible banner becomes an unconditional
+  entry into the same re-provision flow, via a banner button that invokes the
+  **same** controller action as the Status-tab/menu command — one
+  implementation, one set of enablement rules. Replace
+  `UPDATE_AGENT_INSTRUCTION` and `SKEW_BANNER` in
+  `gui/icloud_bridge_gui/bridge.py` (and the "never an automated guest-side
+  update" comment above them, which D35's amended rationale supersedes) with
+  wording along the lines of: "The guest agent does not match this app.
+  Choose **Re-run Windows provisioning…** to install the bundled agent. VMs
+  created before automated provisioning may require the one-time elevated
+  bootstrap step." The flow probes no guest state and works for both VM
+  generations: a post-feature VM's watcher acknowledges and proceeds; a
+  pre-feature VM reaches the no-acknowledgement hint, and once the operator
+  runs the bootstrap one-liner the watcher consumes the already-staged
+  trigger — the operator does not click again. No active recovery UI may
+  contain a `C:\OEM` instruction.
 - Failure rendering: `error` statuses show the failing phase, the bounded
   message, and the copyable manual fallback for that phase (03/04 command
   lines from SETUP.md). A mismatched run ID never replaces the saved run or
@@ -630,19 +664,37 @@ sweep it into a commit — always name paths.
    `make check`. Commit the module, parser/configurer and tests together.
 4. **M3 — GUI wiring.** Provisioning-state button and status rendering,
    re-run action with accurately scoped GUI-I/O quiesce, D43 record/resumption,
-   reducer events, tray/window text. Extend lifecycle, first-run and Qt wiring
-   tests with faked guestprov, including restart during first-run and
-   reprovision plus env re-selection at `waiting-for-secret`. Verify:
-   `make check`, ideally `make test-all`. Commit.
-5. **M4 — Docs.** SETUP.md, automation-notes scoreboard, README. Verify:
+   reducer events, tray/window text. D35 recovery rewiring:
+   `UPDATE_AGENT_INSTRUCTION`/`SKEW_BANNER` and their comment in `bridge.py`,
+   the banner button invoking the canonical re-provision controller action,
+   and enablement during `skewed`/`incompatible`. Update
+   `gui/tests/test_bridge.py`
+   (`test_the_recovery_instruction_names_script_04` becomes a test of the new
+   wording) and `gui/tests/test_qt_wiring.py`
+   (`test_a_skewed_agent_still_dispatches_and_shows_the_banner`), and add
+   wiring tests that (a) no active recovery UI contains a `C:\OEM`
+   instruction and (b) an incompatible bridge keeps ordinary writes disabled
+   while the explicit re-provision action stays available. Extend lifecycle,
+   first-run and Qt wiring tests with faked guestprov, including restart
+   during first-run and reprovision plus env re-selection at
+   `waiting-for-secret`. Verify: `make check`, ideally `make test-all`.
+   Commit.
+5. **M4 — Docs.** SETUP.md, automation-notes scoreboard, README. Every
+   current troubleshooting instruction for agent skew or an incompatible
+   protocol must point at the re-provision workflow rather than `C:\OEM`;
+   historical entries in `CHANGELOG.md` and `docs/acceptance-results.md` stay
+   as written, and a new changelog entry describes the change. Verify:
    `make check`. Commit.
 6. **M5 — Operator verification (not possible in this workspace).** On the
    real host, in this order: (a) stage once, confirm `testparm -s` shows
    `Provision` read-only, and prove that creating/replacing a file through
    `\\host.lan\Provision` fails while status writes through `Data` work;
-   (b) paste the bootstrap one-liner into the existing VM's elevated
-   PowerShell; (c) use **Re-run Windows
-   provisioning…** (or the Provisioning-state button) and watch the phases;
+   (b) on the pre-feature VM, start **Re-run Windows provisioning…** first
+   (from the D35 banner button if one is showing, else the Status tab), let
+   it reach the no-acknowledgement bootstrap hint, then paste the bootstrap
+   one-liner into the VM's elevated PowerShell and confirm the watcher
+   consumes the already-staged trigger with no further host-side click;
+   (c) watch the phases;
    interrupt the GUI once during `waiting-for-signin` and once immediately
    after secret delivery to prove D43/re-delivery; (d) confirm shares `icloud`
    and `bridge` exist, `status.json` shows
