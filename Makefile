@@ -32,7 +32,7 @@ PWSH_VERSION := 7.4.6
 PWSH_DIR     := build/pwsh
 PWSH         := $(PWSH_DIR)/pwsh
 
-.PHONY: help version venv venv-qt hooks test test-qt test-all lint lint-ps check \
+.PHONY: help version venv venv-qt hooks test test-qt test-all lint lint-ps test-ps check \
         deb install uninstall purge configure install-gui run deps acceptance \
         clean distclean
 
@@ -132,6 +132,12 @@ lint-ps: $(PWSH) ## Parse the .ps1 files with PowerShell 7 (downloads ~70 MB)
 	@$(PWSH) -NoProfile -File packaging/lint-ps1.ps1 $(PS_SCRIPTS)
 	@echo "NOTE: PS 7 parses a superset of PS 5.1 and cannot execute the guest-only"
 	@echo "      parts (cfapi interop, Get-LocalUser, SMB cmdlets, scheduled tasks)."
+
+test-ps: $(PWSH) ## Run the guest-agent checks that a Linux host can actually run
+	@echo "==> Bridge JSON serializer byte-identity"
+	@$(PWSH) -NoProfile -NonInteractive -File tools/test-bridge-json.ps1
+	@echo "NOTE: this proves the serializer's output contract only. Nothing here"
+	@echo "      exercises CfAPI, ACLs, or Windows PowerShell 5.1 itself."
 
 check: lint test ## Everything verifiable without a VM: lint + tests
 

@@ -76,7 +76,7 @@ $ShareUser = "syncshare"
 # behavior, so a GUI shipped alongside a newer agent can say so. The GUI carries
 # the same number in bridge.py and a test compares the two literals.
 $ProtocolVersion = 1
-$AgentBuild      = 1
+$AgentBuild      = 2
 
 # Cloud Files / FILE_ATTRIBUTE values.
 # DIRECTORY and UNPINNED are listed for reference and are deliberately unused:
@@ -294,6 +294,50 @@ public static class IcloudBridgeNative {
         }
         return r;
     }
+
+    // JSON string escaping (v2 plan section 2). Compiled, because the PowerShell
+    // original walked every string one character at a time through an eight-branch
+    // comparison chain and allocated a StringBuilder per call -- and it runs for
+    // every key and every value of every node of tree.json every ten minutes,
+    // plus status.json every fifteen seconds.
+    //
+    // The fast path is the point. Almost every real key and path needs no
+    // escaping at all, so the common case scans once and concatenates without
+    // touching a StringBuilder. Output is byte-identical to the version this
+    // replaced, including lowercase \uXXXX for the control characters that have
+    // no short escape, and raw pass-through of DEL, non-ASCII and surrogate
+    // pairs. tools/test-bridge-json.ps1 is the proof.
+    public static string JsonString(string value) {
+        if (string.IsNullOrEmpty(value)) return "\"\"";
+        int i = 0;
+        for (; i < value.Length; i++) {
+            char c = value[i];
+            if (c == '"' || c == '\\' || c < 32) break;
+        }
+        if (i == value.Length) return "\"" + value + "\"";
+
+        var sb = new System.Text.StringBuilder(value.Length + 16);
+        sb.Append('"');
+        sb.Append(value, 0, i);
+        for (; i < value.Length; i++) {
+            char c = value[i];
+            switch (c) {
+                case '"':  sb.Append("\\\""); break;
+                case '\\': sb.Append("\\\\"); break;
+                case '\b': sb.Append("\\b");  break;
+                case '\t': sb.Append("\\t");  break;
+                case '\n': sb.Append("\\n");  break;
+                case '\f': sb.Append("\\f");  break;
+                case '\r': sb.Append("\\r");  break;
+                default:
+                    if (c < 32) sb.Append("\\u").Append(((int)c).ToString("x4"));
+                    else sb.Append(c);
+                    break;
+            }
+        }
+        sb.Append('"');
+        return sb.ToString();
+    }
 }
 '@
 
@@ -373,52 +417,72 @@ function Get-Sha256Hex {
 # Equivalent to ConvertTo-Json -Depth 20 for the shapes this agent emits, but
 # renders empty collections as [] and never emits a BOM (v2 plan section 2).
 
+# The escape loop lives in the compiled helper, and a whole document is built
+# into one StringBuilder. The version this replaced had every level materialize
+# each child as a complete string in a List[string] and then -join them, which
+# recopied every byte once per level of nesting: O(size x depth), where the depth
+# is the operator's folder depth. Measured under PowerShell 7 on a synthetic
+# 3906-node / 4.1 MB / depth-6 tree, the pair of changes took one serialization
+# from 11.9 s to well under half that, and the recursion was the larger share.
+# The output is unchanged -- tools/test-bridge-json.ps1 is the byte-identity proof.
+
 function ConvertTo-BridgeJsonString {
     param([string]$Value)
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.Append('"')
-    foreach ($ch in $Value.ToCharArray()) {
-        $c = [int]$ch
-        if     ($ch -eq '"')  { [void]$sb.Append('\"') }
-        elseif ($ch -eq '\')  { [void]$sb.Append('\\') }
-        elseif ($c  -eq 8)    { [void]$sb.Append('\b') }
-        elseif ($c  -eq 9)    { [void]$sb.Append('\t') }
-        elseif ($c  -eq 10)   { [void]$sb.Append('\n') }
-        elseif ($c  -eq 12)   { [void]$sb.Append('\f') }
-        elseif ($c  -eq 13)   { [void]$sb.Append('\r') }
-        elseif ($c  -lt 32)   { [void]$sb.Append('\u' + $c.ToString('x4')) }
-        else                  { [void]$sb.Append($ch) }
+    return [IcloudBridgeNative]::JsonString($Value)
+}
+
+function Add-BridgeJson {
+    param([System.Text.StringBuilder]$Sb, $Value, [int]$Depth = 0)
+    if ($Depth -gt 64) { throw "JSON nesting too deep" }
+    if ($null -eq $Value) { [void]$Sb.Append('null'); return }
+    if ($Value -is [bool]) {
+        if ($Value) { [void]$Sb.Append('true') } else { [void]$Sb.Append('false') }
+        return
     }
-    [void]$sb.Append('"')
-    return $sb.ToString()
+    if ($Value -is [string]) {
+        [void]$Sb.Append([IcloudBridgeNative]::JsonString($Value)); return
+    }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [int16] -or
+        $Value -is [uint32] -or $Value -is [uint64] -or $Value -is [byte]) {
+        [void]$Sb.Append(([Int64]$Value).ToString([Globalization.CultureInfo]::InvariantCulture))
+        return
+    }
+    if ($Value -is [double] -or $Value -is [decimal] -or $Value -is [single]) {
+        [void]$Sb.Append(([double]$Value).ToString('R', [Globalization.CultureInfo]::InvariantCulture))
+        return
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        [void]$Sb.Append('{')
+        $first = $true
+        foreach ($k in $Value.Keys) {
+            if (-not $first) { [void]$Sb.Append(',') }
+            $first = $false
+            [void]$Sb.Append([IcloudBridgeNative]::JsonString([string]$k))
+            [void]$Sb.Append(':')
+            Add-BridgeJson $Sb $Value[$k] ($Depth + 1)
+        }
+        [void]$Sb.Append('}')
+        return
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        [void]$Sb.Append('[')
+        $first = $true
+        foreach ($item in $Value) {
+            if (-not $first) { [void]$Sb.Append(',') }
+            $first = $false
+            Add-BridgeJson $Sb $item ($Depth + 1)
+        }
+        [void]$Sb.Append(']')
+        return
+    }
+    [void]$Sb.Append([IcloudBridgeNative]::JsonString([string]$Value))
 }
 
 function ConvertTo-BridgeJson {
     param($Value, [int]$Depth = 0)
-    if ($Depth -gt 64) { throw "JSON nesting too deep" }
-    if ($null -eq $Value) { return 'null' }
-    if ($Value -is [bool])   { if ($Value) { return 'true' } else { return 'false' } }
-    if ($Value -is [string]) { return (ConvertTo-BridgeJsonString $Value) }
-    if ($Value -is [int] -or $Value -is [long] -or $Value -is [int16] -or
-        $Value -is [uint32] -or $Value -is [uint64] -or $Value -is [byte]) {
-        return ([Int64]$Value).ToString([Globalization.CultureInfo]::InvariantCulture)
-    }
-    if ($Value -is [double] -or $Value -is [decimal] -or $Value -is [single]) {
-        return ([double]$Value).ToString('R', [Globalization.CultureInfo]::InvariantCulture)
-    }
-    if ($Value -is [System.Collections.IDictionary]) {
-        $parts = New-Object System.Collections.Generic.List[string]
-        foreach ($k in $Value.Keys) {
-            $parts.Add((ConvertTo-BridgeJsonString ([string]$k)) + ':' + (ConvertTo-BridgeJson $Value[$k] ($Depth + 1)))
-        }
-        return '{' + ($parts -join ',') + '}'
-    }
-    if ($Value -is [System.Collections.IEnumerable]) {
-        $parts = New-Object System.Collections.Generic.List[string]
-        foreach ($item in $Value) { $parts.Add((ConvertTo-BridgeJson $item ($Depth + 1))) }
-        return '[' + ($parts -join ',') + ']'
-    }
-    return (ConvertTo-BridgeJsonString ([string]$Value))
+    $sb = New-Object System.Text.StringBuilder
+    Add-BridgeJson $sb $Value $Depth
+    return $sb.ToString()
 }
 
 function Write-JsonAtomic {

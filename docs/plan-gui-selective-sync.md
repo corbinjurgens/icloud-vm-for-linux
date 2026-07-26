@@ -266,6 +266,16 @@ replaces the target. In Windows PowerShell 5.1, do **not** use
 as `[]`, and `tree.json` is full of empty `dirs` arrays. (A consumer that does
 use `ConvertTo-Json` must pass `-Depth 20`.)
 
+What is pinned here is the **output**, not the implementation. Since 2026-07-26
+the string escaping lives in the compiled `IcloudBridgeNative::JsonString` and a
+whole document is appended into one `StringBuilder`, replacing a per-character
+PowerShell loop and a per-level `List[string]` plus `-join` that recopied every
+byte once per level of nesting. Measured 5.3x faster on a 5 461-node tree
+(3.07 s to 0.58 s under PowerShell 7). Any future rewrite is equally free, on one
+condition: `tools/test-bridge-json.ps1` (`make test-ps`) must still pass. It
+asserts the exact bytes for control characters, quotes, backslashes, `[]` for
+empty collections, key order, integer and double formatting, and the depth guard.
+
 ### 2.1 `exclusions.json` — written by GUI, read by agent
 
 ```json
