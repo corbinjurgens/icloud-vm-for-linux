@@ -1991,6 +1991,34 @@ def test_a_generic_connect_failure_never_offers_a_password_reset(controller,
     assert firstrun.read_provisioning_record() is not None
 
 
+def test_a_readiness_timeout_is_routed_by_the_quoted_mount_error(controller,
+                                                                 fakes,
+                                                                 monkeypatch):
+    """D45: the helper's readiness timeout now carries the mount units' error.
+
+    Same exit status and same leading sentence as the generic case above — only
+    the appended excerpt says the credential was rejected, and that is what has
+    to reach the reset route.
+    """
+    app, window = provisioning_controller(controller, fakes)
+    start_first_run(app, fakes)
+    deliver_status(app, fakes, provision_status(guestprov.PHASE_DONE))
+    _ready_host(monkeypatch)
+    fakes.power_on.result = power.HelperResult(
+        False, 5, "The Windows VM is running but its iCloud shares did not "
+                  "become usable within 300s.\n\nThe mount units last "
+                  "reported:\n  mnt-icloud.mount:\n"
+                  "    mount error(13): Permission denied\n")
+    events = _recorded_events(app, monkeypatch)
+
+    app._on_connect_requested()
+    assert pump(3.0, until=lambda: app._prov_offer_reset)
+    assert app._model.phase is lifecycle.Phase.PROVISIONING
+    assert lifecycle.Event.PROVISION_CONNECT_FAILED in events
+    assert lifecycle.Event.POWER_ON_FAILED not in events
+    assert window._prov_retry_button.text() == "Retry and reset share password…"
+
+
 # ------------------------------------------------- quitting during a run --
 
 def test_quitting_a_first_run_says_nothing_is_mounted(controller, fakes):

@@ -18,7 +18,9 @@
 #        the VM left running; never a lazy or forced unmount.
 # `on`   starts the container and retries a *real* CIFS activation until both
 #        mounts are live (a TCP connect to the published port is not readiness,
-#        see docs/automation-notes.md), then re-arms the health timer.
+#        see docs/automation-notes.md), then re-arms the health timer. If that
+#        wait expires it quotes a short, secret-free excerpt of the mount units'
+#        journal, which is the only place the real CIFS error appears (D45).
 #
 # Idempotent: repeated `on`/`off` reconcile toward the same state and succeed once
 # it is reached. If the process is killed mid-transition the marker deliberately
@@ -67,6 +69,8 @@ SYSTEMCTL_TIMEOUT=45    # bound each systemctl call
 ACCESS_TIMEOUT=35       # bound each mount-triggering access (> mount TimeoutSec=30)
 READY_DEADLINE=300      # up to five minutes for SMB to come up
 READY_BACKOFF=10        # pause between readiness attempts
+JOURNAL_SCAN_LINES=40   # raw journal entries read back per mount unit
+JOURNAL_TIMEOUT=10      # bound each journal read
 
 AUTOMOUNTS=(mnt-icloud.automount mnt-icloud_bridge.automount)
 MOUNTS=(mnt-icloud.mount mnt-icloud_bridge.mount)
@@ -130,6 +134,71 @@ container_state() {
     return 0
   fi
   classify_inspect_output "$out"
+}
+
+# Reduce one mount unit's recent journal text to a few secret-free diagnostic
+# lines. Like classify_inspect_output this is a pure function of one string, so
+# gui/tests/test_power_helper.py can extract it and exercise it under plain bash.
+#
+# Two deliberately strict rules:
+#   - allowlist: only lines carrying a mount or CIFS diagnosis survive, so the
+#     excerpt cannot become a transcript of ordinary unit chatter and an
+#     unanticipated log line is dropped rather than quoted. systemd's own
+#     restatements ("Failed to mount ...", "Failed with result ...") are left
+#     out too: they add nothing over the error they follow, and letting them in
+#     would let the noise of one attempt push out the diagnosis of the next;
+#   - redaction: a `<key>=<value>` whose key is password-bearing loses its value.
+#     The mount units pass `credentials=/etc/credentials-icloud` and never a
+#     literal password, so this is defence in depth, not a live leak.
+#
+# The last matching lines win: after up to five minutes of retries, what the
+# mounts said most recently is what describes the failure being reported.
+sanitize_journal_excerpt() {
+  local keep=4 width=200            # lines quoted, and characters kept per line
+  local line lowered matches=()
+  while IFS= read -r line; do
+    lowered="${line,,}"
+    case "$lowered" in
+      *"mount error"*|*"nt_status_"*|*"cifs: "*|*"mount process exited"*) ;;
+      *) continue ;;
+    esac
+    line=$(printf '%s' "$line" \
+      | sed -E 's/(password|passwd|pass)=[^,[:space:]]*/\1=<redacted>/gI')
+    matches+=("    ${line:0:$width}")
+  done <<<"$1"
+  if [ "${#matches[@]}" -eq 0 ]; then
+    return 0
+  fi
+  local start=$(( ${#matches[@]} - keep ))
+  if [ "$start" -lt 0 ]; then
+    start=0
+  fi
+  printf '%s\n' "${matches[@]:$start}"
+}
+
+# Quote what actually failed. `on` can only observe "the shares never became
+# usable"; the real CIFS error — a rejected credential, a share the guest does
+# not export, an unreachable server — is recorded by the .mount units and never
+# reaches the GUI, which shows this helper's stderr and nothing else. Lifting a
+# short excerpt into the failure message is what lets the app tell a wrong share
+# password apart from a slow guest (D45; §4.2 — connecting is the only proof the
+# credential matches) instead of showing one generic banner for both.
+#
+# Read-only, bounded, and never fatal: no journal, no journalctl or nothing that
+# passes the filter simply leaves the message as it was.
+mount_failure_excerpt() {
+  command -v journalctl >/dev/null 2>&1 || return 0
+  local u raw excerpt out=""
+  for u in "${MOUNTS[@]}"; do
+    raw=$(timeout "$JOURNAL_TIMEOUT" journalctl --no-pager -q -o cat \
+            -n "$JOURNAL_SCAN_LINES" -u "$u" 2>/dev/null) || continue
+    # `|| excerpt=""` keeps `set -e` out of this: a diagnostic must never be
+    # able to abort the transaction it is only trying to explain.
+    excerpt=$(sanitize_journal_excerpt "$raw") || excerpt=""
+    [ -n "$excerpt" ] || continue
+    out+="  $u:"$'\n'"$excerpt"$'\n'
+  done
+  printf '%s' "$out"
 }
 
 # =============================================================================
@@ -320,8 +389,13 @@ do_on() {
     # Leave the VM running so the operator can inspect its web screen and retry.
     create_marker
     scq stop "${MOUNTS[@]}" "${AUTOMOUNTS[@]}" || true
+    local detail
+    detail=$(mount_failure_excerpt) || detail=""
+    if [ -n "$detail" ]; then
+      detail=$'\n\nThe mount units last reported:\n'"$detail"
+    fi
     die "$EXIT_READINESS" \
-      "The Windows VM is running but its iCloud shares did not become usable within ${READY_DEADLINE}s. Open the VM screen (http://127.0.0.1:8006) to check that iCloud is signed in, then retry. Health checks were not armed against an unverified mount."
+      "The Windows VM is running but its iCloud shares did not become usable within ${READY_DEADLINE}s. Open the VM screen (http://127.0.0.1:8006) to check that iCloud is signed in, then retry. Health checks were not armed against an unverified mount.${detail}"
   fi
 
   # 5/6. Both mounts are live; the marker is already absent. Arm the health timer.

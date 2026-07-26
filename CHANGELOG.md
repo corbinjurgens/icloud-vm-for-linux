@@ -245,6 +245,39 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-27 — A rejected share password no longer looks like a slow guest
+
+`icloud-bridge-power on` gives up after five minutes with "the shares did not
+become usable"; until now that was the *whole* message, and the CIFS error that
+actually explains it — a rejected credential, a share the guest does not export,
+an unreachable server — stayed in the `mnt-icloud.mount` /
+`mnt-icloud_bridge.mount` journals where the app cannot look. So a wrong
+`syncshare` password and a guest that is merely slow produced identical text,
+and the GUI's **Retry and reset share password…** route, which matches
+authentication wording in the helper's stderr, could almost never fire.
+
+The helper now appends a filtered excerpt of those two units' recent journal to
+that failure message (D45). Only lines carrying a mount or CIFS diagnosis
+survive; systemd's own restatements and ordinary chatter are dropped, a
+password-bearing `key=value` loses its value, and what is quoted is a few short
+tail lines per unit. Collecting it is read-only, bounded by `timeout`, and never
+fatal — no journal, or nothing that passes the filter, simply leaves the message
+as it was. The transaction itself is untouched: same exit status, same marker
+and teardown, no new `==> ` phase line, and no control decision derived from an
+exit code. Nothing weakens the rule that only an authentication failure may
+offer a password reset; a timeout or a missing share still shows the generic
+failure and leaves a working password alone.
+
+Verified in this checkout: `sanitize_journal_excerpt` is a pure function of one
+string, like `classify_inspect_output`, and `gui/tests/test_power_helper.py`
+extracts and runs it under bash for the credential, missing-share, chatter,
+ordering, bounding and redaction cases; a Qt wiring test drives a readiness
+timeout carrying a quoted `mount error(13)` through to the reset offer. The
+helper as a whole still needs root, systemd and real mounts, so the excerpt's
+behaviour against a live journal remains operator-verified. **The installed
+`/usr/local/bin/icloud-bridge-power` is stale until the operator reinstalls the
+package.**
+
 ### 2026-07-27 — The app now provisions the Windows guest, and the docs say so
 
 The implementation of the decisions recorded in the entry below, plus the
