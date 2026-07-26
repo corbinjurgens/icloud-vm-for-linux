@@ -12,9 +12,14 @@ where the two conflict. An entry here does not amend a locked decision. A
 candidate that changes one must first update the applicable plan and decision
 register.
 
-The repository has no release tags yet, and the GUI has reported version
-`2.0.0` throughout its short history. The entries below therefore use dates and
-commit IDs rather than inventing release boundaries after the fact.
+The repository has no release tags yet. The entries below therefore use dates and
+commit IDs rather than inventing release boundaries after the fact. The GUI
+reported `2.0.0` for most of its short history — a number that read like a
+second stable major release of something people were running, which was never
+true of anything here. It is now **`0.2.0`**: pre-1.0, with the minor digit
+tracking the design line the code implements (`0.2.x` is the v2 plan). The
+entries below are unchanged by that renumbering; where an older entry named a
+`2.x` number, it means the `0.x` one with the same minor digit.
 
 Because nothing has shipped, **no entry here is a compatibility promise**. Until
 the first tag, a change is free to break any format, protocol or interface
@@ -77,21 +82,24 @@ into fixes or explicit accepted limitations.
 **Status:** Ready; blocked on live acceptance  
 **Evidence:** The reviewed backlog in
 [`todo/further_improvements.md`](todo/further_improvements.md) has landed, so
-there is a coherent body of work to name. The release is chosen: **2.1.0**. What
-is missing is the evidence, not the decision — every row in
+there is a coherent body of work to name. What is missing is the evidence, not
+the decision — every row in
 [`docs/acceptance-results.md`](docs/acceptance-results.md) is still
 `not yet run`, and a development checkout is structurally unable to change that.
 
-`__version__` in `gui/icloud_bridge_gui/__init__.py` therefore still reads
-`2.0.0`. Bumping it to `2.1.0` is a one-line change, and it is the *only*
-remaining step; `Makefile` and `packaging/build-deb.sh` already derive from that
-single source.
+The numbering itself is now settled: `__version__` reads **`0.2.0`**, and the
+release that names the shipped backlog is **`0.3.0`**. Pre-1.0 is the accurate
+statement of where this stands — no tags, no installed copies but the author's,
+and hard rule 9 explicitly disclaiming compatibility. `1.0.0` is reserved for the
+first build that has passed live acceptance on hardware other than the author's.
+Bumping the minor digit is a one-line change; `Makefile` and
+`packaging/build-deb.sh` already derive from that single source.
 
 **Completion gate:** the applicable E0–E15 rows are recorded on the real host as
 `pass` or an explicitly approved accepted limitation; then bump `__version__` to
-`2.1.0`, add the release entry here mapping it to those rows, and confirm
+`0.3.0`, add the release entry here mapping it to those rows, and confirm
 `make version`, `icloud-bridge-gui --version`, the built package filename and
-`dpkg-deb -I` all agree. Tagging `v2.1.0` remains the operator's call and
+`dpkg-deb -I` all agree. Tagging `v0.3.0` remains the operator's call and
 happens after that, never before.
 
 ## Shipped improvements
@@ -100,8 +108,8 @@ happens after that, never before.
 
 The reviewed backlog recorded in
 [`todo/further_improvements.md`](todo/further_improvements.md) landed as the
-commits below. None of it is tagged; see I-007 for why the version still reads
-`2.0.0`.
+commits below. None of it is tagged; see I-007 for why it carries no release
+number of its own.
 
 - **Live acceptance record** (`46c83c0`). `docs/acceptance-results.md` now exists
   with a row per live check, an environment baseline, and the rules that a

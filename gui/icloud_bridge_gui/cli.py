@@ -18,7 +18,7 @@ DESCRIPTION = "iCloud bridge status and selective sync"
 
 
 def version_line() -> str:
-    """The single line ``--version`` prints, e.g. ``icloud-bridge-gui 2.0.0``.
+    """The single line ``--version`` prints, e.g. ``icloud-bridge-gui 0.2.0``.
 
     ``__init__.__version__`` is the one version source in this repository — the
     ``Makefile`` and ``packaging/build-deb.sh`` derive the package version from
