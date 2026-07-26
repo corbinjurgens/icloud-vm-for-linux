@@ -245,6 +245,33 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-27 — The v1 plan's recovery guidance now leads with the app
+
+`docs/implementation-plan.md` still told the operator to recover by hand — edit
+and run `C:\OEM\03-create-share.ps1`, "re-run scripts 01, 03 and 04", re-run
+`04-bridge-agent.ps1` elevated — in rows people actually follow when something
+breaks. Since the app provisions the guest, the v2 plan wins on conflict and
+those routes go through **Re-run Windows provisioning…** (D35, D42, D44), with
+the manual sequence kept as a documented fallback. §5, §7 and the two §10 runbook
+rows now lead with the app action and demote the scripts, cross-referencing
+SETUP.md §8 rather than restating it.
+
+Two corrections fall out of writing it down, both checked against the code
+rather than assumed:
+
+- **Debloat is not covered by a re-provisioning run.** The §4.2 checklist
+  reconciles the client, share, bridge boundary and agent; it does not model
+  trimmed inbox apps. §4 and the feature-update runbook row now say so and keep
+  `01-debloat.ps1` manual.
+- **Scripts 01 and 02 are not in the refreshed bundle.** `$ProvisionPayload`
+  (`provision/guest-state.ps1`) stages only 03, 04, `agent.ps1`, `guest-state`,
+  `guest-setup` and `watcher`, so "run it from
+  `C:\ProgramData\icloud-bridge-provision\current`" is right for 03/04 and wrong
+  for 01/02, which exist only in `C:\OEM`. The sections say which applies.
+
+Documentation only; no behaviour changed. Historical records (earlier entries
+here, `docs/acceptance-results.md`) are left as written.
+
 ### 2026-07-27 — A rejected share password no longer looks like a slow guest
 
 `icloud-bridge-power on` gives up after five minutes with "the shares did not

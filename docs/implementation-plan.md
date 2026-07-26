@@ -214,7 +214,9 @@ Notes for the executor:
 
 ## 4. Guest provisioning — script 01: debloat
 
-This script runs unattended: dockur copies `./provision` to `C:\OEM` and `install.bat` invokes it as Administrator at the end of installation (see §3's `/oem` volume). Nothing to do by hand on a normal install; to re-run it after a Windows feature update (§10), open the web viewer (or RDP as user `icloud`, blank password), start **PowerShell as Administrator** (right-click Start → Terminal (Admin)) and run `C:\OEM\01-debloat.ps1`, then `Restart-Computer` and wait for the
+This script runs unattended: dockur copies `./provision` to `C:\OEM` and `install.bat` invokes it as Administrator at the end of installation (see §3's `/oem` volume). Nothing to do by hand on a normal install.
+
+Debloat is the one provisioning script the app's **Re-run Windows provisioning…** does not cover: the v2 plan §4.2 checklist reconciles the iCloud client, the share, the bridge boundary and the agent, and does not model trimmed inbox apps. It is also outside the refreshed `C:\ProgramData\icloud-bridge-provision\current` bundle, which carries only the scripts a run dispatches. So re-running it after a Windows feature update (§10) stays manual, from `C:\OEM`: open the web viewer (or RDP as user `icloud`, blank password), start **PowerShell as Administrator** (right-click Start → Terminal (Admin)) and run `C:\OEM\01-debloat.ps1`, then `Restart-Computer` and wait for the
 desktop to return (auto-logon).
 
 **Source of truth: [`provision/01-debloat.ps1`](../provision/01-debloat.ps1).**
@@ -237,10 +239,19 @@ records what must *not* be trimmed later. The decisions behind it:
 
 ## 5. Guest provisioning — script 02: install iCloud
 
+The app installs the client for you — **Set up Windows automatically** on a fresh
+VM, **Re-run Windows provisioning…** afterwards — and only stops for the Apple
+sign-in, which cannot be automated. What follows is the supported fallback
+(SETUP.md §8) for a diagnosed failure or a guest you would rather configure
+yourself.
+
 PowerShell as Administrator again. Windows 11 ships with the PowerShell execution
 policy set to `Restricted`, so launching a `.ps1` directly fails with *"running
 scripts is disabled on this system"*. Invoke it with an explicit bypass — the same
-way `install.bat` runs script 01:
+way `install.bat` runs script 01. `C:\OEM` is the only copy of this one — like
+script 01 it is outside the refreshed
+`C:\ProgramData\icloud-bridge-provision\current` bundle, which carries only the
+scripts a provisioning run dispatches (v2 plan D42):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -NoProfile -File C:\OEM\02-install-icloud.ps1
@@ -296,19 +307,30 @@ Do this via the **web viewer** (`http://127.0.0.1:8006`) so 2FA prompts are visi
 
 ## 7. Guest provisioning — script 03: SMB share
 
+The app runs this script for you, and is the better route because of how the
+secret travels: **Set up Windows automatically** and **Re-run Windows
+provisioning…** read `SHARE_PASS` from an env file you pick and deliver it to the
+guest over the provisioning channel's stdin, so it never reaches a command line,
+an environment, a host temporary file or an edited script (v2 plan D41). Editing
+the placeholder by hand, below, is the fallback (SETUP.md §8).
+
 PowerShell as Administrator. As in §5, the execution policy blocks a direct
 `.ps1` launch — edit the file first to set the password, then invoke it with a
-bypass:
+bypass. Use the copy the app refreshes, not the frozen install-time one
+(v2 plan D42):
 
 ```powershell
-notepad C:\OEM\03-create-share.ps1     # set $pass to SHARE_PASS from .env
-powershell -ExecutionPolicy Bypass -NoProfile -File C:\OEM\03-create-share.ps1
+$P = 'C:\ProgramData\icloud-bridge-provision\current'  # C:\OEM if the app has never provisioned this VM
+notepad $P\03-create-share.ps1         # set $pass to SHARE_PASS from .env
+powershell -ExecutionPolicy Bypass -NoProfile -File $P\03-create-share.ps1
 ```
 
 **Source of truth: [`provision/03-create-share.ps1`](../provision/03-create-share.ps1).**
 The file ships with `STRONG_PASSWORD_HERE` as a deliberate placeholder — it is
-never replaced in the repository, which is the whole reason this step is not
-automated (D10). What it does and why:
+never replaced in the repository, which is why D10 left this step manual. The v2
+plan's D41 automates it without touching that: the app never edits the file, and
+passes the secret to an elevated run over stdin instead. What the script does and
+why:
 
 - Creates a dedicated local `syncshare` account for SMB only, hidden from the
   logon screen (D8). The auto-logon desktop user has a blank password by
@@ -422,11 +444,11 @@ the `sudoers` grant that lets the desktop operator run it; see v2 plan §5.1.
 | Canary writes but files stop appearing on other Apple devices | **Apple session expired** (expected every few months) | Open `http://127.0.0.1:8006`, click the iCloud tray icon, sign in + 2FA again. No other changes needed |
 | Guest disk full | iCloud data grew past DISK_SIZE | Stop container; edit `DISK_SIZE` in compose; `docker compose up -d` (dockur expands the disk); extend the partition in guest Disk Management |
 | New files on host not uploading | File written into the share while guest's iCloud app crashed | RDP in, relaunch iCloud from Start menu; consider adding it to `shell:startup` (do this during provisioning if desired) |
-| Everything broken after Windows feature update | Update reset a setting | Re-run scripts 01, 03 and 04 (all idempotent) |
+| Everything broken after Windows feature update | Update reset a setting | GUI → **Re-run Windows provisioning…** (Status tab or tray menu). It reconciles the share, the bridge boundary and the agent, repairing only what actually drifted, and keeps the working share password unless you tick the reset option (v2 plan D42/D44). Debloat is outside that checklist: re-run `01-debloat.ps1` by hand as in §4 if the update restored inbox apps. Manual §5–§7 remains the fallback (SETUP.md §8) |
 | Mount hangs / IO errors on host | Guest hard-crashed mid-operation | `sudo systemctl restart mnt-icloud.automount` after guest is back (same for `mnt-icloud_bridge.automount`) |
 | Tray yellow, `status.json` stale | The agent task is not running — it only runs in the logged-on `icloud` session | Check auto-logon at `:8006`, then `Start-ScheduledTask icloud-bridge-agent` |
 | Guest disk below the floor and staying there | Reclamation has nothing eligible: content open, modified, or still uploading | Wait for uploads to finish, or grow `DISK_SIZE` as above |
-| An exclusion reports `acl-write-denied` | §4's agent `RC,WDAC` grant did not take, or that object has a protected DACL | Re-run `04-bridge-agent.ps1` elevated and read its protected-DACL report |
+| An exclusion reports `acl-write-denied` | §4's agent `RC,WDAC` grant did not take, or that object has a protected DACL | GUI → **Re-run Windows provisioning…**: the boundary check is on the §4.2 checklist, and a protected child DACL is reported as `blocked` with the exact object rather than overwritten. To read the report yourself, run `04-bridge-agent.ps1` elevated from the refreshed copy, per SETUP.md §8 |
 | Excluded item reappeared under a new name | Renames of excluded items are not followed (accepted limitation) | Exclude the new path; clear the old one from *Missing configured items* |
 | Bridge stays off after a reboot; `ls /mnt/icloud` empty, no automount | The GUI's **Quit and power off VM** left `/var/lib/icloud-bridge/powered-off`, and the unit `ConditionPathExists` gates keep everything down (v2 plan D29). Intended | Launch the GUI (autostart does this at login) — it runs `icloud-bridge-power on`. To reconcile by hand: `sudo /usr/local/bin/icloud-bridge-power on` |
 | **Quit and power off VM** aborts saying a file is in use | A mount is busy (open file, a shell `cwd` inside `/mnt/icloud[_bridge]`, or an active copy); teardown refuses a lazy unmount by design | Close the holder — `lsof /mnt/icloud` / `fuser -m` — then Quit again. The VM stayed running the whole time |
