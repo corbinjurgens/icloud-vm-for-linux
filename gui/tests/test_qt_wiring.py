@@ -1158,3 +1158,85 @@ def test_every_effect_handler_runs_without_raising(controller, fakes):
             raise AssertionError(f"{effect.name} handler raised: {exc!r}") from exc
     app._timer.stop()
     app._end_busy()
+
+
+# ------------------------------------------- state-column memo (D34 host side) --
+
+def _dir_row(window, path: str):
+    """Add a bare directory row the way the real tree builder would."""
+    from PySide6.QtWidgets import QTreeWidgetItem
+    item = QTreeWidgetItem(window._tree_widget, [path, "", "", "", ""])
+    item.setData(0, window_module.ROLE_PATH, path)
+    item.setData(0, window_module.ROLE_KIND, "dir")
+    window._row_epoch += 1
+    return item
+
+
+def test_state_column_skips_the_walk_when_nothing_feeding_it_moved(controller, fakes):
+    """The 5 s tick must not re-render an identical state column.
+
+    Proven by clobbering a cell and showing the refresh leaves it alone: if the
+    per-row walk ran, it would overwrite the clobbered text.
+    """
+    app, window = running_controller(controller, fakes)
+    item = _dir_row(window, "Docs")           # "Docs" is the staged exclusion
+    window._refresh_state_column()
+    rendered = item.text(window_module.COL_STATE)
+    assert rendered, "a staged exclusion must render some state text"
+
+    item.setText(window_module.COL_STATE, "clobbered")
+    window._refresh_state_column()
+    assert item.text(window_module.COL_STATE) == "clobbered"
+
+
+def test_state_column_re_renders_when_the_selection_changes(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    item = _dir_row(window, "Docs")
+    window._refresh_state_column()
+    item.setText(window_module.COL_STATE, "clobbered")
+
+    window._wanted = []                        # the operator un-excluded it
+    window._refresh_state_column()
+    assert item.text(window_module.COL_STATE) != "clobbered"
+
+
+def test_state_column_re_renders_when_the_status_changes(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    item = _dir_row(window, "Docs")
+    window._loaded_wanted = ["Docs"]           # already applied, so status drives it
+    window._refresh_state_column()
+    item.setText(window_module.COL_STATE, "clobbered")
+
+    window._status = {"version": 1,
+                      "exclusions": [{"path": "Docs", "state": "applied"}]}
+    window._refresh_state_column()
+    assert item.text(window_module.COL_STATE) != "clobbered"
+
+
+def test_a_new_row_is_never_left_with_a_stale_memoized_state(controller, fakes):
+    """The failure mode the row epoch exists to prevent.
+
+    A row added after a memoized render must still get its own state cell; if
+    the memo key ignored the row set, this cell would stay empty forever.
+    """
+    app, window = running_controller(controller, fakes)
+    _dir_row(window, "Docs")
+    window._refresh_state_column()             # memo now armed
+
+    late = _dir_row(window, "Docs/Sub")        # under the excluded root
+    window._refresh_state_column()
+    assert late.text(window_module.COL_STATE) == "excluded (parent)"
+
+
+def test_every_row_mutating_path_bumps_the_row_epoch(controller, fakes):
+    """Each path that adds or removes rows must invalidate the memo."""
+    app, window = running_controller(controller, fakes)
+    parent = _dir_row(window, "Docs")
+
+    before = window._row_epoch
+    window._more_row(parent, "Docs", 100)
+    assert window._row_epoch > before, "_more_row adds a row"
+
+    before = window._row_epoch
+    window._rebuild_tree()
+    assert window._row_epoch > before, "_rebuild_tree replaces every row"

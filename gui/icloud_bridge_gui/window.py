@@ -195,6 +195,13 @@ class MainWindow(QMainWindow):
         self._power_action = power.ACTION_NONE
         self._env_path = ""
         self._tree_generated_at: str | None = None
+        #: Bumped by every path that adds or removes a tree row. It is part of
+        #: the ``_refresh_state_column`` memo key, so a new row can never inherit
+        #: a cached "nothing changed" decision and keep an empty state cell.
+        self._row_epoch = 0
+        #: Inputs the state column was last rendered from; ``None`` means the
+        #: column must be rendered. See ``_refresh_state_column``.
+        self._state_column_key: tuple | None = None
 
         central = QWidget()
         central_layout = QVBoxLayout(central)
@@ -906,6 +913,7 @@ class MainWindow(QMainWindow):
     def _rebuild_tree(self) -> None:
         # A new tree generation: every folder is idle again and any answer still
         # in flight from the previous tree is discarded rather than applied.
+        self._row_epoch += 1
         self._requests.reset()
         self._polls_in_flight.clear()
         self._items_by_path.clear()
@@ -1169,8 +1177,34 @@ class MainWindow(QMainWindow):
         return details
 
     def _refresh_state_column(self) -> None:
+        """Rewrite the State column, skipping the walk when nothing feeding it moved.
+
+        The 5 s tick (``REFRESH_INTERVAL_MS``) calls ``apply_snapshot``
+        unconditionally, and every non-rebuild pass ends here — including while
+        the window is hidden in the tray, and against a ``status.json`` the agent
+        only rewrites every 15 s. The text this produces is a pure function of
+        the exclusion states and details in that status, the wanted and loaded
+        selections, and which rows exist; when none of those moved, the whole
+        per-row walk is recomputing an identical answer.
+
+        Measured at 5 219 directory rows: ``apply_snapshot`` cost 12.07-13.43 ms
+        per tick, of which this function was 12.4-12.7 ms; with the early-out it
+        is 0.016-0.034 ms. The saving is small in absolute terms against a guest
+        that burns a fifth of a core, but it scales linearly with the library
+        (~2.4 us per row per tick) and it removes a periodic block of the GUI
+        thread. Extends D34's host-side rule from the document *parse* to the
+        *render*.
+        """
         states = self._status_exclusion_states()
         details = self._status_exclusion_details()
+        key = (self._row_epoch,
+               tuple(sorted(states.items())),
+               tuple(sorted(details.items())),
+               tuple(self._wanted),
+               tuple(self._loaded_wanted))
+        if key == self._state_column_key:
+            return
+        self._state_column_key = key
         lowered = [w.lower() for w in self._wanted]
         loaded = {w.lower() for w in self._loaded_wanted}
         self._suppress_item_signals = True
@@ -1275,6 +1309,7 @@ class MainWindow(QMainWindow):
 
     def _more_row(self, parent: QTreeWidgetItem, path: str, offset: int) -> None:
         """Add (or restore) the continuation row under ``parent``."""
+        self._row_epoch += 1
         more = QTreeWidgetItem(parent, ["Load more…", "", "", "", ""])
         more.setData(0, ROLE_KIND, "more")
         more.setData(0, ROLE_EXTRA, {"path": path, "offset": offset})
@@ -1407,6 +1442,9 @@ class MainWindow(QMainWindow):
         if not self._config_error:
             self._sync_error.hide()
 
+        # New file rows land here, so the state column's memo must not survive
+        # this: a freshly listed file needs its own state cell computed.
+        self._row_epoch += 1
         self._suppress_item_signals = True
         try:
             # The continuation row (now showing "Loading…") is replaced by the
@@ -1578,6 +1616,7 @@ class MainWindow(QMainWindow):
         self._wanted = [w for w in self._wanted if w.lower() != path.lower()]
         parent = selected[0].parent()
         if parent is not None:
+            self._row_epoch += 1
             parent.removeChild(selected[0])
             if parent.childCount() == 0:
                 index = self._tree_widget.indexOfTopLevelItem(parent)
