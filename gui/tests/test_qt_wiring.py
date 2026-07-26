@@ -445,3 +445,91 @@ def test_the_drain_timer_is_stopped_once_the_helper_is_called(controller, fakes)
     pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.POWERED_OFF)
     assert isinstance(app._drain_timer, QTimer)
     assert not app._drain_timer.isActive()
+
+
+# ------------------------------------- the D35 compatibility gate (controller) --
+
+def snapshot_with(compat):
+    return health.Snapshot(
+        checks=[health.Check("Guest agent", health.GREEN, "reporting")],
+        overall=health.GREEN, status={"version": 1}, tree=None, compatibility=compat)
+
+
+def running_controller(controller, fakes):
+    app = controller()
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.RUNNING)
+    window = app._window
+    # A loaded selection with a staged change, so Apply would otherwise be live.
+    window._loaded_wanted = []
+    window._loaded_revision = 3
+    window._config_error = None
+    window._wanted = ["Docs"]
+    return app, window
+
+
+@pytest.mark.parametrize("compat,enabled", [
+    (bridge.Compatibility(bridge.COMPAT_CURRENT, bridge.AGENT_BUILD), True),
+    (bridge.Compatibility(bridge.COMPAT_SKEWED, 99, "build 99"), True),
+    (bridge.Compatibility(bridge.COMPAT_INCOMPATIBLE, None, "version 2"), False),
+    (bridge.Compatibility(bridge.COMPAT_UNKNOWN), False),
+])
+def test_apply_is_enabled_only_by_a_verified_protocol(controller, fakes, compat, enabled):
+    """Skew stays usable; an unsupported or unverified protocol does not."""
+    app, window = running_controller(controller, fakes)
+    window.apply_snapshot(snapshot_with(compat))
+    assert window._apply_button.isEnabled() is enabled
+
+
+def test_an_incompatible_protocol_refuses_the_apply_write(controller, fakes, monkeypatch):
+    app, window = running_controller(controller, fakes)
+    written = Recorder(4)
+    monkeypatch.setattr(bridge, "write_exclusions", written)
+    window.apply_snapshot(
+        snapshot_with(bridge.Compatibility(bridge.COMPAT_INCOMPATIBLE, None, "version 2")))
+
+    window._apply()
+    pump(0.3)
+    assert written.count == 0                   # exclusions.json left untouched
+    # The Selective Sync tab is not the current tab, so `isVisible` is False for
+    # a reason unrelated to this; `isHidden` is the per-widget question.
+    assert not window._sync_error.isHidden()
+    assert "04-bridge-agent.ps1" in window._sync_error.text()
+
+
+def test_an_incompatible_protocol_dispatches_no_list_request(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    window.apply_snapshot(
+        snapshot_with(bridge.Compatibility(bridge.COMPAT_INCOMPATIBLE, None, "version 2")))
+
+    window._request_files("Docs", 0, listing.FIRST_PAGE)
+    pump(0.3)
+    assert not any(call[0][:1] == ("Docs",) for call in fakes.request_listing.calls)
+
+
+def test_a_skewed_agent_still_dispatches_and_shows_the_banner(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    window.apply_snapshot(
+        snapshot_with(bridge.Compatibility(bridge.COMPAT_SKEWED, 99, "the guest agent is build 99")))
+    assert window._protocol.isVisible()
+    assert "04-bridge-agent.ps1" in window._protocol.text()
+
+    def asked_for_docs():
+        return any(call[0][:1] == ("Docs",) for call in fakes.request_listing.calls)
+
+    window._request_files("Docs", 0, listing.FIRST_PAGE)
+    pump(1.0, until=asked_for_docs)
+    assert asked_for_docs()
+
+
+def test_powering_off_reverts_the_gate_to_unknown(controller, fakes):
+    """A classification about an agent that is no longer reachable is not kept."""
+    app, window = running_controller(controller, fakes)
+    window.apply_snapshot(
+        snapshot_with(bridge.Compatibility(bridge.COMPAT_CURRENT, bridge.AGENT_BUILD)))
+    assert window._compatibility.writable
+
+    app._on_power_off_requested()
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.POWERED_OFF)
+    assert window._compatibility.state == bridge.COMPAT_UNKNOWN
+    assert not window._compatibility.writable
+    assert not window._protocol.isVisible()

@@ -230,6 +230,12 @@ Files: `gui/icloud_bridge_gui/lifecycle.py` (new),
 
 ## 3. Detect protocol and agent-version skew (D35, I-003)
 
+> **Status: done.** D35 is in the register; all three document kinds carry
+> `"version": 1`; `status.json` carries `agentBuild`; `bridge.py` validates and
+> classifies; the controller gates Apply and list dispatch on it. The agent side
+> is **unexecuted here** — `make lint-ps` parses it, but nothing in this
+> workspace can run Windows PowerShell against a guest. E12 covers that.
+
 The §2 formats already carry `"version": 1` in `status.json` and `tree.json`,
 but the GUI accepts both as arbitrary JSON, and list responses have no version
 at all. A package upgrade ships a newer `agent.ps1` into the host bundle but

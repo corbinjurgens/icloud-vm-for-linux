@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable
 
@@ -359,6 +359,11 @@ class Snapshot:
     overall: str
     status: dict | None
     tree: dict | None
+    #: The D35 protocol/agent-build classification. Carried explicitly rather
+    #: than left as one more "file unavailable" string, because the controller's
+    #: central write gate keys off it.
+    compatibility: bridge.Compatibility = field(
+        default_factory=bridge.Compatibility)
 
 
 def gather(*, last_written_revision: Any = None, last_write_at: datetime | None = None,
@@ -385,17 +390,26 @@ def gather(*, last_written_revision: Any = None, last_write_at: datetime | None 
     except OSError:
         pass
 
+    # A `ProtocolError` is kept apart from every other read failure: only it
+    # may close the D35 write gate, and "the file is missing" must never be
+    # mistaken for "the guest speaks a protocol this app does not".
     status: dict | None = None
     status_error: str | None = None
+    status_protocol_error: str | None = None
     try:
         status = documents.read(bridge.status_path(), bridge.read_status)
+    except bridge.ProtocolError as exc:
+        status_error = status_protocol_error = str(exc)
     except bridge.BridgeError as exc:
         status_error = str(exc)
 
     tree: dict | None = None
     tree_error: str | None = None
+    tree_protocol_error: str | None = None
     try:
         tree = documents.read(bridge.tree_path(), bridge.read_tree)
+    except bridge.ProtocolError as exc:
+        tree_error = tree_protocol_error = str(exc)
     except bridge.BridgeError as exc:
         tree_error = str(exc)
 
@@ -407,4 +421,8 @@ def gather(*, last_written_revision: Any = None, last_write_at: datetime | None 
         tree=tree, tree_error=tree_error,
         last_written_revision=last_written_revision, last_write_at=last_write_at,
     )
-    return Snapshot(checks=checks, overall=overall(checks), status=status, tree=tree)
+    compatibility = bridge.classify_compatibility(
+        status, status_protocol_error=status_protocol_error,
+        tree_protocol_error=tree_protocol_error)
+    return Snapshot(checks=checks, overall=overall(checks), status=status, tree=tree,
+                    compatibility=compatibility)

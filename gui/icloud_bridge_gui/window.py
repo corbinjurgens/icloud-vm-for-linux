@@ -95,6 +95,11 @@ class MainWindow(QMainWindow):
         #: True only while an Apply write is actually in flight, so the shutdown
         #: gate never begins an unmount mid-write.
         self._apply_writing = False
+        #: The D35 protocol/agent-build classification from the last snapshot.
+        #: Starts `unknown`, which is *closed*: no write and no list request may
+        #: be dispatched until a status document has actually proved the guest
+        #: agent speaks this protocol.
+        self._compatibility = bridge.Compatibility()
         self.setWindowTitle("iCloud bridge")
         self.resize(880, 620)
 
@@ -153,6 +158,17 @@ class MainWindow(QMainWindow):
         self._notice.setStyleSheet(f"color: {DOT_COLORS[health.RED]};")
         self._notice.hide()
         central_layout.addWidget(self._notice)
+
+        # The D35 protocol/agent-build banner. Its own widget for the same
+        # reason as the notice: skew persists across snapshots and must survive
+        # whatever the lifecycle banner is currently saying. Selectable so the
+        # operator can copy the recovery command out of it.
+        self._protocol = QLabel("")
+        self._protocol.setWordWrap(True)
+        self._protocol.setContentsMargins(10, 6, 10, 6)
+        self._protocol.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._protocol.hide()
+        central_layout.addWidget(self._protocol)
 
         self._tabs = QTabWidget()
         self._tabs.addTab(self._build_status_tab(), "Status")
@@ -513,6 +529,48 @@ class MainWindow(QMainWindow):
     def hide_notice(self) -> None:
         self._notice.hide()
 
+    # ------------------------------------------------- the D35 version gate --
+
+    #: Yellow for skew (everything works, the pair is wrong), red for an
+    #: unsupported protocol (nothing may be written).
+    PROTOCOL_STYLES = {
+        bridge.COMPAT_SKEWED: "background: #fdf5e2; color: #6b4e00;",
+        bridge.COMPAT_INCOMPATIBLE: f"background: #fbecea; color: {DOT_COLORS[health.RED]};",
+    }
+
+    def _apply_compatibility(self, compatibility: bridge.Compatibility) -> None:
+        """Record the classification and show the matching persistent banner.
+
+        `unknown` shows nothing — a status document that has not arrived yet is
+        an ordinary transient, already reported by the Guest agent health row —
+        but it still leaves the write gate closed, which `writable` decides.
+        """
+        self._compatibility = compatibility
+        if compatibility.state == bridge.COMPAT_SKEWED:
+            self._protocol.setText(f"{bridge.SKEW_BANNER}\n{compatibility.detail}")
+        elif compatibility.state == bridge.COMPAT_INCOMPATIBLE:
+            self._protocol.setText(
+                "The guest agent is not speaking this app's bridge protocol, so "
+                "nothing will be written to it.\n"
+                f"{compatibility.detail}")
+        else:
+            self._protocol.hide()
+            self._update_buttons()
+            return
+        self._protocol.setStyleSheet(self.PROTOCOL_STYLES[compatibility.state])
+        self._protocol.show()
+        self._update_buttons()
+
+    def _refuse_incompatible(self) -> bool:
+        """True when the protocol gate is closed; also explains why on the tab."""
+        if self._compatibility.writable:
+            return False
+        self._sync_error.setText(
+            "Selective sync is unavailable until the guest agent matches this "
+            f"app. {self._compatibility.detail} {bridge.UPDATE_AGENT_INSTRUCTION}")
+        self._sync_error.show()
+        return True
+
     #: Button text per D30 action. ``power.ACTION_SETUP`` has no button here —
     #: first-run guidance is a banner, not a one-click action.
     POWER_BUTTON_TEXT = {
@@ -551,6 +609,9 @@ class MainWindow(QMainWindow):
         """
         self._checks = []
         self._status = None
+        # The last version classification described an agent that is no longer
+        # reachable; back to `unknown`, which also re-closes the D35 write gate.
+        self._apply_compatibility(bridge.Compatibility())
         for dot, detail in self._check_widgets.values():
             dot.setStyleSheet("color: palette(mid);")
             detail.setText("-")
@@ -605,6 +666,7 @@ class MainWindow(QMainWindow):
         """Update every widget from a freshly gathered snapshot (GUI thread)."""
         self._checks = snapshot.checks
         self._status = snapshot.status
+        self._apply_compatibility(snapshot.compatibility)
         for check in snapshot.checks:
             dot, detail = self._ensure_check_row(check.name)
             dot.setStyleSheet(f"color: {DOT_COLORS[check.severity]};")
@@ -1066,9 +1128,12 @@ class MainWindow(QMainWindow):
             self._suppress_item_signals = False
 
     def _request_files(self, path: str, offset: int, kind: str) -> None:
-        if self._io_paused:
-            # Nothing was dispatched, so leave no state claiming otherwise.
+        if self._io_paused or not self._compatibility.writable:
+            # Nothing was dispatched, so leave no state claiming otherwise. The
+            # D35 gate belongs here rather than at the call sites: this is the
+            # single point every list request passes through.
             self._on_request_dropped(path, offset, kind)
+            self._refuse_incompatible()
             return
 
         def work():
@@ -1213,7 +1278,8 @@ class MainWindow(QMainWindow):
         is_missing = bool(selected) and selected[0].data(0, ROLE_KIND) == "missing"
         self._remove_button.setEnabled(is_missing)
         dirty = sorted(w.lower() for w in self._wanted) != sorted(w.lower() for w in self._loaded_wanted)
-        self._apply_button.setEnabled(dirty and self._config_error is None)
+        self._apply_button.setEnabled(
+            dirty and self._config_error is None and self._compatibility.writable)
 
     def _remove_selected_missing(self) -> None:
         selected = self._tree_widget.selectedItems()
@@ -1237,6 +1303,9 @@ class MainWindow(QMainWindow):
 
     def _apply(self) -> None:
         if self._io_paused:
+            return
+        if self._refuse_incompatible():
+            # Fail closed: leave the current exclusions.json exactly as it is.
             return
         try:
             wanted = bridge.canonicalize(self._wanted)

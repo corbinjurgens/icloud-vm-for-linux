@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 
 import pytest
@@ -156,7 +157,8 @@ def test_request_and_response_round_trip(share):
 
     # The agent answers and removes the request.
     request_path.unlink()
-    response = {"path": "Docs", "error": None, "offset": 0, "nextOffset": None,
+    response = {"version": 1, "path": "Docs", "error": None, "offset": 0,
+                "nextOffset": None,
                 "files": [{"name": "notes.txt", "path": "Docs/notes.txt",
                            "logicalBytes": 1024, "excluded": False, "dataless": False}]}
     (share / "responses" / f"list-{request_id}.json").write_text(json.dumps(response), encoding="utf-8")
@@ -233,3 +235,145 @@ def test_bridge_dir_follows_the_environment(monkeypatch, tmp_path):
     assert bridge.bridge_dir() == bridge.DEFAULT_BRIDGE_DIR
     monkeypatch.setenv("ICLOUD_MOUNT_DIR", "/tmp/fake-icloud")
     assert bridge.mount_dir() == "/tmp/fake-icloud"
+
+
+# ------------------------------------- protocol and agent-build skew (D35) ---
+
+def write_status(share, **overrides):
+    doc = {"version": 1, "agentBuild": bridge.AGENT_BUILD, "generatedAt": "2026-07-26T00:00:00Z"}
+    doc.update(overrides)
+    (share / "status.json").write_text(json.dumps(doc), encoding="utf-8")
+    return doc
+
+
+def write_tree(share, **overrides):
+    doc = {"version": 1, "generatedAt": "2026-07-26T00:00:00Z", "root": {"dirs": []}}
+    doc.update(overrides)
+    (share / "tree.json").write_text(json.dumps(doc), encoding="utf-8")
+    return doc
+
+
+def test_the_bundled_agent_build_matches_the_powershell_literal():
+    """The two ends carry the same number, or skew detection is a lie.
+
+    Compared against the source of truth; `make lint` separately proves
+    `provision/agent.ps1` is byte-identical to it.
+    """
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    text = open(os.path.join(repo, "guest-agent", "agent.ps1"), encoding="utf-8").read()
+    builds = re.findall(r"^\$AgentBuild\s*=\s*(\d+)\s*$", text, re.MULTILINE)
+    versions = re.findall(r"^\$ProtocolVersion\s*=\s*(\d+)\s*$", text, re.MULTILINE)
+    assert builds == [str(bridge.AGENT_BUILD)]
+    assert versions == [str(bridge.PROTOCOL_VERSION)]
+
+
+@pytest.mark.parametrize("version", [None, "1", 1.0, True, 0, 2, 99, [1], {"v": 1}])
+def test_status_with_an_unsupported_version_is_a_protocol_error(share, version):
+    doc = {"agentBuild": bridge.AGENT_BUILD}
+    if version is not None:
+        doc["version"] = version
+    (share / "status.json").write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(bridge.ProtocolError):
+        bridge.read_status()
+
+
+@pytest.mark.parametrize("version", [None, "1", True, 2])
+def test_tree_with_an_unsupported_version_is_a_protocol_error(share, version):
+    doc = {"root": {"dirs": []}}
+    if version is not None:
+        doc["version"] = version
+    (share / "tree.json").write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(bridge.ProtocolError):
+        bridge.read_tree()
+
+
+@pytest.mark.parametrize("version", [None, "1", True, 2])
+def test_list_response_with_an_unsupported_version_is_a_protocol_error(share, version):
+    request_id = bridge.request_listing("Docs")
+    doc = {"path": "Docs", "error": None, "offset": 0, "nextOffset": None, "files": []}
+    if version is not None:
+        doc["version"] = version
+    (share / "responses" / f"list-{request_id}.json").write_text(
+        json.dumps(doc), encoding="utf-8")
+    with pytest.raises(bridge.ProtocolError):
+        bridge.poll_response(request_id)
+
+
+def test_a_protocol_error_is_also_a_bridge_error(share):
+    """So no existing `except BridgeError` path loses its handling."""
+    (share / "status.json").write_text(json.dumps({"version": 2}), encoding="utf-8")
+    with pytest.raises(bridge.BridgeError):
+        bridge.read_status()
+
+
+def test_a_matching_build_is_current(share):
+    doc = write_status(share)
+    assert bridge.read_status() == doc
+    compat = bridge.classify_agent_build(doc)
+    assert compat.state == bridge.COMPAT_CURRENT
+    assert compat.agent_build == bridge.AGENT_BUILD
+    assert compat.writable
+
+
+@pytest.mark.parametrize("build", [0, bridge.AGENT_BUILD + 1, bridge.AGENT_BUILD + 99])
+def test_any_other_build_is_skewed_in_both_directions(build):
+    """A newer agent is treated exactly like an older one (hard rule 9)."""
+    compat = bridge.classify_agent_build({"version": 1, "agentBuild": build})
+    assert compat.state == bridge.COMPAT_SKEWED
+    assert compat.agent_build == build
+    # Skew still works: the protocol matched, so writes stay allowed.
+    assert compat.writable
+
+
+@pytest.mark.parametrize("build", [None, "1", True, -1, 1.5, [], {}])
+def test_a_missing_or_malformed_build_is_skewed(build):
+    doc = {"version": 1}
+    if build is not None:
+        doc["agentBuild"] = build
+    compat = bridge.classify_agent_build(doc)
+    assert compat.state == bridge.COMPAT_SKEWED
+    assert compat.agent_build is None
+    assert compat.writable
+
+
+def test_an_absent_status_leaves_compatibility_unknown_and_closed():
+    compat = bridge.classify_compatibility(None)
+    assert compat.state == bridge.COMPAT_UNKNOWN
+    assert not compat.writable
+
+
+def test_an_unsupported_status_version_closes_the_gate():
+    compat = bridge.classify_compatibility(
+        None, status_protocol_error="status.json reports version 2")
+    assert compat.state == bridge.COMPAT_INCOMPATIBLE
+    assert not compat.writable
+    assert "version 2" in compat.detail
+
+
+def test_an_unsupported_tree_version_closes_the_gate_too():
+    compat = bridge.classify_compatibility(
+        {"version": 1, "agentBuild": bridge.AGENT_BUILD},
+        tree_protocol_error="tree.json reports version 7")
+    assert compat.state == bridge.COMPAT_INCOMPATIBLE
+    assert not compat.writable
+
+
+def test_a_merely_missing_tree_does_not_override_a_good_status():
+    """Browsing is unavailable, but that is not a reason to refuse writes."""
+    compat = bridge.classify_compatibility(
+        {"version": 1, "agentBuild": bridge.AGENT_BUILD})
+    assert compat.state == bridge.COMPAT_CURRENT
+    assert compat.writable
+
+
+def test_the_recovery_instruction_names_script_04():
+    assert "04-bridge-agent.ps1" in bridge.UPDATE_AGENT_INSTRUCTION
+    assert "04-bridge-agent.ps1" in bridge.SKEW_BANNER
+
+
+def test_read_exclusions_still_uses_its_own_version_check(share):
+    """This item does not change the exclusions format."""
+    (share / "exclusions.json").write_text(
+        json.dumps({"version": 2, "revision": 0, "exclusions": []}), encoding="utf-8")
+    with pytest.raises(bridge.BridgeError):
+        bridge.read_exclusions()

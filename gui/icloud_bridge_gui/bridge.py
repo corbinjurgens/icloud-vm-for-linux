@@ -17,10 +17,23 @@ import os
 import re
 import secrets
 import tempfile
+from dataclasses import dataclass
 from typing import Any, Iterable
 
 DEFAULT_BRIDGE_DIR = "/mnt/icloud_bridge"
 DEFAULT_MOUNT_DIR = "/mnt/icloud"
+
+#: The one supported protocol version, carried by every document in both
+#: directions (v2 plan D35). There is deliberately no compatibility matrix: the
+#: project is pre-release, the GUI and the agent ship together, and skew is
+#: something to detect and report rather than accommodate (`AGENTS.md` rule 9).
+PROTOCOL_VERSION = 1
+
+#: The agent build this app was shipped with. A non-negative integer bumped in
+#: any commit that changes `guest-agent/agent.ps1` behavior. `test_bridge`
+#: checks it against the PowerShell literal so the two cannot drift unnoticed.
+#: A date would not do: more than one agent change can land on the same day.
+AGENT_BUILD = 1
 
 # Mirrors the agent's own bounds so the two ends agree on what is acceptable.
 MAX_CONFIG_BYTES = 1024 * 1024
@@ -40,6 +53,115 @@ class BridgeError(Exception):
 
 class RevisionConflict(BridgeError):
     """exclusions.json changed underneath us; reload before writing again."""
+
+
+class ProtocolError(BridgeError):
+    """A bridge document does not carry the one supported protocol version.
+
+    Distinct from a plain :class:`BridgeError` on purpose: "the file is missing"
+    and "the guest speaks a protocol this app does not" need different UI and
+    different gating, and collapsing them into one message would make the
+    fail-closed write gate impossible to enforce centrally (D35).
+    """
+
+
+# --------------------------------------------------------- version checking --
+
+#: Compatibility classifications (D35).
+COMPAT_CURRENT = "current"            # protocol matches and the build matches
+COMPAT_SKEWED = "skewed"              # protocol matches, the agent build does not
+COMPAT_UNKNOWN = "unknown"            # no current status document yet
+COMPAT_INCOMPATIBLE = "incompatible"  # a document reported an unsupported version
+
+
+@dataclass(frozen=True)
+class Compatibility:
+    """What we know about the agent on the other end of the bridge."""
+
+    state: str = COMPAT_UNKNOWN
+    agent_build: int | None = None
+    detail: str = ""
+
+    @property
+    def writable(self) -> bool:
+        """Whether writes and list requests may be dispatched at all.
+
+        Fail-closed: only a protocol we have actually verified opens the gate. A
+        transient missing status leaves it `unknown` and therefore closed, so
+        the GUI never guesses which agent is running.
+        """
+        return self.state in (COMPAT_CURRENT, COMPAT_SKEWED)
+
+
+#: The recovery action for both skew and an unsupported protocol. Deliberately a
+#: copyable instruction, never an automated guest-side update: the GUI has no
+#: guest-admin credentials and must not gain any.
+UPDATE_AGENT_INSTRUCTION = (
+    "In the VM, re-run C:\\OEM\\04-bridge-agent.ps1 (elevated) to update it.")
+
+SKEW_BANNER = ("The guest agent does not match this app. " + UPDATE_AGENT_INSTRUCTION)
+
+
+def classify_compatibility(status: Any, *, status_protocol_error: str | None = None,
+                           tree_protocol_error: str | None = None) -> Compatibility:
+    """The overall D35 classification the controller gates writes on.
+
+    An explicitly unsupported *status or tree* version makes the whole channel
+    incompatible — a guest speaking the wrong protocol in one document is not a
+    guest to write to. A merely missing or stale tree keeps browsing
+    unavailable but does not override a compatible status classification, which
+    is why only the *protocol* errors are passed here, not every read failure.
+    """
+    if status_protocol_error:
+        return Compatibility(COMPAT_INCOMPATIBLE, None, status_protocol_error)
+    if tree_protocol_error:
+        return Compatibility(COMPAT_INCOMPATIBLE, None, tree_protocol_error)
+    if not isinstance(status, dict):
+        return Compatibility(
+            COMPAT_UNKNOWN, None,
+            "the guest agent's status document is not available, so its version "
+            "cannot be checked yet.")
+    return classify_agent_build(status)
+
+
+def _check_protocol_version(data: dict, name: str) -> None:
+    """Raise :class:`ProtocolError` unless ``data`` carries version 1 exactly.
+
+    Missing, boolean, non-integer, or any other number is incompatible. There is
+    no tolerated older form to make an exception for.
+    """
+    version = data.get("version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise ProtocolError(
+            f'{name} has no usable "version" field, so the guest agent is not '
+            f"speaking this app's bridge protocol (version {PROTOCOL_VERSION}). "
+            + UPDATE_AGENT_INSTRUCTION)
+    if version != PROTOCOL_VERSION:
+        raise ProtocolError(
+            f"{name} reports bridge protocol version {version}; this app supports "
+            f"only version {PROTOCOL_VERSION}. " + UPDATE_AGENT_INSTRUCTION)
+
+
+def classify_agent_build(status: Any) -> Compatibility:
+    """Classify a *protocol-valid* status document's ``agentBuild``.
+
+    Comparison is equality. Anything that is not exactly the bundled constant —
+    lower, higher, missing or malformed — is `skewed`; under the pre-release
+    rule the only supported configuration is the matching pair.
+    """
+    if not isinstance(status, dict):
+        return Compatibility(COMPAT_UNKNOWN, None, "no status document")
+    build = status.get("agentBuild")
+    if isinstance(build, bool) or not isinstance(build, int) or build < 0:
+        return Compatibility(
+            COMPAT_SKEWED, None,
+            "the guest agent does not report a build number, so it predates the "
+            "version check.")
+    if build != AGENT_BUILD:
+        return Compatibility(
+            COMPAT_SKEWED, build,
+            f"the guest agent is build {build}; this app ships build {AGENT_BUILD}.")
+    return Compatibility(COMPAT_CURRENT, build)
 
 
 def bridge_dir() -> str:
@@ -154,6 +276,7 @@ def read_status() -> dict:
     data = _read_json(status_path(), MAX_STATUS_BYTES)
     if not isinstance(data, dict):
         raise BridgeError("status.json is not a JSON object")
+    _check_protocol_version(data, "status.json")
     return data
 
 
@@ -162,6 +285,7 @@ def read_tree() -> dict:
     data = _read_json(tree_path(), MAX_TREE_BYTES)
     if not isinstance(data, dict):
         raise BridgeError("tree.json is not a JSON object")
+    _check_protocol_version(data, "tree.json")
     return data
 
 
@@ -299,6 +423,7 @@ def poll_response(request_id: str) -> dict | None:
             pass
     if not isinstance(data, dict):
         raise BridgeError("list response is not a JSON object")
+    _check_protocol_version(data, "a file-listing response")
     return data
 
 

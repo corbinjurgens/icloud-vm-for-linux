@@ -68,6 +68,16 @@ $BridgeDir = Join-Path $BaseDir "io"
 $StateDir  = Join-Path $BaseDir "state"
 $ShareUser = "syncshare"
 
+# Bridge protocol identity (v2 plan D35). $ProtocolVersion is the "version"
+# field of every document this agent writes and reads; there is exactly one
+# supported value, and a mismatch is an error the GUI reports rather than
+# something either end works around. $AgentBuild is a non-negative, monotonically
+# increasing integer -- bump it in any commit that changes this script's
+# behavior, so a GUI shipped alongside a newer agent can say so. The GUI carries
+# the same number in bridge.py and a test compares the two literals.
+$ProtocolVersion = 1
+$AgentBuild      = 1
+
 # Cloud Files / FILE_ATTRIBUTE values.
 # DIRECTORY and UNPINNED are listed for reference and are deliberately unused:
 # the native enumerator already reports IsDirectory, and UNPINNED is only user
@@ -1635,7 +1645,7 @@ function Invoke-FullScan {
     $script:ScanInfo.cloudInfoQueries = $script:CloudInfoQueries
 
     $tree = [ordered]@{
-        version = 1
+        version = $ProtocolVersion
         generatedAt = Get-UtcStamp
         root = [ordered]@{ dirs = $root.dirs }
     }
@@ -1662,7 +1672,11 @@ function Invoke-ListRequests {
         if ($handled -ge $MaxRequestsPerTick) { continue }
         $handled++
         $id = $fi.BaseName
-        $response = [ordered]@{ path = ''; error = $null; offset = 0; nextOffset = $null; files = @() }
+        # The version goes on the response too (v2 plan section 2.4/D35), so all
+        # three document kinds are checked the same way. It is set before the
+        # try block so an error response carries it as well -- a failure the GUI
+        # can read is more useful than one it rejects as unversioned.
+        $response = [ordered]@{ version = $ProtocolVersion; path = ''; error = $null; offset = 0; nextOffset = $null; files = @() }
         try {
             if ($fi.Length -gt $MaxRequestBytes) { throw "request exceeds $MaxRequestBytes bytes" }
             $doc = Read-JsonFile $fi.FullName $MaxRequestBytes
@@ -1742,7 +1756,8 @@ function Write-Status {
     } catch { }
 
     $status = [ordered]@{
-        version = 1
+        version = $ProtocolVersion
+        agentBuild = $AgentBuild
         generatedAt = Get-UtcStamp
         agentStartedAt = Get-UtcStamp $script:AgentStartedAt
         syncRoot = $script:SyncRootFull.Replace('\', '/')

@@ -221,6 +221,7 @@ Continues the v1 register (D1–D13).
 | D32 | SMB wire protection | **Off, deliberately.** `03-create-share.ps1` sets `RequireSecuritySignature $false` and asserts `EncryptData $false` / `RejectUnencryptedAccess $false`; neither mount unit asks for `sign` or `seal` | Since 24H2 a stock Windows 11 Pro requires SMB signing by default, so every hydration byte would be HMAC/GMAC-signed (and, if encryption ever flips on, AES-GCM'd) on both ends of a path that is host loopback → docker-proxy → container NAT → QEMU tap. Anyone positioned on that path already has root on the host, so there is no confidentiality or integrity property to lose — D9 already makes the host the security boundary. Authentication (D8) and the exclusion model (D15: ACLs + ABE) are untouched, and SMB 3.1.1 pre-auth integrity still protects negotiation. The settings are idempotent assertions, so the documented post-feature-update re-run of script 03 (v1 plan §10) is also the correction path for a future Microsoft default-flip |
 | D33 | Host I/O path | Pass `/dev/vhost-net` into the container (`host/setup-prereqs.sh` loads the module and persists it; `acceptance-tests.sh` checks the node). Add `rasize=16777216` to the **data** mount only. Everything else on the path keeps its default, and those defaults are recorded as load-bearing in the unit files: `cache=strict`, `actimeo=1`, negotiated `rsize`/`wsize`, no `mfsymlinks`, no `max_channels`, no `sign`/`seal` | dockur enables `vhost=on` only if it can open `/dev/vhost-net`; the default docker device cgroup denies that, so without the passthrough QEMU copies every SMB byte through its userspace main loop. `rasize` decouples readahead from the negotiated I/O size, which is what shortens a cold hydration — one long sequential read that blocks the reader. The recorded defaults are not incidental: `cache=strict` is what forces a placeholder read to reach the guest and trigger CfAPI hydration, `mfsymlinks` would create files iCloud syncs as junk, and multichannel cannot apply to one NATed virtio NIC |
 | D34 | Steady-state work elision | The agent may skip **reporting and discovery** work when it is provably redundant, never enforcement work: (a) the per-entry DACL reads of full-tree reconciliation are skipped while the wanted set and private state are empty and the previous pass completed clean, gated by a persisted flag that defaults to false and is cleared *before* any ACL write; (b) the re-verification walk of an already-applied exclusion runs every pass for its first few passes, then every ~10th, and immediately on a config change; (c) a reclamation episode reuses its candidate lists for ~5 passes but may never *end* on a stale list. On the host side the GUI keeps its 5 s cadence for file stats but re-parses `status.json`/`tree.json` only when `(mtime, size)` moves, and runs `docker inspect` — for the health row and the D30 power-control classification alike — at most every 15 s per consumer, with an explicit invalidation on every power transition and on Refresh | These are the three recurring costs that scale with library size rather than with anything the user did, and none of them is what makes the system safe. D15's denies and parent guards are still asserted on every 60 s pass; every dehydration candidate is still re-checked with `CfGetPlaceholderInfo` immediately before its request (D26); the cadences of D17 are unchanged. What degrades is label freshness — an `applied` exclusion's reported size, and the health rows' view of the container — by an interval far inside the thresholds D23 already uses |
+| D35 | Bridge protocol and agent-build skew | Every bridge document — `status.json`, `tree.json` and **every list response** — carries `"version": 1`, which **is** the protocol version; there is no second version field and no capability set. `status.json` additionally carries `"agentBuild": <non-negative int>`, a constant near the top of `agent.ps1` bumped in any commit that changes agent behavior; `bridge.py` carries the same number and a test compares the two literals. `bridge.py` validates `version == 1` next to each reader and raises a distinct `ProtocolError`, propagated to the controller through `health.Snapshot.compatibility` rather than collapsed into a generic "file unavailable" string. Build comparison is **equality**: anything but the bundled constant — lower, higher, missing or malformed — is `skewed`, which still works but shows a persistent, copyable yellow banner telling the operator to re-run `C:\OEM\04-bridge-agent.ps1` elevated. An unsupported `status.json` **or** `tree.json` version makes the channel `incompatible`: one central gate disables Apply and Restore, dispatches no list request, and leaves the current `exclusions.json` untouched; the document is not rendered merely because its JSON parsed. Until a status document has established `current` or `skewed`, compatibility is `unknown` and that gate stays **closed**. A merely missing or stale `tree.json` keeps browsing unavailable without overriding a compatible status. `exclusions.json` keeps its own existing version check. | A package upgrade ships a newer `agent.ps1` into the host bundle but cannot replace `C:\ProgramData\icloud-bridge\agent.ps1`, so GUI/agent skew was previously silent. The project is pre-release (`AGENTS.md` hard rule 9), so there is exactly **one** supported protocol and the pair is expected to match: skew is to be **detected and reported**, never accommodated with a legacy/older/newer matrix. Failing closed while compatibility is unknown is what stops the GUI guessing which agent is running and writing a config an unknown agent will misread. The recovery action stays a copyable instruction — the GUI holds no guest-admin credentials and must never silently update scheduled guest code. This does not amend D23: the protocol classification drives its own banner and the write gate, not the tray colour precedence |
 
 **Known accepted limitations (do not attempt to fix):**
 
@@ -305,6 +306,7 @@ use `ConvertTo-Json` must pass `-Depth 20`.)
 ```json
 {
   "version": 1,
+  "agentBuild": 1,
   "generatedAt": "2026-07-22T01:15:00Z",
   "agentStartedAt": "2026-07-21T23:00:01Z",
   "syncRoot": "C:/Users/icloud/iCloudDrive",
@@ -371,6 +373,13 @@ use `ConvertTo-Json` must pass `-Depth 20`.)
   simply the latest measured `diskFreeBytes < 20 GB`; both states drive D23
   yellow rather than pretending an asynchronous request already freed space.
 
+- `version` **is** the bridge protocol version and is exactly `1` (D35). Missing,
+  boolean, non-integer or any other value makes the whole channel incompatible;
+  the GUI then writes nothing and dispatches no list request. `agentBuild` is a
+  non-negative integer identifying the agent build; the GUI compares it to its own
+  bundled constant by **equality** and reports any difference, in either
+  direction, as skew.
+
 ### 2.3 `tree.json` — written by agent every 10 min and immediately after each enforcement pass that changed anything
 
 Folders only (files are fetched on demand via §2.4 — a full-file tree could be
@@ -415,6 +424,7 @@ Folders only (files are fetched on demand via §2.4 — a full-file tree could b
 
 ```json
 {
+  "version": 1,
   "path": "Docs",
   "error": null,
   "offset": 0,
@@ -434,6 +444,9 @@ the empirical iCloud signal `RECALL_ON_DATA_ACCESS` is set; allocation/completio
 logic uses `CfGetPlaceholderInfo` instead. Process only filenames matching
 `^list-[0-9a-f]{32}\.json$`; ignore temp/unknown names.
 `nextOffset` is the next integer offset when more files remain, otherwise null.
+The response carries `"version": 1` like the other two documents (D35), including
+on the error path — a failure the GUI can read is more useful than one it has to
+reject as unversioned.
 
 ---
 
@@ -447,6 +460,11 @@ $BaseDir  = "C:\ProgramData\icloud-bridge"
 $BridgeDir = Join-Path $BaseDir "io"
 $StateDir  = Join-Path $BaseDir "state"
 $ShareUser = "syncshare"
+# Bridge protocol identity (D35). One supported protocol version; $AgentBuild is
+# bumped in any commit that changes this script's behavior, and bridge.py carries
+# the same number so the GUI can report skew.
+$ProtocolVersion = 1
+$AgentBuild      = 1
 # Cloud Files / FILE_ATTRIBUTE values
 $ATTR_PINNED   = 0x00080000   # FILE_ATTRIBUTE_PINNED
 $ATTR_UNPINNED = 0x00100000   # FILE_ATTRIBUTE_UNPINNED
@@ -464,6 +482,8 @@ state and once at startup). Wrap each sub-task in `try/catch`; a failure sets
 catch exits non-zero so Task Scheduler's restart-on-failure setting can act.
 Process at most ten list
 requests per iteration so a writable bridge cannot starve enforcement/status.
+
+The status writer emits `version = $ProtocolVersion` and `agentBuild = $AgentBuild`; the tree writer emits `version = $ProtocolVersion`; and the list responder sets `version = $ProtocolVersion` on the response object **before** its `try` block, so an error response carries it too (D35).
 
 At startup, compile a small C# interop helper with `Add-Type` for
 `CfGetPlaceholderInfo`, `CreateFileW`/`CloseHandle`, and
@@ -1197,6 +1217,21 @@ useful when the tray instance already exists.
   accepts the source tree's `.env.example`. The per-user installer records the
   checkout it ran from in `resources/source-checkout`, and the assistant warns if
   that checkout no longer contains `host/setup-host.sh`.
+- **Version skew and the write gate (D35).** Every snapshot carries a
+  compatibility classification derived from the bridge documents' `version` and
+  `status.agentBuild`: `current`, `skewed`, `incompatible`, or `unknown`. Only
+  `current` and `skewed` open the write gate. `skewed` changes nothing else — the
+  protocol matched, so Apply, Restore and browsing all keep working — but a
+  persistent, copyable yellow banner says the guest agent does not match this app
+  and names the elevated `C:\OEM\04-bridge-agent.ps1` re-run. `incompatible`
+  shows a red diagnostic instead and one central gate disables Apply and Restore,
+  refuses every list-request dispatch, and leaves `exclusions.json` exactly as it
+  is; a document with an unsupported version is not fed into normal health or
+  tree rendering merely because its JSON parsed. `unknown` — no status document
+  yet — shows no banner (the Guest agent health row already reports it) but keeps
+  the gate closed, so a transient missing status can never make the GUI guess
+  which agent is running. Powering the bridge off returns the classification to
+  `unknown`, because it describes an agent that is no longer reachable.
 - **In-session power control (D30).** The controller holds one lifecycle state —
   `starting`, `running`, `start_failed`, `powered_off`, `shutting_down`,
   `setup`, `provisioning`. That state machine is implemented as a **pure reducer**
@@ -1579,6 +1614,17 @@ still applies. This v2 document is not permission to let
   that state and reach a live CIFS activation without any lazy or forced
   unmount. This is what the `ls -A` readiness probe is for — verify from the
   journal that readiness was not declared while the old mount was still stale.
+- [ ] **E12** (D35) **Version skew and the fail-closed write gate:** with the
+  bridge running and healthy, edit `C:\ProgramData\icloud-bridge\agent.ps1` in
+  the guest to report a deliberately different `$AgentBuild`, let a status cycle
+  pass, and confirm the GUI shows the yellow skew banner with the copyable
+  `04-bridge-agent.ps1` instruction **while Apply, Restore and folder browsing
+  keep working**. Re-run script 04 and confirm the banner clears to `current`.
+  Then, using `ICLOUD_BRIDGE_DIR` and `ICLOUD_MOUNT_DIR` overrides against a
+  throwaway fixture directory — never the real share — serve a `status.json` and
+  a `tree.json` with an unsupported `version`, and confirm every write surface is
+  disabled, no list request is dispatched, and the real `exclusions.json` and the
+  real mount are untouched throughout.
 - [ ] **E11** (D29) **No-tray + autostart toggle:** with the tray unavailable, the
   window X presents the same three-way Quit dialog; with a tray it only hides.
   Untick **Start when the computer starts**, log out/in → the GUI does not launch
