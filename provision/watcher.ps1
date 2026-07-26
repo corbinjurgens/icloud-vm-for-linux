@@ -1,0 +1,386 @@
+# ============ watcher.ps1 — the elevated provisioning watcher ============
+# The only elevated code that reacts to the host. It polls the read-only
+# \\host.lan\Provision inbox for a trigger, copies the fixed payload allowlist
+# into an administrator-only per-run directory, and runs that protected copy of
+# guest-setup.ps1 (v2 plan D40/D42).
+#
+# Runs INSIDE the Windows guest. Two modes:
+#
+#   Install (elevated, once per VM — provision/install.bat does this at OEM time,
+#   or the operator pastes it by hand on a VM created before this feature):
+#     powershell -ExecutionPolicy Bypass -NoProfile -File C:\OEM\watcher.ps1 -Install
+#     powershell -ExecutionPolicy Bypass -NoProfile -File \\host.lan\Provision\watcher.ps1 -Install
+#
+#   Poll loop (what the registered task runs; not invoked by hand):
+#     powershell -ExecutionPolicy Bypass -NoProfile -File C:\ProgramData\icloud-bridge-provision\watcher.ps1
+#
+# Idempotent. -Install re-registers with -Force and re-hardens the directory;
+# the loop consumes each run ID exactly once through a local accepted-run marker
+# and re-triggering an already-converged VM is a no-op reconciliation.
+#
+# Two rules this file exists to enforce, neither of which may be relaxed:
+#
+#   1. Nothing under \\host.lan\Data or C:\OEM is ever an execution source.
+#      dockur serves Data writable, guest-only, force user = root, so any process
+#      in the guest can replace a script staged there; executing it elevated
+#      would turn the deliberately limited D28 agent into an administrator.
+#      Only the protected copy under C:\ProgramData\icloud-bridge-provision runs.
+#   2. The trigger carries a version, an action, a UUID and a boolean — never a
+#      path, a command, a script name, or a work list. The orchestrator derives
+#      the work from its own inspection.
+#
+# This file deliberately restates its handful of constants instead of
+# dot-sourcing guest-state.ps1: only watcher.ps1 is installed into the protected
+# directory, so its envelope has to stand alone. D42 pins that envelope —
+# changing it requires re-running the bootstrap, because a running old watcher
+# cannot safely upgrade the protocol that authenticates its own replacement.
+# =========================================================================
+
+[CmdletBinding()]
+param([switch]$Install)
+
+$ErrorActionPreference = 'Stop'
+
+# --- the stable envelope (D42): fixed names, fixed version, nothing derived ---
+$ProvisionDir     = 'C:\ProgramData\icloud-bridge-provision'
+$RunsDir          = Join-Path $ProvisionDir 'runs'
+$InstalledWatcher = Join-Path $ProvisionDir 'watcher.ps1'
+$AcceptedPath     = Join-Path $ProvisionDir 'accepted-run.txt'
+$TaskName         = 'icloud-bridge-provision'
+$AgentUser        = 'icloud'
+$AdminsSid        = 'S-1-5-32-544'      # BUILTIN\Administrators, never the localized name
+$SystemSid        = 'S-1-5-18'
+
+$Inbox        = '\\host.lan\Provision'
+$TriggerPath  = Join-Path $Inbox 'trigger.json'
+$StatusDir    = '\\host.lan\Data\.provision'
+$StatusPath   = Join-Path $StatusDir 'status.json'
+
+$PayloadFiles = @(
+    '03-create-share.ps1',
+    '04-bridge-agent.ps1',
+    'agent.ps1',
+    'guest-state.ps1',
+    'guest-setup.ps1',
+    'watcher.ps1'
+)
+$CheckIds = @('icloudPackage', 'syncRoot', 'shareAccount', 'shareCredential',
+              'dataShare', 'bridgeBoundary', 'agentInstall', 'agentRuntime')
+
+$PollSeconds    = 30
+$MaxTriggerSize = 65536
+$MaxLine        = 500
+
+function Step { param([string]$Message) Write-Host "==> $Message" -ForegroundColor Cyan }
+
+# ---------------------------------------------------------------- helpers ----
+
+function Get-BoundedLine {
+    # One physical line, control characters removed, capped. Every string this
+    # script puts into status.json goes through here.
+    param([string]$Text)
+    if ($null -eq $Text) { return '' }
+    $clean = ($Text -replace '[\x00-\x1F\x7F]', ' ').Trim()
+    if ($clean.Length -gt $MaxLine) { $clean = $clean.Substring(0, $MaxLine) }
+    return $clean
+}
+
+function ConvertTo-JsonString {
+    param([string]$Value)
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    foreach ($ch in $Value.ToCharArray()) {
+        switch ($ch) {
+            '"'  { [void]$sb.Append('\"');  continue }
+            '\'  { [void]$sb.Append('\\');  continue }
+            default {
+                if ([int]$ch -lt 0x20) { [void]$sb.AppendFormat('\u{0:x4}', [int]$ch) }
+                else { [void]$sb.Append($ch) }
+            }
+        }
+    }
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
+function Write-JsonAtomic {
+    # BOM-less UTF-8 + atomic replace, matching Write-JsonAtomic in
+    # 04-bridge-agent.ps1 and the agent's bridge writer (v2 plan section 2).
+    param([string]$Path, [string]$Json)
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    $dir = Split-Path -Parent $Path
+    $tmp = Join-Path $dir ('.' + [IO.Path]::GetFileName($Path) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        [IO.File]::WriteAllText($tmp, $Json, $enc)
+        if ([IO.File]::Exists($Path)) { [IO.File]::Replace($tmp, $Path, $null) }
+        else { [IO.File]::Move($tmp, $Path) }
+    } finally {
+        if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) }
+    }
+}
+
+function Write-WatcherError {
+    # A watcher-level failure still owes the host a complete, schema-valid
+    # document: the GUI treats a malformed one as unreadable, not as progress.
+    param([string]$RunId, [string]$Message)
+    try {
+        New-Item -ItemType Directory -Force -Path $StatusDir -ErrorAction SilentlyContinue | Out-Null
+        $checks = ($CheckIds | ForEach-Object { (ConvertTo-JsonString $_) + ':"pending"' }) -join ','
+        $json = '{"version":1,' +
+                '"runId":' + (ConvertTo-JsonString $RunId) + ',' +
+                '"phase":"staging",' +
+                '"detail":"the watcher could not start this run",' +
+                '"updatedAt":' + (ConvertTo-JsonString ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))) + ',' +
+                '"error":' + (ConvertTo-JsonString (Get-BoundedLine $Message)) + ',' +
+                '"checks":{' + $checks + '},' +
+                '"work":[]}'
+        Write-JsonAtomic -Path $StatusPath -Json $json
+    } catch {
+        Write-Warning "could not write the error status: $($_.Exception.Message)"
+    }
+}
+
+function Test-RunId {
+    param([object]$Value)
+    return ($Value -is [string] -and $Value -cmatch '^[0-9a-f]{32}$')
+}
+
+function Get-AcceptedToken {
+    if (-not (Test-Path -LiteralPath $AcceptedPath)) { return '' }
+    try { return (Get-Content -LiteralPath $AcceptedPath -Raw -ErrorAction Stop).Trim() } catch { return '' }
+}
+
+function Set-AcceptedToken {
+    param([string]$Token)
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    $tmp = Join-Path $ProvisionDir ('.accepted-run.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        [IO.File]::WriteAllText($tmp, $Token, $enc)
+        if ([IO.File]::Exists($AcceptedPath)) { [IO.File]::Replace($tmp, $AcceptedPath, $null) }
+        else { [IO.File]::Move($tmp, $AcceptedPath) }
+    } finally {
+        if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) }
+    }
+}
+
+function Remove-StaleSecret {
+    # A guest reboot between delivery and 03 consuming the value would strand a
+    # protected local copy. Clear them at task start and before each new run;
+    # never touch the run currently executing (the loop is synchronous, so no
+    # run is active here).
+    foreach ($p in @(Join-Path $ProvisionDir 'secret')) {
+        if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+    }
+    if (Test-Path -LiteralPath $RunsDir) {
+        Get-ChildItem -LiteralPath $RunsDir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $s = Join-Path $_.FullName 'secret'
+            if (Test-Path -LiteralPath $s) { Remove-Item -LiteralPath $s -Force -ErrorAction SilentlyContinue }
+        }
+    }
+}
+
+function Remove-SupersededRun {
+    # Keep the run just executed; prune the rest. Never touch 'current', which is
+    # the protected manual fallback bundle.
+    param([string]$KeepRunId)
+    if (-not (Test-Path -LiteralPath $RunsDir)) { return }
+    Get-ChildItem -LiteralPath $RunsDir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($_.Name -eq $KeepRunId) { return }
+        Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# ------------------------------------------------------------- install mode --
+
+function Install-Watcher {
+    Step "Installing the '$TaskName' watcher"
+
+    if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+            ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw "run this from an elevated PowerShell (Administrator)"
+    }
+
+    $user = Get-LocalUser -Name $AgentUser -ErrorAction SilentlyContinue
+    if ($null -eq $user) { throw "local account '$AgentUser' does not exist — this is not a provisioned dockur guest" }
+    $userSid = $user.SID.Value
+
+    # dockur's current answer file puts its configured local user in
+    # Administrators, but the image is unpinned, so assert it at runtime. Assert,
+    # never repair: silently adding icloud to Administrators would be a privilege
+    # grant nobody asked for.
+    $members = @()
+    try { $members = @(Get-LocalGroupMember -SID $AdminsSid -ErrorAction Stop) } catch {
+        throw "cannot enumerate the built-in Administrators group ($AdminsSid): $($_.Exception.Message)"
+    }
+    $isAdmin = $false
+    foreach ($m in $members) {
+        $sid = $null
+        try { $sid = $m.SID.Value } catch { $sid = $null }
+        if ($sid -eq $userSid) { $isAdmin = $true }
+    }
+    if (-not $isAdmin) {
+        throw ("'$AgentUser' ($userSid) is not a member of the built-in Administrators group " +
+               "($AdminsSid). The elevated watcher task cannot run without it. Add the account " +
+               "deliberately, or rebuild the VM; this installer will not grant it.")
+    }
+
+    Step "Hardening $ProvisionDir (SYSTEM + Administrators only)"
+    New-Item -ItemType Directory -Force -Path $ProvisionDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $RunsDir | Out-Null
+    $global:LASTEXITCODE = 0
+    & icacls.exe $ProvisionDir /inheritance:r `
+        /grant "*${SystemSid}:(OI)(CI)F" /grant "*${AdminsSid}:(OI)(CI)F" /Q 2>&1 | Out-Null
+    if ([int]$LASTEXITCODE -ne 0) { throw "hardening $ProvisionDir failed (icacls exit $LASTEXITCODE)" }
+
+    Step "Copying the watcher into the protected directory"
+    $self = $PSCommandPath
+    if (-not $self) { throw "cannot determine this script's own path" }
+    if ([IO.Path]::GetFullPath($self) -ne [IO.Path]::GetFullPath($InstalledWatcher)) {
+        Copy-Item -LiteralPath $self -Destination $InstalledWatcher -Force
+    }
+
+    # Mirrors 04-bridge-agent.ps1 step 8 exactly, except RunLevel Highest and the
+    # protected target: interactive principal in the auto-logged-on icloud
+    # session, no stored password, infinite loop with restart, IgnoreNew (D17/D40).
+    Step "Registering the '$TaskName' scheduled task (RunLevel Highest)"
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" `
+      -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $InstalledWatcher"
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $AgentUser
+    $principal = New-ScheduledTaskPrincipal -UserId "$env:COMPUTERNAME\$AgentUser" `
+      -LogonType Interactive -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -RestartCount 999 `
+      -RestartInterval (New-TimeSpan -Minutes 1) `
+      -MultipleInstances IgnoreNew `
+      -ExecutionTimeLimit (New-TimeSpan -Seconds 0)   # no time limit
+    Register-ScheduledTask -TaskName $TaskName -Action $action `
+      -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+
+    try { Start-ScheduledTask -TaskName $TaskName } catch {
+        # At OEM time the icloud session does not exist yet; the logon trigger
+        # starts it at first sign-in. That is not a failure.
+        Write-Host "    not started yet (no '$AgentUser' session): the logon trigger will start it"
+    }
+
+    Write-Host ""
+    Write-Host "PASS: watcher installed" -ForegroundColor Green
+    Write-Host "  script : $InstalledWatcher"
+    Write-Host "  task   : $TaskName (RunLevel Highest, restarts on failure)"
+    Write-Host "  inbox  : $Inbox (read-only to this guest)"
+}
+
+# --------------------------------------------------------------- poll loop ---
+
+function Invoke-TriggerPass {
+    if (-not (Test-Path -LiteralPath $TriggerPath)) { return }
+
+    $info = Get-Item -LiteralPath $TriggerPath -ErrorAction Stop
+    if ($info.Length -gt $MaxTriggerSize) {
+        throw "trigger.json is $($info.Length) bytes, over the $MaxTriggerSize byte cap"
+    }
+    $bytes = [IO.File]::ReadAllBytes($TriggerPath)
+
+    # Consume-once identity. A valid run is keyed by its UUID; a trigger we
+    # cannot even parse is keyed by its content hash, so a bad trigger is
+    # rejected once instead of failing forever in a 30 s loop.
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $digest = ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '' }
+    finally { $sha.Dispose() }
+
+    $accepted = Get-AcceptedToken
+    $runId = ''
+    $reset = $false
+    $parseError = ''
+    try {
+        $doc = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+        if ([int]$doc.version -ne 1) { throw "unsupported trigger version '$($doc.version)'" }
+        if ("$($doc.action)" -cne 'reconcile') { throw "unsupported action '$($doc.action)'" }
+        if (-not (Test-RunId $doc.runId)) { throw "runId is not 32 lowercase hex characters" }
+        if (-not ($doc.resetShareCredential -is [bool])) { throw "resetShareCredential must be a JSON boolean" }
+        $runId = [string]$doc.runId
+        $reset = [bool]$doc.resetShareCredential
+    } catch {
+        $parseError = $_.Exception.Message
+    }
+
+    $token = if ($parseError) { "invalid-$digest" } else { $runId }
+    if ($accepted -eq $token) { return }     # already consumed; never loop on it
+
+    if ($parseError) {
+        Set-AcceptedToken $token
+        Write-WatcherError -RunId '' -Message "rejected trigger.json: $parseError"
+        Write-Warning "rejected trigger.json: $parseError"
+        return
+    }
+
+    Step "Accepting run $runId"
+    Remove-StaleSecret
+
+    $runDir = Join-Path $RunsDir $runId
+    try {
+        # The run directory inherits the SYSTEM + Administrators DACL that
+        # -Install set on $ProvisionDir with /inheritance:r, so it is protected
+        # from the moment it exists.
+        New-Item -ItemType Directory -Force -Path $runDir | Out-Null
+        foreach ($name in $PayloadFiles) {
+            $src = Join-Path $Inbox $name
+            $dst = Join-Path $runDir $name
+            Copy-Item -LiteralPath $src -Destination $dst -Force
+            if (-not (Test-Path -LiteralPath $dst)) { throw "payload file '$name' did not copy" }
+            if ((Get-Item -LiteralPath $dst).Length -le 0) { throw "payload file '$name' copied empty" }
+        }
+    } catch {
+        Set-AcceptedToken $token
+        Write-WatcherError -RunId $runId -Message "staging failed: $($_.Exception.Message)"
+        Write-Warning "staging failed: $($_.Exception.Message)"
+        return
+    }
+
+    # Refresh the installed watcher for its NEXT task start (D42). A failure here
+    # is not fatal: the current envelope still works.
+    try { Copy-Item -LiteralPath (Join-Path $runDir 'watcher.ps1') -Destination $InstalledWatcher -Force }
+    catch { Write-Warning "could not refresh $InstalledWatcher : $($_.Exception.Message)" }
+
+    # Record acceptance BEFORE executing: a crash mid-run must not re-execute the
+    # same run at the next logon.
+    Set-AcceptedToken $token
+
+    $setup = Join-Path $runDir 'guest-setup.ps1'
+    $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $setup, '-RunId', $runId)
+    # The boolean crosses as presence/absence, not as a string: `-File` would
+    # turn "false" into $true.
+    if ($reset) { $argv += '-ResetShareCredential' }
+
+    Step "Running the protected guest-setup.ps1 for $runId"
+    $global:LASTEXITCODE = 0
+    & powershell.exe @argv
+    $rc = [int]$LASTEXITCODE
+    if ($rc -ne 0) {
+        # guest-setup.ps1 writes its own error status; this covers the case where
+        # it could not start at all.
+        Write-Warning "guest-setup.ps1 exited $rc for run $runId"
+    }
+
+    Remove-StaleSecret
+    Remove-SupersededRun -KeepRunId $runId
+}
+
+# -------------------------------------------------------------------- main ---
+
+if ($Install) {
+    Install-Watcher
+    exit 0
+}
+
+New-Item -ItemType Directory -Force -Path $RunsDir -ErrorAction SilentlyContinue | Out-Null
+Remove-StaleSecret
+Step "Watching $TriggerPath every $PollSeconds s"
+
+while ($true) {
+    try { Invoke-TriggerPass } catch {
+        # The loop is the product: a malformed trigger, an unreachable share, or
+        # a failed launch must never take the watcher down.
+        Write-Warning "watcher pass failed: $($_.Exception.Message)"
+    }
+    Start-Sleep -Seconds $PollSeconds
+}
+# ===============================================
