@@ -7,7 +7,10 @@ and how they were resolved. If you are rebuilding on a new box, follow this file
 top to bottom.
 
 `docs/implementation-plan.md` remains the authoritative design doc; this file is
-the operational "what you actually type, and what bites you" companion.
+the operational "what you actually type, and what bites you" companion. If you
+are changing the code rather than standing up a host, you want
+[README Development](README.md#development) instead — `make check` and
+`make run` need neither a guest nor root.
 
 ---
 

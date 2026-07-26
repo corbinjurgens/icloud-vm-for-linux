@@ -1,5 +1,10 @@
 # Todo: Quit from the GUI powers off the VM and disconnects the drive
 
+> **Status: implemented.** This review became v2 decision D29 and landed in
+> commit `15c3079` on 2026-07-25. It is retained for the design rationale;
+> ongoing candidates and ruled-out ideas are tracked in
+> [`../CHANGELOG.md`](../CHANGELOG.md).
+
 ## Goal
 
 Make an intentional **Quit** from the GUI behave like quitting Google Drive:

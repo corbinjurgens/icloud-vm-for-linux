@@ -108,6 +108,8 @@ install -D -m 0755 "$repo_root/host/acceptance-tests.sh" \
 
 install -D -m 0644 "$repo_root/README.md" "$STAGE/usr/share/doc/$PKG/README.md"
 install -D -m 0644 "$repo_root/SETUP.md"  "$STAGE/usr/share/doc/$PKG/SETUP.md"
+install -D -m 0644 "$repo_root/CHANGELOG.md" \
+  "$STAGE/usr/share/doc/$PKG/CHANGELOG.md"
 install -D -m 0644 "$here/deb/lintian-overrides" \
   "$STAGE/usr/share/lintian/overrides/$PKG"
 

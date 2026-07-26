@@ -1,5 +1,10 @@
 # Todo: GUI ease-of-use improvements
 
+> **Status: implemented.** All eight items landed in commit `26d29ac` on
+> 2026-07-26. This file is retained as the implementation review; ongoing
+> candidates and ruled-out ideas are tracked in
+> [`../CHANGELOG.md`](../CHANGELOG.md).
+
 ## Goal
 
 Make the GUI feel like a consumer sync client (the Google Drive standard the
