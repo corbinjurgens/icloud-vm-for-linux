@@ -217,15 +217,20 @@ Continues the v1 register (D1–D13).
 | D28 | Agent ACL authority | The task stays `RunLevel Limited`. Elevated provisioning grants the `icloud` **SID** an inheritable allow ACE of exactly `RC,WDAC` on the sync root (`(OI)(CI)(RC,WDAC)`), repeated explicitly on any protected child DACL that does not inherit. The agent preflights `READ_CONTROL\|WRITE_DAC` on every new target and parent before changing anything, reporting `acl-write-denied` per exclusion on failure | Editing a DACL needs `WRITE_DAC`. An owner gets it implicitly, but ownership of a new object depends on who created it — cloud-created items are owned by `icloud` while items created through SMB may be owned by `syncshare` — so ownership is not a dependable basis. Two rights are the minimum: no `WO`/`D`/data access is granted, and the ACE names `icloud`, never `syncshare`, so it cannot weaken an exclusion deny |
 | D29 | GUI-managed bridge lifecycle | An explicit GUI **Quit** confirms and then records a durable desired-off state (`/var/lib/icloud-bridge/powered-off`), quiesces health and CIFS activity, unmounts both shares, and gracefully stops `icloud-windows` (`docker stop --timeout 130`); starting a new GUI process automatically restores an existing stopped bridge before doing any CIFS I/O. All of this runs through one root helper, `host/icloud-bridge-power on\|off`, serialized by `flock`. The six mount/automount/health units gain `ConditionPathExists=!/var/lib/icloud-bridge/powered-off` so the marker survives a reboot without disabling the units. Window-close only hides when a tray exists; without a tray, close routes through the same confirmation. The confirmation retains **Quit GUI only** for maintenance. A checkable tray item **Start when the computer starts** toggles the XDG autostart entry (`Hidden=`), making start-at-login a user setting rather than an installer constant. `restart: unless-stopped` gives Docker the matching semantics, so no compose change is needed. | Makes the GUI the normal on/off boundary without confusing window management with shutdown. The marker keeps automounts and health checks off across reboot, while ordered teardown (health -> automount -> mount, then container) avoids stale CIFS mounts and refuses to interrupt open files. Power-on retries a real CIFS activation because a published-port TCP connect is not SMB readiness. Only the explicit confirmed action powers off — logout, signals, crashes, and `aboutToQuit` do not. Amends the v1/v2 always-on assumption. **Amended by D30**, which adds an equally explicit in-session power off/on that does not exit the app; the "only a user action powers off" rule is unchanged |
 | D30 | In-session bridge power control (amends D29) | The GUI offers **Power off bridge (keep this app running)** and **Start bridge** as tray items and one Status-tab button, driven by an explicit lifecycle state machine (`power.available_action`), never by a health colour. Power-off runs the *same* transaction as Quit — stop polling, refuse new bridge I/O, drain in-flight mount work and Apply, call `icloud-bridge-power off` — and differs only in its success continuation: idle in-process instead of exiting. The idle state clears the health rows, shows a grey **Bridge is powered off** icon/banner, keeps every mount-touching control disabled, and stops polling until **Start bridge** or process exit. Start reuses the D29 power-on path in full. Quit while already off never calls the helper again. | A temporary stop should not require quitting and relaunching, and a container stopped by hand mid-session had no in-app recovery at all. Sharing one transaction is what keeps the teardown ordering from drifting between the two callers. The state machine exists because **red is not evidence the bridge is off** — it equally means a running VM with a stale canary, a missing mount, or bad JSON — so only a definitive `docker inspect` (`exited`/`created`/`dead`) may enable Start. This is a whole-bridge power operation, **not** pausing iCloud sync, which stays out of scope (§9) |
-| D31 | First-run assistant (supersedes D29's "`provision_needed` never runs `docker compose up`") | A dedicated **Setup required** state — reached when no container exists *or* the inspection failed — performs **no** CIFS I/O at all: no `health.gather()`, no `bridge.read_*()`, no `ismount()`, no `xdg-open` of the mount. It shows read-only readiness checks from a Qt-free, mount-I/O-free `firstrun.py` (KVM/tun nodes, native Engine socket reachable by this session, Compose plugin, active-context warning, a complete resource bundle, a syntactically valid env file whose `SHARE_PASS` is not the placeholder, and whether the container is absent/running/stopped). Only with the container **absent** and no failing check does it offer a confirmed **Create Windows VM**, which runs `docker compose -p icloud-bridge -f <bundle>/docker-compose.yml --env-file <chosen> up -d` in a worker. Success enters **Provisioning Windows** — *not* `_begin_startup()` — which keeps I/O paused, offers the VM screen, and presents the manual guest sequence (02, sign-in, 03, 04) plus the matching host command. **Check setup and connect** then verifies the helper, both argument-exact `sudo -n -l` grants, the installed units and host config, and the Docker state, and only then calls the existing privileged `power_on()`. | v2's §6.2 said both "startup precedes all CIFS I/O" and "preserve today's red first-run state", and the old code resolved that the wrong way: `provision_needed` and `inspect_error` called `_enter_monitoring()`, which unpaused I/O and immediately scheduled selective-sync reads against a mount that does not exist. The safe reading is now the only one. Creation is a **confirmed user action** with a fixed project name and an explicitly chosen env file, which is a different thing from the helper silently manufacturing a container — `icloud-bridge-power on` still never does that. Windows' initial install legitimately leaves SMB unavailable for far longer than the helper's five-minute readiness deadline, so the provisioning state waits for the operator instead of failing a power-on. The password never passes through the GUI: the env file is parsed as text, never sourced, its value never printed, never in argv, never copied into a bundle or the clipboard |
+| D31 | First-run assistant (supersedes D29's "`provision_needed` never runs `docker compose up`") | A dedicated **Setup required** state — reached when no container exists *or* the inspection failed — performs **no** CIFS I/O at all: no `health.gather()`, no `bridge.read_*()`, no `ismount()`, no `xdg-open` of the mount. It shows read-only readiness checks from a Qt-free, mount-I/O-free `firstrun.py` (KVM/tun nodes, native Engine socket reachable by this session, Compose plugin, active-context warning, a complete resource bundle, a syntactically valid env file whose `SHARE_PASS` is not the placeholder, and whether the container is absent/running/stopped). Only with the container **absent** and no failing check does it offer a confirmed **Create Windows VM**, which runs `docker compose -p icloud-bridge -f <bundle>/docker-compose.yml --env-file <chosen> up -d` in a worker. Success enters **Provisioning Windows** — *not* `_begin_startup()` — which keeps I/O paused, offers the VM screen, and presents the manual guest sequence (02, sign-in, 03, 04) plus the matching host command. **Check setup and connect** then verifies the helper, both argument-exact `sudo -n -l` grants, the installed units and host config, and the Docker state, and only then calls the existing privileged `power_on()`. | v2's §6.2 said both "startup precedes all CIFS I/O" and "preserve today's red first-run state", and the old code resolved that the wrong way: `provision_needed` and `inspect_error` called `_enter_monitoring()`, which unpaused I/O and immediately scheduled selective-sync reads against a mount that does not exist. The safe reading is now the only one. Creation is a **confirmed user action** with a fixed project name and an explicitly chosen env file, which is a different thing from the helper silently manufacturing a container — `icloud-bridge-power on` still never does that. Windows' initial install legitimately leaves SMB unavailable for far longer than the helper's five-minute readiness deadline, so the provisioning state waits for the operator instead of failing a power-on. The password never passes through the GUI, **except as provided by D41**: the env file is parsed as text, never sourced, its value never printed, never in argv, never copied into a bundle or the clipboard |
 | D32 | SMB wire protection | **Off, deliberately.** `03-create-share.ps1` sets `RequireSecuritySignature $false` and asserts `EncryptData $false` / `RejectUnencryptedAccess $false`; neither mount unit asks for `sign` or `seal` | Since 24H2 a stock Windows 11 Pro requires SMB signing by default, so every hydration byte would be HMAC/GMAC-signed (and, if encryption ever flips on, AES-GCM'd) on both ends of a path that is host loopback → docker-proxy → container NAT → QEMU tap. Anyone positioned on that path already has root on the host, so there is no confidentiality or integrity property to lose — D9 already makes the host the security boundary. Authentication (D8) and the exclusion model (D15: ACLs + ABE) are untouched, and SMB 3.1.1 pre-auth integrity still protects negotiation. The settings are idempotent assertions, so the documented post-feature-update re-run of script 03 (v1 plan §10) is also the correction path for a future Microsoft default-flip |
 | D33 | Host I/O path | Pass `/dev/vhost-net` into the container (`host/setup-prereqs.sh` loads the module and persists it; `acceptance-tests.sh` checks the node). Add `rasize=16777216` to the **data** mount only. Everything else on the path keeps its default, and those defaults are recorded as load-bearing in the unit files: `cache=strict`, `actimeo=1`, negotiated `rsize`/`wsize`, no `mfsymlinks`, no `max_channels`, no `sign`/`seal` | dockur enables `vhost=on` only if it can open `/dev/vhost-net`; the default docker device cgroup denies that, so without the passthrough QEMU copies every SMB byte through its userspace main loop. `rasize` decouples readahead from the negotiated I/O size, which is what shortens a cold hydration — one long sequential read that blocks the reader. The recorded defaults are not incidental: `cache=strict` is what forces a placeholder read to reach the guest and trigger CfAPI hydration, `mfsymlinks` would create files iCloud syncs as junk, and multichannel cannot apply to one NATed virtio NIC |
 | D34 | Steady-state work elision | The agent may skip **reporting and discovery** work when it is provably redundant, never enforcement work: (a) the per-entry DACL reads of full-tree reconciliation are skipped while the wanted set and private state are empty and the previous pass completed clean, gated by a persisted flag that defaults to false and is cleared *before* any ACL write; (b) the re-verification walk of an already-applied exclusion runs every pass for its first few passes, then every ~10th, and immediately on a config change; (c) a reclamation episode reuses its candidate lists for ~5 passes but may never *end* on a stale list. On the host side the GUI keeps its 5 s cadence for file stats but re-parses `status.json`/`tree.json` only when `(mtime, size)` moves, and runs `docker inspect` — for the health row and the D30 power-control classification alike — at most every 15 s per consumer, with an explicit invalidation on every power transition and on Refresh | These are the three recurring costs that scale with library size rather than with anything the user did, and none of them is what makes the system safe. D15's denies and parent guards are still asserted on every 60 s pass; every dehydration candidate is still re-checked with `CfGetPlaceholderInfo` immediately before its request (D26); the cadences of D17 are unchanged. What degrades is label freshness — an `applied` exclusion's reported size, and the health rows' view of the container — by an interval far inside the thresholds D23 already uses |
-| D35 | Bridge protocol and agent-build skew | Every bridge document — `status.json`, `tree.json` and **every list response** — carries `"version": 1`, which **is** the protocol version; there is no second version field and no capability set. `status.json` additionally carries `"agentBuild": <non-negative int>`, a constant near the top of `agent.ps1` bumped in any commit that changes agent behavior; `bridge.py` carries the same number and a test compares the two literals. `bridge.py` validates `version == 1` next to each reader and raises a distinct `ProtocolError`, propagated to the controller through `health.Snapshot.compatibility` rather than collapsed into a generic "file unavailable" string. Build comparison is **equality**: anything but the bundled constant — lower, higher, missing or malformed — is `skewed`, which still works but shows a persistent, copyable yellow banner telling the operator to re-run `C:\OEM\04-bridge-agent.ps1` elevated. An unsupported `status.json` **or** `tree.json` version makes the channel `incompatible`: one central gate disables Apply and Restore, dispatches no list request, and leaves the current `exclusions.json` untouched; the document is not rendered merely because its JSON parsed. Until a status document has established `current` or `skewed`, compatibility is `unknown` and that gate stays **closed**. A merely missing or stale `tree.json` keeps browsing unavailable without overriding a compatible status. `exclusions.json` keeps its own existing version check. | A package upgrade ships a newer `agent.ps1` into the host bundle but cannot replace `C:\ProgramData\icloud-bridge\agent.ps1`, so GUI/agent skew was previously silent. The project is pre-release (the policy in `CONTRIBUTING.md`), so there is exactly **one** supported protocol and the pair is expected to match: skew is to be **detected and reported**, never accommodated with a legacy/older/newer matrix. Failing closed while compatibility is unknown is what stops the GUI guessing which agent is running and writing a config an unknown agent will misread. The recovery action stays a copyable instruction — the GUI holds no guest-admin credentials and must never silently update scheduled guest code. This does not amend D23: the protocol classification drives its own banner and the write gate, not the tray colour precedence |
+| D35 | Bridge protocol and agent-build skew | Every bridge document — `status.json`, `tree.json` and **every list response** — carries `"version": 1`, which **is** the protocol version; there is no second version field and no capability set. `status.json` additionally carries `"agentBuild": <non-negative int>`, a constant near the top of `agent.ps1` bumped in any commit that changes agent behavior; `bridge.py` carries the same number and a test compares the two literals. `bridge.py` validates `version == 1` next to each reader and raises a distinct `ProtocolError`, propagated to the controller through `health.Snapshot.compatibility` rather than collapsed into a generic "file unavailable" string. Build comparison is **equality**: anything but the bundled constant — lower, higher, missing or malformed — is `skewed`, which still works but shows a persistent yellow banner. Recovery in **both** the `skewed` and the `incompatible` state is an unconditional entry into the confirmed **Re-run Windows provisioning…** action (D40-D44) — never a `C:\OEM` instruction, and never a different code path per state: the banner button and the Status-tab/menu command invoke the same controller action with the same enablement rules. An unsupported `status.json` **or** `tree.json` version makes the channel `incompatible`: one central gate disables Apply and Restore, dispatches no list request, and leaves the current `exclusions.json` untouched; the document is not rendered merely because its JSON parsed. That gate deliberately exempts the re-provision action, which is what the banner points at and requires no guest state of its own. Until a status document has established `current` or `skewed`, compatibility is `unknown` and that gate stays **closed**. A merely missing or stale `tree.json` keeps browsing unavailable without overriding a compatible status. `exclusions.json` keeps its own existing version check. | A package upgrade ships a newer `agent.ps1` into the host bundle but cannot replace `C:\ProgramData\icloud-bridge\agent.ps1`, so GUI/agent skew was previously silent. The project is pre-release (the policy in `CONTRIBUTING.md`), so there is exactly **one** supported protocol and the pair is expected to match: skew is to be **detected and reported**, never accommodated with a legacy/older/newer matrix. Failing closed while compatibility is unknown is what stops the GUI guessing which agent is running and writing a config an unknown agent will misread. Recovery became one explicit confirmed action rather than a copyable instruction, and the two constraints behind that instruction are intact: the GUI still holds no guest-admin credentials and still never updates guest code silently — elevation lives in the guest watcher task (D40) and the update happens only through this explicit confirmed action. This does not amend D23: the protocol classification drives its own banner and the write gate, not the tray colour precedence |
 | D36 | Host-side backup of the selective-sync choices | A mode-0600 snapshot at `$XDG_STATE_HOME/icloud-bridge-gui/exclusions-backup.json` (default base `~/.local/state`), in a 0700 app directory, written atomically through a unique temp file in the same directory; a symlink or non-regular directory/destination is refused rather than followed, and an existing regular backup is tightened to 0600 even when the write is skipped. Content is `{version, savedAt, source, revision, exclusions}` with `source` ∈ `read`|`apply` and `exclusions` the canonical D19 list; an **empty list is a valid backup** meaning include-everything. Written after every validated `read_exclusions` and every successful Apply, on the same worker thread as the operation that produced the data. An automatic **read** may only move the snapshot forward: a *lower* revision is kept (that is a rebuilt VM's fresh revision-0 config), and the same revision with different content is a retained, reported conflict; an explicit **Apply** may always replace. The bridge operation and the local snapshot are **two results**: a read or Apply that succeeded stays succeeded when only the backup failed, and shows a persistent yellow warning instead. Restore is **explicit and previewed, never automatic**: a *Restore from backup…* button enabled only in normal monitoring, with a loaded snapshot, no staged unapplied selection, and a compatible protocol; it validates and canonicalizes, previews additions/removals against the loaded selection, and writes through `write_exclusions(..., minimum_revision=<backup revision>)` so the result is strictly above `status.appliedRevision`, the loaded revision, the GUI's last write **and** the backup's own. A missing or corrupt backup is an error dialog, never an empty list, and never blocks normal operation; an old-but-valid backup is not rejected for being old | `exclusions.json` is the only unique configuration inside the otherwise disposable VM, and the fail-closed provisioning rule correctly refuses to manufacture an empty one after loss — which leaves recovery assuming the operator kept their own copy. The lower-revision rule is the whole point: without it the first automatic read after a VM rebuild would overwrite the snapshot with the empty config that rebuild produced, destroying exactly what recovery needs. Restoring is previewed rather than automatic because re-including or excluding folders moves real data; `minimum_revision` exists as its own parameter because "the revision I must beat" and "the revision I last wrote" are different facts and overloading one of them is how a later reader gets it wrong |
 | D37 | Privacy-safe diagnostic report | **Copy diagnostics** and **Save diagnostic report…** on the Status tab, backed by Qt-free, mount-I/O-free `diagnostics.py` (`collect(facts, runner) -> Report`, `render(report) -> str`). `facts` is a typed **allowlist** dataclass the controller fills in explicitly — app version and coarse install origin (`package`/`per-user`/`source`/`override`, never a checkout or home path), lifecycle phase and cached container classification, marker state, health row **names and severities only**, bridge document versions/timestamps/revisions, agent build and skew classification, autostart state, and bounded last-helper-result / last-successful-gather fields the controller retains for this purpose. `collect` may run only `systemctl is-active` on the six units and the two argument-exact `sudo -n -l /usr/local/bin/icloud-bridge-power on|off` probes, through the injected bounded runner: no journal, no docker of its own, no CIFS — so the export works in **every** lifecycle state, which is when reports matter. Only the classified result of those probes is rendered, never their output. Redaction is default-on: operator paths become stable `<path-N>` placeholders, real names only on an explicit **Include folder names** tick. Raw agent `lastError`, raw health detail and unfiltered environments are **not admitted to `facts` at all**. Each field is bounded to 2000 characters with a `[truncated]` suffix and the whole report to 64 KiB. Save writes mode 0600, refusing a symlink or non-regular destination | Support currently means hand-collecting rows from the GUI, Docker, systemd and the journal — hardest in exactly the failure states where it is needed. Making the input an allowlisted dataclass rather than a filter is the point: a field nobody copied in cannot leak, whereas a redactor over free prose cannot reliably tell a sentence containing a filename from one that does not — which is why raw `lastError`, raw health detail and raw subprocess output are excluded outright rather than scrubbed. `.env`, `/etc/credentials-icloud`, `SHARE_PASS`, command environments, Apple identity data and file contents have **no opt-in** |
 | D38 | Progress for long transactions | **No new IPC channel.** `host/icloud-bridge-power` already prints one `==> ` line per step; streamed live, that stdout *is* the progress feed — no progress file under `/run`, no socket. `power.stream_command` drains stdout and stderr on their own threads (a child filling one while we read the other would deadlock), enforces the monotonic deadline on `wait()` so a silent child still times out, splits on newline **and** carriage return, strips ANSI/control characters, caps each line, and keeps a bounded tail (50 lines / 64 KiB). A callback that raises cannot abort the transaction. `power_on`/`power_off` take an optional `on_line`; their result and error precedence **without** one are unchanged, and an explicitly passed runner still wins. `_TaskSignals` gains `progress = Signal(str)` and `run_async` an optional GUI-thread `on_progress`. Busy surfaces show elapsed time ticking from a Qt timer plus the most recent phase; **no percentages, no estimates, no cancel button**, and every existing timeout unchanged. Only bounded, sanitized `==> ` lines are treated as helper phases and the wording after the prefix is **presentation only, never a control input**; Compose has no such convention, so creation shows its most recent line elided to one row. The provisioning wait has no subprocess at all and shows elapsed time only. On an **outer** timeout the GUI enters `transition_unknown`: killing an unprivileged `sudo` is no evidence the root helper stopped, so all bridge I/O stays paused, cached documents/classifications are invalidated, the container is marked *unknown* rather than stopped, and the only mutating control is **Retry**, which repeats the same desired action (`flock` serializes it against a survivor). **Open VM screen** and the diagnostic export stay available; Quit is allowed but quitting-and-powering-off is not | Creation plus Windows provisioning spans 20-40+ minutes and power-on retries CIFS activation for up to five, against a static busy message. The helper's own stdout is a feed that already exists, is already bounded, and cannot go stale the way a file under `/run` can. The `transition_unknown` phase exists because the ordinary failure path resumes polling — against shares a surviving helper may already have unmounted. A cancel button is refused outright: interrupting the D29/D30 transaction halfway is exactly what the marker-then-ordered-teardown design exists to prevent |
-| D39 | Interrupted-provisioning record | Before invoking Compose, the GUI atomically writes a private mode-0600 record at `$XDG_STATE_HOME/icloud-bridge-gui/provisioning.json` containing only `version`, `startedAt`, `phase` and (after success) the inspected container id — **never the env-file path and never its contents**. A later launch reads it *and* Docker before any CIFS access: a matching container — or the fixed-name container when the pre-Compose record has no id yet — re-enters D31's no-CIFS **Provisioning Windows** state; an absent container returns to Setup with retry guidance; a different container id shows a stale-record warning and performs no CIFS I/O; a malformed or unsupported record enters Setup with a diagnostic and is **never** silently deleted or treated as proof a VM is configured. A running container with **no** record keeps the existing startup behavior. The record is cleared only after **Check setup and connect** completes `power_on` successfully, or by a separately confirmed **Discard failed setup record** offered only when Docker has proved the container absent or different — which removes this local file and nothing else: no container, no VM disk, no env file, no bundle. Same 0700 directory, atomic-replace and symlink/non-regular rules as D36 | The app can be closed, crash or be logged out during the 20-40 minutes Windows takes to install. Without the record the next launch sees a running container with no configuration and has to guess — and the wrong guess is the one that touches a mount belonging to a half-built guest. Not persisting the env path is deliberate: it must never become a second place a share password can be reached from, which is why a restarted package install may ask the operator to select that file again before showing the final host configuration command |
+| D39 | Interrupted-provisioning record | Before invoking Compose, the GUI atomically writes a private mode-0600 record at `$XDG_STATE_HOME/icloud-bridge-gui/provisioning.json` containing only `version`, `startedAt`, `phase` and (after success) the inspected container id — **never the env-file path and never its contents**. A later launch reads it *and* Docker before any CIFS access: a matching container — or the fixed-name container when the pre-Compose record has no id yet — re-enters D31's no-CIFS **Provisioning Windows** state; an absent container returns to Setup with retry guidance; a different container id shows a stale-record warning and performs no CIFS I/O; a malformed or unsupported record enters Setup with a diagnostic and is **never** silently deleted or treated as proof a VM is configured. A running container with **no** record keeps the existing startup behavior. The record is cleared only after **Check setup and connect** completes `power_on` successfully, or by a separately confirmed **Discard failed setup record** offered only when Docker has proved the container absent or different — which removes this local file and nothing else: no container, no VM disk, no env file, no bundle. Same 0700 directory, atomic-replace and symlink/non-regular rules as D36. **Amended by D43**, which makes the same record cover `reprovision` as well as `first-run` and adds the container's Docker `State.StartedAt` token, the guest run ID, the last guest phase, the mode, and the non-secret `resetShareCredential` intent; the container id stays, and the exclusion of the env-file path and its contents is unchanged | The app can be closed, crash or be logged out during the 20-40 minutes Windows takes to install. Without the record the next launch sees a running container with no configuration and has to guess — and the wrong guess is the one that touches a mount belonging to a half-built guest. Not persisting the env path is deliberate: it must never become a second place a share password can be reached from, which is why a restarted package install may ask the operator to select that file again before showing the final host configuration command |
+| D40 | Guest provisioning channel | The host stages provisioning code on a new **read-only-to-the-guest** Samba share `Provision` (container `/run/icloud-bridge-provision`, mode 0700, root-owned; guest `\\host.lan\Provision`), installed as a marker-delimited `[Provision]` stanza in dockur's generated configuration — `read only = yes`, `guest ok = yes`, `guest only = yes`, `force user = root` — validated with `testparm` in a temporary copy, atomically replaced, then `smbd` reloaded. dockur's guest-writable `Data` path is never edited. An elevated scheduled task `icloud-bridge-provision` (principal `icloud`, `LogonType Interactive`, **`RunLevel Highest`**, at-logon, infinite loop with restart, `IgnoreNew`) runs the hardened installed `C:\ProgramData\icloud-bridge-provision\watcher.ps1`, polls `\\host.lan\Provision\trigger.json` every 30 s, validates it, copies the fixed payload allowlist into an administrator-only per-run directory, atomically records the accepted run ID locally, and executes **only** that protected copy. Because the share is read-only the host, not the watcher, removes the trigger during cleanup; the local accepted-run marker gives consume-once semantics. Progress JSON is written atomically to the separate guest-writable `\\host.lan\Data\.provision\status.json` and is always parsed as untrusted input. `install.bat` registers the task at OEM time; a VM installed before this feature takes one elevated bootstrap command once (§4.1). QEMU-monitor keystroke injection stays a `tools/` debugging aid and is never installed or invoked by the app | Every step is verified by effect — files and JSON, not screenshots — and nothing is typed, so there is no blind injection to confirm by OCR and no secret on a keystroke path or a screen. It reuses D17's task pattern rather than adding a runtime, listener, port or firewall rule to a guest holding an Apple session. Above all it creates no guest-local elevation path: dockur serves `Data` `writable`/`guest only`/`force user = root`, so any guest process can replace a script staged there, and executing from it would promote the deliberately `RunLevel Limited` D28 agent to a silent administrator. Only the host root/docker-group user can write executable input, which is the boundary v1 D9 already assumes and which the monitor socket and OEM delivery already grant |
+| D41 | `SHARE_PASS` delivery to the guest (narrows D31's "never handled") | A new Qt-free, mount-I/O-free `guestprov.py` is the only GUI code permitted to return the `SHARE_PASS` value, and the trigger carries **no secret**. Only after the guest reports `waiting-for-secret` does it re-read the explicitly selected env file and stream the exact UTF-8 bytes over `docker exec -i` **stdin** into a run-scoped temporary file in the container inbox, atomically renamed to `secret` — never argv, never environment, never a host temp file, never logged, never in status, never on the clipboard, never persisted by the GUI. The elevated orchestrator copies it without text decoding to a protected local file and only then advances to `creating-share`; that transition is the acknowledgement that lets the host delete the remote copy. `03-create-share.ps1 -PasswordFile` reads the local copy once and deletes it in a `finally` before changing the account, the orchestrator deletes any residue in an outer `finally`, and watcher start plus every new-run preflight removes a local `secret` stranded by a reboot. Host cleanup may delete an unacknowledged remote secret on completion, failure, explicit exit and before a new run: that merely leaves the guest in `waiting-for-secret`, so a restarted GUI asks for the env file again and re-delivers. 03's manual placeholder path remains the fallback | D31's boundary was deliberate, so automating script 03 amends it deliberately and as narrowly as possible: one module, one direction, one moment. Deferring delivery until the guest is provably waiting is what keeps a secret out of the guest across the unbounded Apple sign-in wait, and stdin plus an atomic rename is what keeps it out of every surface — argv, environment, logs, host temp files, screenshots — that D37's redaction rules could not scrub after the fact. A deleted secret is recoverable by re-delivery, which is why cleanup may be aggressive |
+| D42 | Provisioning script currency | Every trigger re-stages the installed bundle's current `03-create-share.ps1`, `04-bridge-agent.ps1`, `agent.ps1`, `guest-state.ps1`, `guest-setup.ps1` and `watcher.ps1` into the read-only inbox **before** writing the trigger; the watcher copies exactly that allowlist into a protected per-run directory and executes only those copies, and `04-bridge-agent.ps1` resolves its sibling `agent.ps1` from `$PSScriptRoot` instead of hard-coding `C:\OEM\agent.ps1` (§4 step 2). After a non-blocked inspection the orchestrator transactionally refreshes an administrator-only `current` directory for the documented manual fallback and refreshes the installed watcher for its **next** task start; `C:\OEM` may also be refreshed for operator inspection but is never an elevated execution source. The watcher envelope — `version: 1`, the fixed filenames, the UUID run ID — is deliberately frozen; changing it requires re-running the documented bootstrap | `provision/` is copied to `C:\OEM` at install time only, so an OEM copy goes stale the moment the repo moves: the live VM's copy was four commits behind, missing D35's own skew detection, and automation running it would install stale code. Staging per run fixes that without opening the time-of-check/time-of-use hole that executing from a guest-writable or weakly-ACL'd directory would create (D40). The envelope limit is stated rather than papered over: a running old watcher cannot safely upgrade the protocol that authenticates its own replacement, so that one upgrade stays an explicit operator step |
+| D43 | Durable guest-provisioning transactions (amends D39) | The private record of D39 covers both `first-run` and `reprovision` and additionally stores the container id and its Docker `State.StartedAt` token, the guest run ID, the last guest phase, the mode, and the non-secret `resetShareCredential` intent — still **never** the env-file path and never its contents. It is written before the trigger and updated only after a matching status is parsed. A restart with a live matching container and start token plus an active run re-enters D31's no-CIFS `Phase.PROVISIONING` and polls the recorded run ID, asking the operator to reselect the env file if the guest is waiting for a secret (D41). A changed start token together with a missing or stale status offers a confirmed new idempotent run rather than adopting an uncorrelated status; without restart evidence, a missing status keeps polling and requires an explicit **Abandon and start a new run** confirmation. A record still in host `staging` with no acknowledged status retries `ensure_channel()`/`stage()` with the **same** saved run ID, covering a crash before the trigger's atomic rename. First-run success continues into **Check setup and connect**; reprovision success verifies the current bridge protocol and bundled agent build through a fresh gather, clears the record, invalidates caches and returns to monitoring. No status is trusted merely for being the newest file | D39 exists because Windows installs for 20-40 minutes; provisioning adds a second window, in which elevated guest scripts are rewriting the share, its ACLs and the agent task, and the wrong guess mounts CIFS into the middle of that. The run ID is what makes reattachment a match rather than an assumption, and `State.StartedAt` is what separates "the container restarted" from "the watcher is merely quiet" — two conditions whose correct responses are opposite. Keeping the env path out of the record is unchanged from D39, which is precisely why re-selection, not recovery, is the restart path for a pending secret |
+| D44 | Inspect, reconcile, verify | A provisioning run is a desired-state reconciliation, not an unconditional replay of scripts 03 and 04. Before changing any guest configuration the protected orchestrator evaluates the fixed checklist of §4.2 and publishes its observations plus a fixed-enum work plan. `ok` components are skipped; a safely repairable `missing` or `drifted` component invokes only its owning repair scope; a `blocked` or `unknown` observation stops the run before mutation instead of being read as absence. After the selected repairs the orchestrator evaluates the complete checklist again and reports `done` only when every required invariant is `ok` — `shareCredential`, which Windows cannot read back, is the one explicitly `unverifiable` exception. First-run and an explicit **Reset share password** request the credential (D41); ordinary reprovisioning preserves an existing credential unless the account is missing. The app renders the checklist and the proposed/completed work, but the elevated scripts independently re-probe every precondition and never authorize a mutation from guest-writable status JSON | An agent-build update must not reset a working SMB password, rerun share setup, or rewrite unrelated ACLs, while a partly built or hand-modified VM must still converge and say exactly what stopped it — requirements that are only compatible if the run inspects first and repairs by owner. Refusing to guess past `blocked`/`unknown` is the fail-closed rule D22(f) and D35 already apply: an ambiguous guest is diagnosed and contained, never overwritten to make a checklist green. Re-verifying afterwards is what makes `done` a claim about the VM rather than about which scripts exited zero |
 
 **Known accepted limitations (do not attempt to fix):**
 
@@ -714,10 +719,12 @@ defined in step 5. Then perform these steps in order:
    `New-Item -ItemType Directory -Force` for
    `C:\ProgramData\icloud-bridge\io\requests`, `...\io\responses`, and
    `...\state`.
-2. Copy `C:\OEM\agent.ps1` → `C:\ProgramData\icloud-bridge\agent.ps1`
-   (docker-compose already mounts `./provision` at `/oem` → `C:\OEM`; add
-   `guest-agent/agent.ps1` to that mount by copying it into `provision/` at build
-   time — see §8 task A3 — so it lands in `C:\OEM`).
+2. Copy the **sibling** `agent.ps1` — `Join-Path $PSScriptRoot 'agent.ps1'` — to
+   `C:\ProgramData\icloud-bridge\agent.ps1` (D42). For the manual fallback that
+   sibling is `C:\OEM\agent.ps1`, because docker-compose mounts `./provision` at
+   `/oem` → `C:\OEM` and `guest-agent/agent.ps1` is copied into `provision/` at
+   build time (§8 task A3); for an automated run it is the protected per-run
+   payload directory of §4.1. The script must not hard-code either path.
 3. Normalize the **data-root** `syncshare` ACL left by v1. The old
    `03-create-share.ps1` used `/T`, which put explicit allows on descendants;
    explicit allows outrank an inherited folder deny and can make a known child
@@ -811,6 +818,214 @@ Start-ScheduledTask -TaskName "icloud-bridge-agent"
 
 9. Verify the task reaches `Running`, the share path is exactly `...\io`, and a
    fresh `status.json` appears; then print a green "bridge ready" message.
+
+### 4.1 Automated provisioning — channel and protocol (D40-D42)
+
+Everything above stays exactly as written: it is what the operator runs by hand,
+and it is what the automated path executes on their behalf. The app never invents
+a second way to configure the guest — it stages the same scripts, elevated, and
+watches their effects. Apple ID sign-in and the iCloud Drive toggle remain manual
+(`CONTRIBUTING.md` Scope).
+
+Two directories, with opposite trust:
+
+| Role | Container path | Guest path | Writable by |
+|---|---|---|---|
+| Executable inbox | `/run/icloud-bridge-provision/` | `\\host.lan\Provision\` | host only (share is `read only = yes`) |
+| Status outbox | `/tmp/smb/.provision/` | `\\host.lan\Data\.provision\` | guest (dockur's existing `Data`) |
+
+Nothing reachable through a guest-writable path is ever executed elevated (D40).
+
+`guestprov.ensure_channel()` reconstructs **only** its marker-delimited
+`[Provision]` stanza in a temporary copy of dockur's generated `smb.conf`,
+validates that candidate with `testparm`, atomically replaces the config, and
+reloads `smbd`; a failure leaves dockur's working configuration untouched. A
+same-named stanza outside its own complete marker block is a conflict and fails
+closed — it is never merged or overridden. Every shell program and path in the
+command is a fixed constant: no env value, run ID, bundle path, status text or
+password is interpolated into shell source. The inbox is mode 0700 and root-owned
+in the container. The host refuses to stage unless the effective Samba
+configuration reports the exact share path and `read only = Yes`.
+
+`trigger.json` is written by the host **last**, after the six payload files of
+D42 are in place, through a temporary name and an atomic rename. The secret is
+deliberately absent from it (D41):
+
+```json
+{"version":1,"runId":"<32 lowercase UUID4 hex characters>",
+ "action":"reconcile","resetShareCredential":false}
+```
+
+`action` is exactly `reconcile`: no arbitrary command and no repair-step list
+crosses the elevation boundary. `resetShareCredential` is a JSON boolean — `true`
+for first run or when the operator explicitly chooses **Reset share password**,
+otherwise `false`. The protected orchestrator, not the host, derives the work
+list from a fresh inspection (D44). An inspect-only action is deliberately not
+offered: every confirmed run publishes its inspection before and during repair,
+and ordinary bridge monitoring is already the cheap continuous health probe.
+
+`status.json` is written by the guest orchestrator with the same atomic
+temp-then-rename pattern §4 step 6 uses in the guest:
+
+```json
+{"version": 1, "runId": "<echoed>", "phase": "<see list>",
+ "detail": "<one bounded human line>", "updatedAt": "<ISO-8601 UTC>",
+ "error": null,
+ "checks": {
+   "icloudPackage": "<check state>", "syncRoot": "<check state>",
+   "shareAccount": "<check state>", "shareCredential": "<check state>",
+   "dataShare": "<check state>", "bridgeBoundary": "<check state>",
+   "agentInstall": "<check state>", "agentRuntime": "<check state>"
+ },
+ "work": ["<zero or more fixed work IDs>"]}
+```
+
+Check states are exactly `pending`, `ok`, `missing`, `drifted`, `blocked`,
+`unknown`, `unverifiable`. Work IDs are exactly `install-icloud`,
+`wait-for-signin`, `create-share-account`, `reset-share-credential`,
+`repair-data-share`, `repair-bridge-boundary`, `update-agent`. The GUI validates
+the complete key set, the states, the work IDs, the types and the size before
+rendering **locally owned** labels; missing or extra keys and impossible
+combinations make the status unreadable, and guest-provided `detail` never
+decides what code runs.
+
+Phases, in order where the corresponding work exists: `staging` (payload copied
+into the protected run directory), `inspecting`, `installing-icloud`,
+`launching-icloud`, `waiting-for-signin`, `waiting-for-secret`, `creating-share`,
+`installing-bridge-boundary`, `installing-agent`, `verifying`, `done`. A skipped
+component never gets a fake busy phase: its check stays `ok` and its work ID is
+absent. On failure `phase` stays at the failing phase and `error` becomes a
+bounded message. An unknown trigger version or action, an invalid run ID, a
+missing payload file or a copy failure makes the watcher write an error status
+for that run and mark it consumed locally, so it never loops on the same bad
+trigger. The GUI treats an unknown phase or version, or a malformed field, as an
+error and never as progress.
+
+Rules a weaker model must not improvise around:
+
+- The host matches `runId` before trusting a status file. A stale or mismatched
+  `runId` means "no acknowledgement yet", not progress.
+- `runId` is `uuid.uuid4().hex`, validated as exactly 32 lowercase hex characters
+  on both sides and stored in D43's record. A timestamp is neither unique enough
+  nor an acceptable path component.
+- The watcher executes only protected local copies of the six allowlisted files
+  (D42). Nothing under `Data` or `C:\OEM` is an execution source.
+- `checks` and `work` are explanatory output from an untrusted channel, never
+  capabilities or instructions. The elevated orchestrator derives and revalidates
+  its own in-memory work plan and accepts no host-supplied phase list, path,
+  command, script name, account name or share name.
+- The secret file is never mentioned in `status.json`, in `detail`, or in any log.
+- The secret is exact UTF-8 with no added newline, and its grammar is
+  deliberately small: exactly one physical line beginning `SHARE_PASS=` in column
+  1, every byte after the first `=` being value (so `#` and later `=` are data),
+  with no quote processing, no surrounding whitespace, and no NUL or CR/LF.
+  Duplicate or quoted forms are rejected rather than interpreted. `firstrun.py`,
+  `guestprov.py` and `host/icloud-bridge-configure` must apply that one rule, so
+  the guest account and `/etc/credentials-icloud` cannot silently receive
+  different passwords.
+- `waiting-for-signin` has no timeout — it is the manual step, polled every 15 s,
+  unbounded. Every other phase carries a host-side deadline (10 minutes for
+  `installing-icloud`, 5 minutes for each of the rest). A deadline, or a status
+  mtime frozen for more than 120 s during an active phase, surfaces a "stalled"
+  warning with the manual fallback while polling continues; the guest may merely
+  be slow. The orchestrator rewrites a heartbeat at least every 30 s during both
+  waits and while each child process runs, which is what makes 120 s of silence
+  meaningful. The two waiting phases have the heartbeat check and no elapsed
+  deadline.
+- Re-triggering is always safe: reconciliation re-probes instead of trusting the
+  previous phase, the 03/04 repair scopes are idempotent, `installing-icloud`
+  skips when `Get-AppxPackage AppleInc.iCloud` already answers, and the watcher
+  consumes one trigger at a time. A new run is never staged over an acknowledged
+  active run; after a reboot, an error or an explicit retry it takes a new UUID
+  and its own protected run directory.
+- `detail` and `error` are single-line strings capped at 500 characters after
+  control-character removal, and a status read is capped at 64 KiB. The host
+  keeps the matching terminal status until D43's record has been cleared:
+  cleanup removes executable inbox content and any secret, never the only
+  evidence needed to resume safely after a GUI crash.
+
+On a VM created before this feature there is no watcher task, so a staged
+trigger is simply never acknowledged — which is not an error. The GUI keeps
+polling and shows the one-time elevated bootstrap, run once in the guest:
+
+```
+powershell -ExecutionPolicy Bypass -NoProfile -File \\host.lan\Provision\watcher.ps1 -Install
+```
+
+The installer asserts its own elevation and that `icloud` is a member of the
+built-in Administrators SID `S-1-5-32-544` — dockur currently places its
+configured user there, but the image is unpinned, so that is an upstream detail
+and not a substitute for the runtime check. Once it runs, the watcher consumes
+the already-staged trigger with no further host-side click.
+
+### 4.2 Desired-state inspection and reconciliation (D44)
+
+Inspection is implemented once, in the side-effect-free `guest-state.ps1`, and
+reused before and after repair. It is read-only: even creating a missing
+directory counts as repair and happens later. The checklist is deliberately
+fixed, so the GUI can render stable local labels and tests can exhaust its state
+matrix:
+
+| Check | `ok` means | Repair owner |
+|---|---|---|
+| `icloudPackage` | The exact `AppleInc.iCloud` AppX package is registered for the `icloud` user | Install through `winget --source msstore` (v1 D4), with bounded retries for Store readiness and v1 script 02's manual Store fallback named on exhaustion; never remove an unexpected package |
+| `syncRoot` | The exact `C:\Users\icloud\iCloudDrive` path is an accessible directory | Launch iCloud and wait for the operator's sign-in and Drive toggle; a wrong-type or inaccessible object is `blocked`, never deleted |
+| `shareAccount` | Local `syncshare` exists, is enabled, does not expire, carries the required password/account flags, and has the hidden-logon registry value | Script 03 account scope. Creating the account needs the secret (D41); non-secret property drift does not |
+| `shareCredential` | Never inferred from Windows account metadata | Always `unverifiable`. First run, a missing account, or an explicit **Reset share password** schedules a reset; otherwise the credential is preserved. A later authenticated host connection is separate corroboration, not a recovered password |
+| `dataShare` | Share `icloud` points at the exact sync root with the expected `syncshare` access; LanmanServer state/startup, firewall rules, the D32 signing/encryption settings, and the root `syncshare` ACE match this plan | Script 03 share scope. A wrong share path is recreated after inspection without deleting its target or its contents |
+| `bridgeBoundary` | The §4 step 6 exclusions safety preflight passes, and the bridge paths/share, ABE, the D27/D28 ACL boundaries and the full read-only traversal-link / protected-DACL / legacy-explicit-allow scan all pass | Script 04 boundary scope. This long metadata scan writes heartbeats and runs only during provisioning, never in background status polling |
+| `agentInstall` | The installed `agent.ps1` hashes to the staged source and the task's action, principal, run level, trigger, restart policy and protected paths match exactly | Script 04 agent scope; it does not walk or normalize the iCloud tree |
+| `agentRuntime` | The exact task is running and a fresh `status.json` reports the one supported protocol version and the staged `agentBuild` (D35) | Start the already-correct task, or run script 04's agent scope, then wait out §4 step 9's existing verification window |
+
+Rules for deriving work:
+
+- Compute the complete checklist before the first mutation. If any check is
+  `blocked` or `unknown`, publish the whole checklist and stop before changing
+  configuration. The only things that authorize a mutation are expected absence
+  (`missing`) and enumerated drift with a named repair owner. `pending` is
+  allowed only where an unmet earlier dependency makes a downstream probe
+  meaningless — bridge-boundary checks before the sync root exists, for
+  example. It is not healthy, it is re-probed once the dependency converges, and
+  it may not survive to `done`.
+- Work is dependency ordered, not blindly script ordered: package and sign-in
+  work precede share work, share-account and data-share work precede the bridge
+  boundary, and the agent is last. Re-inspect downstream dependencies after a
+  wait such as sign-in, because the VM may have changed while the app waited.
+- `ok` means verified by current effect, not by a marker alone. Markers and
+  hashes may establish bundle identity, but share paths, task definitions,
+  service state, ACL boundaries and runtime freshness are probed directly.
+- An agent-only mismatch produces only `update-agent`: it does not request the
+  secret, reset `syncshare`, rerun data-share setup, or perform the boundary
+  repair, and the inspection's own boundary scan stays read-only. A
+  non-credential data-share drift with an existing account uses script 03's
+  preserve-credential mode.
+- Each component gets at most one repair pass per run. The `verifying` pass
+  re-evaluates every check; residual drift becomes a terminal, specifically
+  classified error naming the protected manual fallback, never an automatic
+  repair loop.
+- `shareCredential` may still be `unverifiable` at `done`. The GUI must say
+  whether it was **reset this run** or **preserved**, and must never show a
+  green claim that Windows revealed or validated it. The existing authenticated
+  **Check setup and connect** step remains the end-to-end proof.
+- Guest-writable status can make the GUI display a false warning, so the host
+  validates it defensively (§4.1). It cannot cause elevated execution: the
+  protected orchestrator owns the probes, the dependency graph, the fixed paths
+  and the repair dispatch.
+
+Explicit strange-state policy:
+
+- A missing `exclusions.json` alongside any existing bridge marker (the §4 step 6
+  fail-closed condition), an unexpected file at the sync-root path, a traversal
+  link that could redirect an elevated walk, a protected child DACL, an
+  unparseable task/share/account object, or a failure to enumerate a security
+  boundary is `blocked`. Preserve the data and show the exact diagnosis; do not
+  reinterpret any of it as a fresh install.
+- A missing package, account, share, task or agent file is ordinary `missing`. A
+  known object at the wrong fixed path or with wrong fixed properties is
+  `drifted` **only** where the table above names a non-destructive repair.
+- Stale, malformed, mismatched-run or unknown-version status never alters this
+  classification. That is a host/watcher communication condition, handled by
+  D43 — not evidence that a guest component is absent.
 
 ---
 
@@ -1293,8 +1508,10 @@ useful when the tray instance already exists.
   `status.agentBuild`: `current`, `skewed`, `incompatible`, or `unknown`. Only
   `current` and `skewed` open the write gate. `skewed` changes nothing else — the
   protocol matched, so Apply, Restore and browsing all keep working — but a
-  persistent, copyable yellow banner says the guest agent does not match this app
-  and names the elevated `C:\OEM\04-bridge-agent.ps1` re-run. `incompatible`
+  persistent yellow banner says the guest agent does not match this app and
+  offers the confirmed **Re-run Windows provisioning…** action (D35/D40-D44) —
+  the same controller action the Status tab and menu invoke, never a `C:\OEM`
+  instruction, and available in the `incompatible` state too. `incompatible`
   shows a red diagnostic instead and one central gate disables Apply and Restore,
   refuses every list-request dispatch, and leaves `exclusions.json` exactly as it
   is; a document with an unsupported version is not fed into normal health or
@@ -1691,14 +1908,18 @@ still applies. This v2 document is not permission to let
 - [ ] **E12** (D35) **Version skew and the fail-closed write gate:** with the
   bridge running and healthy, edit `C:\ProgramData\icloud-bridge\agent.ps1` in
   the guest to report a deliberately different `$AgentBuild`, let a status cycle
-  pass, and confirm the GUI shows the yellow skew banner with the copyable
-  `04-bridge-agent.ps1` instruction **while Apply, Restore and folder browsing
-  keep working**. Re-run script 04 and confirm the banner clears to `current`.
-  Then, using `ICLOUD_BRIDGE_DIR` and `ICLOUD_MOUNT_DIR` overrides against a
+  pass, and confirm the GUI shows the yellow skew banner offering **Re-run
+  Windows provisioning…** — with no `C:\OEM` instruction anywhere in the active
+  recovery UI — **while Apply, Restore and folder browsing keep working**. Use
+  that banner button (not a hand-run of script 04), confirm the proposed work is
+  only `update-agent`, that no env-file chooser appears and no password reset is
+  requested, and that the banner clears to `current` when it finishes. Then,
+  using `ICLOUD_BRIDGE_DIR` and `ICLOUD_MOUNT_DIR` overrides against a
   throwaway fixture directory — never the real share — serve a `status.json` and
   a `tree.json` with an unsupported `version`, and confirm every write surface is
-  disabled, no list request is dispatched, and the real `exclusions.json` and the
-  real mount are untouched throughout.
+  disabled, no list request is dispatched, the real `exclusions.json` and the
+  real mount are untouched throughout, and the **Re-run Windows provisioning…**
+  action is still offered, since it is what the red diagnostic points at.
 - [ ] **E13** (D36) **Backup and restore, on disposable paths only.** Prefer a
   disposable VM. On the production VM, simulate a reset **non-destructively**:
   close the app, and install a validated backup at

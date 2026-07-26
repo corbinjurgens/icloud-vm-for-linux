@@ -245,6 +245,58 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-27 — App-driven guest provisioning: the decisions, before any code
+
+The plan half of the work described in
+[`todo/automated-guest-provisioning.md`](todo/automated-guest-provisioning.md).
+No behaviour changed here — this entry records the decisions that the
+implementation must now be judged against, because `CONTRIBUTING.md` requires a
+todo's proposed decisions to reach a plan register before they are implemented.
+Today a fresh VM auto-runs only `01-debloat.ps1` and leaves a `NEXT-STEPS.txt`
+telling a human to run 02, the Apple sign-in, 03 and 04 by hand; the goal is that
+the app does all of that except the sign-in, and can re-provision an existing VM.
+
+- **D40-D42 give the app a way into the guest that does not weaken it.** The host
+  stages the current scripts on a new Samba share that is **read-only to the
+  guest**, and an elevated scheduled task inside Windows copies that payload into
+  an administrator-only directory before running it. dockur's existing `Data`
+  share is `writable`/`guest only`/`force user = root`, so anything staged there
+  can be replaced by any guest process — it stays the status channel and is never
+  an execution source, and neither is the `C:\OEM` copy, which is written once at
+  install time and was found four commits stale on the live VM. Keystroke
+  injection through the QEMU monitor was rejected as the product mechanism: it is
+  blind without OCR, and it would type the share password.
+- **D41 narrows D31's "the password never passes through the GUI".** It still
+  does not, except through one Qt-free module, in one direction, at one moment:
+  after the guest says it is waiting, the value is streamed over `docker exec`
+  stdin to a run-scoped file and consumed immediately. Never argv, environment,
+  a host temp file, a log, the status channel or the clipboard.
+- **D43 extends D39's interrupted-provisioning record** to cover re-provisioning
+  and to carry the container's `State.StartedAt` token, the guest run ID and the
+  last phase, so a GUI restart mid-run reattaches to *its* run instead of
+  guessing — while still never storing the env-file path.
+- **D44 makes a run a reconciliation rather than a replay.** It inspects a fixed
+  checklist, repairs only what is missing or drifted, stops before mutating
+  anything when a check is blocked or unknown, and re-verifies afterwards. An
+  agent-build mismatch therefore updates the agent and nothing else — no password
+  reset, no ACL rewrite — and the credential check is honestly reported as
+  unverifiable rather than shown green.
+- **D35's recovery action changed shape.** The skew banner used to hand the
+  operator an elevated `C:\OEM\04-bridge-agent.ps1` command line. It now enters
+  the confirmed **Re-run Windows provisioning…** action, in both the skewed and
+  the incompatible state, through the same controller action as the Status tab.
+  The two properties behind the old instruction are unchanged: the GUI holds no
+  guest-admin credentials, and guest code is never updated silently — elevation
+  lives in the guest watcher task and the update needs an explicit confirmation.
+  E12 now tests the button instead of a hand-run of script 04.
+
+The v2 plan gained §4.1 (channel, `trigger.json`/`status.json`, the check-state
+and work-ID enums, the ordered phases, and the rules that must not be
+improvised around) and §4.2 (the fixed inspection checklist, how work is derived
+from it, and the explicit strange-state policy). Nothing in this entry has been
+run against a guest: the scripts, the GUI module and the whole live matrix are
+the milestones after this one.
+
 ### 2026-07-27 — A second read-only review, and the three things a checkout could act on
 
 A follow-up performance and resource review of the live host, recorded in
