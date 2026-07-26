@@ -1159,6 +1159,10 @@ gui/
 │   ├── sizes.py           # Qt-free: the honest excluded-space aggregation
 │   ├── firstrun.py        # Qt-free, no mount I/O: readiness checks, resource
 │   │                      #   resolution, compose argv, host-setup verification (D31)
+│   ├── envfile.py         # Qt-free, no I/O but an injected reader: the one
+│   │                      #   SHARE_PASS grammar its three readers share (D41)
+│   ├── guestprov.py       # Qt-free, no mount I/O: host half of the provisioning
+│   │                      #   channel — share, staging, secret, status (D40-D44)
 │   ├── health.py          # host-side checks (no bridge): container/mount/canary
 │   ├── bridge.py          # bridge share I/O: read status/tree, write exclusions,
 │   │                      #   list-request round-trip; worker-thread I/O

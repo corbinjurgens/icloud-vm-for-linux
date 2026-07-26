@@ -115,14 +115,17 @@ register explicitly.
 
 The Qt boundary is part of the design. `tray.py`, `window.py`, and
 `__main__.py` are the PySide6 layer. `health.py`, `bridge.py`, `power.py`,
-`lifecycle.py`, `backup.py`, `diagnostics.py`, `firstrun.py`, `autostart.py`,
-`filtering.py`, `listing.py`, `sizes.py`, `notify.py`, and `cli.py` import no Qt
-and own the logic.
+`lifecycle.py`, `backup.py`, `diagnostics.py`, `firstrun.py`, `guestprov.py`,
+`envfile.py`, `autostart.py`, `filtering.py`, `listing.py`, `sizes.py`,
+`notify.py`, and `cli.py` import no Qt and own the logic.
 
 `lifecycle.py` is stricter still: it is a pure reducer with no I/O, subprocess,
-or clock. `power.py`, `backup.py`, `diagnostics.py`, `firstrun.py`, and
-`autostart.py` must remain free of mount I/O. Consult their module docstrings
-and the v2 plan before changing those boundaries.
+or clock. `envfile.py` performs no I/O of its own either; it holds the single
+`SHARE_PASS` grammar that `firstrun.py`, `guestprov.py`, and
+`host/icloud-bridge-configure` must agree on (D41). `power.py`, `backup.py`,
+`diagnostics.py`, `firstrun.py`, `guestprov.py`, and `autostart.py` must remain
+free of mount I/O. Consult their module docstrings and the v2 plan before
+changing those boundaries.
 
 Keep the security and data-safety boundaries of those modules intact:
 
@@ -137,6 +140,12 @@ Keep the security and data-safety boundaries of those modules intact:
 - `firstrun.py` owns readiness, resource resolution, compose arguments,
   host-setup verification, and the interrupted-provisioning record. It never
   persists an env-file path or its contents.
+- `guestprov.py` is the only GUI module allowed to handle the share password,
+  which is the whole of D41's narrow amendment to D31. It may read `SHARE_PASS`
+  from the selected env file only once the guest has reported
+  `waiting-for-secret`, and may deliver it only over `docker exec` stdin. The
+  value never appears in argv, the environment, a host temporary file, a log, a
+  status, or the clipboard, and is never persisted.
 - `autostart.py` only reads and toggles the XDG entry's `Hidden=` value.
 
 ## Hard rules
