@@ -49,8 +49,9 @@ the security, lifecycle, Files On-Demand, and no-secret contracts in `AGENTS.md`
 **Status:** Candidate, highest priority  
 **Evidence:** The checkout can prove syntax, pure state models, package contents,
 and command construction, but it has no KVM guest, systemd instance, CIFS mount,
-tray, or Apple device. The v2 plan's E0–E11d checks are consequently still the
-largest source of uncertainty.
+tray, or Apple device. The v2 plan's Phase 0 and Phase E checks are consequently
+still the largest source of uncertainty — and the reviewed follow-up work below
+added four more of them (E12–E15).
 
 Run and record the complete matrix on the real host before adding more
 data-path behavior: cold hydration and write round trips; exclusion ACL/ABE and
@@ -65,130 +66,78 @@ Results are recorded in
 environment baseline those results are read against. Rows are filled in only from
 the real host.
 
-**Completion gate:** E0 and every applicable E1–E11d case in
+**Completion gate:** E0 and every applicable Phase E case in
 [`docs/plan-gui-selective-sync.md`](docs/plan-gui-selective-sync.md#phase-e--v2-live-acceptance-tests-require-the-real-vm)
-has a dated result, with failures turned into fixes or explicit accepted
-limitations.
-
-### I-002 — Export a privacy-safe diagnostic report
-
-**Status:** Candidate  
-**Evidence:** The app now classifies lifecycle and health failures, but support
-still requires the operator to collect details manually from several GUI rows,
-Docker, systemd, the bridge JSON, and the journal. Long startup and mount
-failures are especially hard to report after the fact.
-
-Add **Copy diagnostics** and **Save diagnostic report** actions. A report should
-contain the app/install version, lifecycle and container classification, marker
-state, host-unit state, helper authorization result, health rows, bridge
-document versions/timestamps, and bounded recent helper errors. It must never
-read or include `.env`, `/etc/credentials-icloud`, `SHARE_PASS`, command
-environments, Apple identity data, or file contents. Exclusion paths and other
-filenames should be omitted by default and require a separate explicit opt-in.
-Setup/powered-off reports must retain D31/D29's no-CIFS rule.
-
-**Completion gate:** Qt-free collector/redaction tests prove secrets and
-unbounded output cannot enter a report; package and per-user installs both
-identify their origin; a real failure report is sufficient to follow the
-matching `SETUP.md` recovery path.
-
-### I-003 — Detect host/guest protocol and agent-version skew
-
-**Status:** Candidate  
-**Evidence:** `exclusions.json` has a checked version, but `status.json` and
-`tree.json` are currently accepted as arbitrary JSON objects. A package upgrade
-installs a newer `agent.ps1` into the host resource bundle but cannot replace
-`C:\ProgramData\icloud-bridge\agent.ps1`; the operator must re-run
-`04-bridge-agent.ps1` inside the guest. A newer GUI and older guest agent can
-therefore coexist without a clear upgrade warning.
-
-Add an explicit agent build/protocol version and capability set to status, then
-validate the versions of status, tree, and list responses. The GUI should
-distinguish “guest agent needs updating” from malformed data and refuse
-incompatible writes fail-closed while preserving the current exclusion list.
-The recovery action remains a copyable instruction to re-run script 04; the GUI
-must not gain guest-admin credentials or silently update scheduled code.
-
-**Completion gate:** compatibility tests cover older, current, newer, malformed,
-and missing-version documents, and a live package upgrade demonstrates a clear
-warning followed by recovery without losing exclusions.
-
-### I-004 — Back up and explicitly restore selective-sync choices
-
-**Status:** Candidate  
-**Evidence:** iCloud is the canonical copy of file content, but
-`exclusions.json` is unique configuration stored inside the otherwise
-disposable VM. The existing fail-closed provisioning rule correctly refuses to
-manufacture an empty config after loss, yet the documented recovery currently
-assumes the operator already has a copy to restore.
-
-After each successfully validated read or Apply, keep a mode-0600 snapshot in
-the desktop user's XDG state directory, including revision and source metadata.
-Offer an explicit restore preview that validates and canonicalizes the whole
-list, shows additions/removals, and writes a revision higher than every observed
-revision. Never interpret a missing or corrupt backup as an empty exclusion
-list, and never restore automatically.
-
-**Completion gate:** tests cover atomic backup, permissions, malformed and stale
-snapshots, revision monotonicity, case-insensitive duplicates, and an
-include-everything backup; a disposable-VM recovery preserves the selected
-exclusions.
-
-### I-005 — Show progress for long VM operations
-
-**Status:** Candidate  
-**Evidence:** VM creation may run for an hour and power-on may spend five minutes
-retrying real CIFS activation. Both run off the GUI thread, but the operator
-mostly sees a static busy message until the subprocess returns.
-
-Show elapsed time and safe phase-level progress such as container creation,
-Windows installation, guest boot, data-share readiness, bridge-share readiness,
-and host services armed. Do not fake percentage completion, expose subprocess
-environments, touch CIFS early, or add a cancel button that can interrupt the
-D29/D30 transaction halfway through. Any helper progress channel needs a
-bounded, stale-safe format tied to the serialized transaction.
-
-**Completion gate:** the UI remains responsive through a deliberately slow
-create/start, reports the phase that timed out, and preserves all rollback,
-marker, and no-early-I/O behavior.
-
-### I-006 — Extract lifecycle state and add thin Qt integration tests
-
-**Status:** Candidate  
-**Evidence:** The recent usability pass successfully moved reusable logic into
-Qt-free modules, but `__main__.py` and `window.py` are now roughly 1,000 and
-1,300 lines. The highest-risk D29–D31 orchestration still lives in Qt callbacks,
-while the automated suite exercises model modules rather than complete
-controller transitions.
-
-Extract a pure lifecycle reducer and presentation model before adding more
-states. Add a small optional PySide6/offscreen layer that verifies signal wiring
-for startup-before-CIFS, failed power-off rollback, powered-off Quit, setup
-gating, stale listing responses, and tray/no-tray close behavior. The ordinary
-no-Qt suite must continue to pass and must not require a display.
-
-**Completion gate:** the transition table is exhaustively tested without Qt,
-the with-Qt run covers the wiring above, and no behavior or plan contract
-changes during the refactor.
+has a dated result in
+[`docs/acceptance-results.md`](docs/acceptance-results.md), with failures turned
+into fixes or explicit accepted limitations.
 
 ### I-007 — Establish release boundaries
 
-**Status:** Candidate  
-**Evidence:** Selective sync, lifecycle control, packaging, first-run setup, and
-the performance pass all currently report the same `2.0.0` version. That makes
-operator bug reports and package comparisons less precise even though
-`__version__` is already the correct single source.
+**Status:** Ready; blocked on live acceptance  
+**Evidence:** The reviewed backlog in
+[`todo/further_improvements.md`](todo/further_improvements.md) has landed, so
+there is a coherent body of work to name. The release is chosen: **2.1.0**. What
+is missing is the evidence, not the decision — every row in
+[`docs/acceptance-results.md`](docs/acceptance-results.md) is still
+`not yet run`, and a development checkout is structurally unable to change that.
 
-Before publishing another package, choose and document the first release
-boundary, bump `__version__`, tag only after the live acceptance appropriate to
-that release, and add the resulting version/date to this file. Do not
-retroactively label untagged commits as releases.
+`__version__` in `gui/icloud_bridge_gui/__init__.py` therefore still reads
+`2.0.0`. Bumping it to `2.1.0` is a one-line change, and it is the *only*
+remaining step; `Makefile` and `packaging/build-deb.sh` already derive from that
+single source.
 
-**Completion gate:** the GUI, `--version`, `make version`, package filename and
-package metadata agree, and the changelog maps the tag to its acceptance
-evidence.
+**Completion gate:** the applicable E0–E15 rows are recorded on the real host as
+`pass` or an explicitly approved accepted limitation; then bump `__version__` to
+`2.1.0`, add the release entry here mapping it to those rows, and confirm
+`make version`, `icloud-bridge-gui --version`, the built package filename and
+`dpkg-deb -I` all agree. Tagging `v2.1.0` remains the operator's call and
+happens after that, never before.
 
 ## Shipped improvements
+
+### 2026-07-26 — Reviewed follow-up work: skew, backup, diagnostics, progress
+
+The reviewed backlog recorded in
+[`todo/further_improvements.md`](todo/further_improvements.md) landed as the
+commits below. None of it is tagged; see I-007 for why the version still reads
+`2.0.0`.
+
+- **Live acceptance record** (`46c83c0`). `docs/acceptance-results.md` now exists
+  with a row per live check, an environment baseline, and the rules that a
+  failure becomes a fix or a stated limitation, that history is appended rather
+  than overwritten, and that evidence never carries operator data. It ships in
+  the package. Every row is `not yet run`: filling one in needs the real host.
+- **Lifecycle reducer** (`4d58f03`). The D29–D31 state machine moved out of Qt
+  callbacks into a pure `lifecycle.py` reducer, with an exhaustive transition
+  table test and a new offscreen PySide6 wiring suite. Behavior-preserving: no
+  plan contract changed. Stale worker completions are now dropped by an
+  operation token instead of ad-hoc state checks.
+- **Protocol and agent-build skew** (`da62339`, v2 plan D35). All three bridge
+  document kinds carry `"version": 1`, `status.json` carries `agentBuild`, and
+  the GUI reports skew with a copyable "re-run script 04" banner. An unsupported
+  or not-yet-verified protocol fails closed: Apply and list requests are refused
+  and `exclusions.json` is left untouched.
+- **Selective-sync backup and restore** (`693cf64`, v2 plan D36). A mode-0600
+  host-side snapshot is written after every validated read and Apply, and a
+  rebuilt VM's empty revision-0 config can no longer overwrite it. Recovery is an
+  explicit, previewed **Restore from backup…** rather than an assumption that the
+  operator kept their own copy.
+- **Diagnostic report** (`01fb4ef`, v2 plan D37). **Copy diagnostics** and **Save
+  diagnostic report…** build a report from an allowlisted fact set, so a field
+  nobody deliberately copied in cannot leak. Folder names are placeholders unless
+  opted in; secrets, environments and file contents have no opt-in at all. It
+  works in every lifecycle state, including the ones with no mount.
+- **Progress and interrupted first runs** (`6c7aaba`, v2 plan D38/D39). Long
+  transactions now show elapsed time and the helper's own streamed `==> ` phase
+  lines — no new IPC channel, no fake percentages, no cancel button. An outer
+  timeout enters a quiesced `transition_unknown` state instead of resuming
+  polling against shares that may already be gone, and a first run interrupted
+  mid-install resumes its no-CIFS provisioning state instead of guessing.
+
+Everything above is proven by `make check` and `make test-all` only. Real
+KVM/Windows/CIFS/tray behavior — including the new E12–E15 checks — still
+requires I-001.
 
 ### 2026-07-26 — In-session lifecycle, first run, usability and performance
 

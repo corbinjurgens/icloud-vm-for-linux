@@ -1,6 +1,10 @@
 # Todo: Execute the CHANGELOG "Further improvements" backlog
 
-> **Status: not started.** This note turns the candidates recorded in
+> **Status: items 1-6 implemented; item 7 is ready and blocked on live
+> acceptance.** Each item below carries its own status note. The one thing this
+> workspace could not do is run anything on real hardware, so every row in
+> `docs/acceptance-results.md` is still `not yet run` — which is exactly what
+> item 7's version bump waits for. This note turns the candidates recorded in
 > [`../CHANGELOG.md`](../CHANGELOG.md) under **Further improvements**
 > (I-001 – I-007) into an ordered, reviewed implementation plan. The CHANGELOG
 > stays the ledger: when an item here ships, move its candidate to **Shipped
@@ -609,6 +613,15 @@ Files: `gui/icloud_bridge_gui/power.py`, `gui/icloud_bridge_gui/__main__.py`,
 `docs/plan-gui-selective-sync.md`, `AGENTS.md`.
 
 ## 7. Establish the first release boundary (I-007)
+
+> **Status: prepared, bump withheld.** The release is chosen (2.1.0) and the
+> CHANGELOG now carries the shipped entries for items 1-6 and an I-007 entry
+> saying what remains. `__version__` deliberately still reads `2.0.0`: this
+> item's own precondition is that every release-applicable Phase E row is a
+> `pass` or an approved accepted limitation, and all of them are `not yet run`.
+> The derivation chain was verified as it stands — `make version`,
+> `icloud-bridge-gui --version`, the built filename and `dpkg-deb -I` all agree
+> — so the bump is a one-line change once the live rows exist.
 
 Everything so far reports `2.0.0`. Decisions:
 
