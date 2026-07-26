@@ -4,6 +4,18 @@ Run Apple's official **iCloud for Windows** client inside a stripped-down
 Windows 11 VM on a Linux host, and expose the synced iCloud Drive folder to the
 host as a normal mounted directory at `/mnt/icloud`.
 
+## Which document you want
+
+| If you want to | Read |
+|---|---|
+| Stand this up on a fresh host | [`SETUP.md`](SETUP.md) — the annotated runbook, with the snags a real machine actually hits |
+| Follow the condensed happy path | [Usage](#usage), below |
+| Lint, test or run the code | [Development](#development), below |
+| Exclude folders from sync | [`docs/selective-sync.md`](docs/selective-sync.md) |
+| Fix something that broke | [`SETUP.md` troubleshooting](SETUP.md#troubleshooting-quick-reference) |
+| See what improved, what is next, or what was already ruled out | [`CHANGELOG.md`](CHANGELOG.md) |
+| Understand why it is built this way, or what was already tried and rejected | [`docs/implementation-plan.md`](docs/implementation-plan.md) (v1) and [`docs/plan-gui-selective-sync.md`](docs/plan-gui-selective-sync.md) (v2 — amends v1 and wins on conflict) |
+
 ## Why this approach
 
 Every native-Linux iCloud tool relies on reverse-engineered web APIs. Those
@@ -64,6 +76,7 @@ cached until the guest needs the space back.
 ├── docker-compose.yml     # the dockur/windows service definition
 ├── .env.example           # operator-specific values (copy to .env, gitignored)
 ├── SETUP.md               # annotated real-machine runbook + troubleshooting
+├── CHANGELOG.md           # shipped improvements, next candidates, ruled-out ideas
 ├── packaging/             # .deb build
 │   ├── build-deb.sh       # stages a tree, dpkg-deb (no debhelper/fakeroot/root)
 │   ├── lint-ps1.ps1       # PowerShell parse + analyzer pass
@@ -78,8 +91,8 @@ cached until the guest needs the space back.
 ├── guest-agent/
 │   └── agent.ps1          # THE guest agent (source of truth): exclusions, status, reclaim
 ├── gui/                   # host GUI + tray icon (PySide6)
-│   ├── icloud_bridge_gui/ # health.py, bridge.py, tray.py, window.py, __main__.py
-│   ├── tests/             # pytest: health precedence + bridge protocol
+│   ├── icloud_bridge_gui/ # the app; health/bridge/power/autostart stay Qt-free
+│   ├── tests/             # pytest; must pass with AND without PySide6 installed
 │   ├── install-gui.sh     # per-user install (launcher, .desktop, autostart)
 │   ├── icloud-bridge-gui.desktop
 │   └── autostart/icloud-bridge-tray.desktop
@@ -102,7 +115,8 @@ cached until the guest needs the space back.
 │   ├── icloud-health.service
 │   └── icloud-health.timer
 └── docs/
-    ├── implementation-plan.md   # full, authoritative build handoff
+    ├── implementation-plan.md   # v1: full, authoritative build handoff
+    ├── plan-gui-selective-sync.md # v2: GUI, bridge protocol, selective sync
     ├── selective-sync.md        # what exclusion does, and the deployment checklist
     └── automation-notes.md      # first-run record: what was manual and why
 ```
@@ -280,17 +294,45 @@ installer remains the right choice on a release whose archives lack the
 
 ```bash
 make            # list every target
+make hooks      # once per clone: install the pre-commit and commit-msg hooks
 make check      # lint + tests -- everything provable without a VM
 make test-all   # run the suite both with and without PySide6
+make run        # launch the GUI from the source tree, nothing installed
 make lint-ps    # fetch PowerShell 7 and parse the .ps1 files
 ```
 
+`make hooks` points `core.hooksPath` at `.githooks/`. The pre-commit hook runs
+`tools/hygiene-checks.sh` and the pytest suite against a snapshot of the staged
+tree -- no live secrets, loopback-only published ports, LF endings, the two
+`agent.ps1` copies identical, syntax, and the full pytest suite, in about a
+second. `make lint` runs the same checker over the working tree if you want it
+without committing.
+
+This project is **pre-release**: there are no tags and no installed copies
+beyond the author's. Formats and interfaces change without a migration path, so
+after pulling, re-run `04-bridge-agent.ps1` in the guest if the GUI says the
+agent no longer matches.
+
 `make test` creates `.venv` on first use; there is no system pytest and PEP 668
-blocks `pip install --user`, so a venv is the supported route. Targets that need
-real hardware — `deps`, `install`, `configure`, `acceptance` — are labelled
-`HOST:` in `make` output and cannot be validated from a checkout alone. See
-[plan §14](docs/implementation-plan.md) for how the packaging is put together and
-why it ships where it does.
+blocks `pip install --user`, so a venv is the supported route. `make run` and
+`make test-qt` also want `.venv-qt`, which `make venv-qt` builds (a large PySide6
+download); `make run` falls back to your system `python3` when that venv is
+absent, which works only if PySide6 is installed system-wide.
+
+**What `make run` gives you without a VM.** The tray appears and, with no guest
+yet, the window opens on its **Setup** tab — the checks there (`/dev/kvm`, the
+Docker socket, the compose and provision files, `.env`) are exactly what a
+first-run operator sees, and the checkout itself supplies the bundle they point
+at. What you cannot exercise is anything behind an install: health and selective
+sync read as unavailable with nothing mounted, and the power controls fail,
+because they call the `icloud-bridge-power` helper that the host install places.
+`make install-gui` does the per-user install — the same thing as running
+`./gui/install-gui.sh` directly.
+
+Targets that need real hardware — `deps`, `install`, `configure`, `acceptance` —
+are labelled `HOST:` in `make` output and cannot be validated from a checkout
+alone. See [plan §14](docs/implementation-plan.md#14-build-packaging-and-developer-entry-points)
+for how the packaging is put together and why it ships where it does.
 
 ## Files On-Demand and disk space
 
