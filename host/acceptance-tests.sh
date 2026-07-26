@@ -31,12 +31,38 @@ docker inspect -f '{{.State.Running}}' icloud-windows 2>/dev/null | grep -q true
   && ok "icloud-windows running" || bad "icloud-windows not running"
 
 # The compose file passes /dev/vhost-net so QEMU runs the virtio NIC with
-# vhost=on (v2 plan D33). Without the node the container cannot start at all,
-# so this reports the cause rather than leaving a bare "not running" above.
+# vhost=on (v2 plan D33). Without the node a container created from the current
+# compose file cannot start at all, so this reports the cause rather than leaving
+# a bare "not running" above.
 if [ -e /dev/vhost-net ]; then
-  ok "/dev/vhost-net present (accelerated virtio networking)"
+  ok "/dev/vhost-net present on the host (accelerated virtio networking)"
 else
   bad "/dev/vhost-net missing — run host/setup-prereqs.sh (modprobe vhost_net)"
+fi
+
+# ...but the host node existing proves nothing about the container that is
+# actually running. A container created before the compose file gained the device
+# keeps running happily without it: dockur silently falls back to userspace
+# virtio, and QEMU then copies every SMB byte through its own main loop. That is
+# precisely the state the author's own guest was found in on 2026-07-26, with the
+# host check above passing green. Ask the container and then ask QEMU.
+if docker inspect -f '{{range .HostConfig.Devices}}{{.PathOnHost}} {{end}}' \
+     icloud-windows 2>/dev/null | grep -q '/dev/vhost-net'; then
+  ok "the running container was given /dev/vhost-net"
+else
+  bad "the running container has NO /dev/vhost-net — it predates the compose file;
+        recreate it with 'docker compose up -d' (power the bridge off first)"
+fi
+
+# Ground truth: vhost=on only appears if QEMU could actually open the node.
+QEMU_ARGS=$(docker exec icloud-windows sh -c \
+  'tr "\0" " " < /proc/$(pgrep -f qemu-system-x86_64 | head -1)/cmdline' 2>/dev/null)
+if [ -z "$QEMU_ARGS" ]; then
+  echo "  INFO: could not read the guest QEMU command line (container not exec-able)"
+elif echo "$QEMU_ARGS" | grep -q 'vhost=on'; then
+  ok "QEMU is running the virtio NIC with vhost=on"
+else
+  bad "QEMU has no vhost=on — virtio packet processing is in userspace (v2 plan D33)"
 fi
 
 echo "== 3. Published ports answer only on 127.0.0.1 =="
