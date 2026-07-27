@@ -136,6 +136,29 @@ Numbering is stable; completed items are removed without renumbering.
    now write the secret exactly once, at creation, and still never log,
    display, or re-read it outside the existing D41 channel.
 
+8. **Creating the VM should flow straight into the first provisioning run.**
+   Operator observation, 2026-07-27: after **Create Windows VM** there is no
+   indication of when the install finishes and no cue that anything can be
+   done meanwhile — the operator polled the VM screen by hand, then clicked
+   **Set up Windows automatically** manually. Both halves are already built;
+   they are just not joined. The reducer's own comment says "both doors out
+   of Setup lead to the same first run" (`lifecycle.py`, `_setup`,
+   `VM_CREATED`), and `_begin_provisioning_run` -> `_probe_guest_os` already
+   tolerates an installing guest: it polls until the container runs *and*
+   Windows answers, shows "Windows is still installing", and stages the run
+   by itself the moment the guest is ready. But the `VM_CREATED` dispatch
+   (`__main__.py` `done` in the create-VM path) only changes phase — nothing
+   begins the run, so the app sits silent until the click. Fix: after
+   `VM_CREATED`, begin the first run automatically (the click remains for
+   re-entry after an interruption). The confirmation the operator already
+   gave for Create Windows VM covers the whole flow — its dialog text
+   (`_confirm_create_vm`) and the provisioning explainer both describe one
+   end-to-end sequence. Complement: desktop notifications for the moments a
+   run needs the operator (`waiting-for-signin`, a failure, done) —
+   `notify.IncidentTracker` currently serves only RUNNING-phase health
+   incidents, and notifications are explicitly disabled through provisioning,
+   which is exactly when the operator has tabbed away to wait.
+
 ## Constraints
 
 - Items 1-2 first: they are the operator-facing circle-breakers, and item 2's
