@@ -72,7 +72,11 @@ function Write-JsonAtomic {
     $tmp = Join-Path $dir ('.' + [IO.Path]::GetFileName($Path) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
     try {
         [IO.File]::WriteAllText($tmp, $Json, $enc)
-        if ([IO.File]::Exists($Path)) { [IO.File]::Replace($tmp, $Path, $null) }
+        # [NullString]::Value, never $null: PowerShell marshals $null to the
+        # empty string when binding a [string] parameter, and File.Replace
+        # rejects "" as a backup path with "The path is not of a legal form",
+        # which made every write after the first one throw.
+        if ([IO.File]::Exists($Path)) { [IO.File]::Replace($tmp, $Path, [NullString]::Value) }
         else { [IO.File]::Move($tmp, $Path) }
     } finally {
         if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) }

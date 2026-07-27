@@ -113,15 +113,12 @@ function Write-JsonAtomic {
     try {
         [IO.File]::WriteAllText($tmp, $Json, $enc)
         if (-not [IO.File]::Exists($Path)) { [IO.File]::Move($tmp, $Path) }
-        elseif ($Path.StartsWith('\\')) {
-            # File.Replace rejects UNC paths ("The path is not of a legal
-            # form"), so the status file on \\host.lan\Data is deleted and
-            # renamed instead. The host reads a momentarily missing status as
-            # "not readable yet", never as an error, so the window is safe.
-            [IO.File]::Delete($Path)
-            [IO.File]::Move($tmp, $Path)
-        }
-        else { [IO.File]::Replace($tmp, $Path, $null) }
+        # [NullString]::Value, never $null: PowerShell marshals $null to the
+        # empty string when binding a [string] parameter, and File.Replace
+        # rejects "" as a backup path with "The path is not of a legal form" -
+        # on every destination, local or UNC. Passing $null made every write
+        # after the first one (which takes the Move branch) throw.
+        else { [IO.File]::Replace($tmp, $Path, [NullString]::Value) }
     } finally {
         if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) }
     }
@@ -164,7 +161,8 @@ function Set-AcceptedToken {
     $tmp = Join-Path $ProvisionDir ('.accepted-run.' + [Guid]::NewGuid().ToString('N') + '.tmp')
     try {
         [IO.File]::WriteAllText($tmp, $Token, $enc)
-        if ([IO.File]::Exists($AcceptedPath)) { [IO.File]::Replace($tmp, $AcceptedPath, $null) }
+        # [NullString]::Value, never $null - see Write-JsonAtomic above.
+        if ([IO.File]::Exists($AcceptedPath)) { [IO.File]::Replace($tmp, $AcceptedPath, [NullString]::Value) }
         else { [IO.File]::Move($tmp, $AcceptedPath) }
     } finally {
         if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) }

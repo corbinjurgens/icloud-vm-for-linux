@@ -245,6 +245,38 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-27 — Every JSON writer could publish exactly once (`agentBuild` 4 → 5)
+
+With a working agent finally running, the guest rebooted, the agent restarted,
+burned CPU — and `status.json` never changed again. Probing `File.Replace` in
+the live guest, on a plain local path, produced the same "The path is not of a
+legal form" that the earlier entry below blamed on UNC:
+
+```
+[IO.File]::Replace($src, $dst, $null)                 -> FAILS (local and UNC)
+[IO.File]::Replace($src, $dst, "backup.bak")          -> ok
+[IO.File]::Replace($src, $dst, [NullString]::Value)   -> ok (local and UNC)
+```
+
+The cause is PowerShell, not the filesystem: `$null` bound to a `[string]`
+parameter marshals to the **empty string**, and `File.Replace` rejects `""` as a
+backup path. Every `Write-JsonAtomic` in this repository passed `$null`, so
+every document — `status.json`, `tree.json`, the agent's private state, the
+watcher's accepted-run token, script 04's config — could be written exactly once
+(the file-absent `Move` branch) and threw on every write afterwards. The agent
+swallowed the exception into a `status` subtask error, which is only reportable
+through the file it could not write, so a live agent looked identical to a dead
+one.
+
+**This corrects the entry below.** UNC was never the constraint: `File.Replace`
+works fine on `\\host.lan\Data` with a real null. That earlier diagnosis fitted
+the symptom (first write succeeds, all later writes throw) because the symptom
+was the same bug seen through the one writer that happened to be on a UNC path.
+All five writers now pass `[NullString]::Value`, the delete-then-rename UNC
+accommodation is deleted, and §4.1 of the v2 plan records the real constraint.
+Verified live: after the fix the agent publishes a fresh `status.json` every
+pass.
+
 ### 2026-07-27 — The guest agent imported a DLL that does not exist (`agentBuild` 3 → 4)
 
 With the bridge finally built on the live guest, the agent task registered,

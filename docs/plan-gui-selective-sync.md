@@ -866,13 +866,15 @@ offered: every confirmed run publishes its inspection before and during repair,
 and ordinary bridge monitoring is already the cheap continuous health probe.
 
 `status.json` is written by the guest orchestrator with the same
-temp-then-rename pattern §4 step 6 uses in the guest, with one UNC
-accommodation: .NET Framework's `File.Replace` rejects UNC paths outright, so
-on `\\host.lan\Data` an existing status file is deleted and the temp file
-renamed into place. The host already treats a momentarily missing or unreadable
-status as "not readable yet" rather than an error, so the sub-second non-atomic
-window is harmless; local-path writers (the agent, script 04) keep the fully
-atomic `Replace`:
+temp-then-rename pattern §4 step 6 uses in the guest, and every writer —
+including the one on `\\host.lan\Data` — keeps the fully atomic `File.Replace`.
+Its third argument must be `[NullString]::Value`, never `$null`: PowerShell
+marshals `$null` to the empty string when binding a `[string]` parameter, and
+`File.Replace` rejects `""` as a backup path with "The path is not of a legal
+form" on every destination, local or UNC. `$null` therefore let each document be
+written exactly once — the run that created it, which takes the file-absent
+`Move` branch — and threw on every write after that. UNC is not the constraint
+here, and no writer needs a delete-then-rename accommodation:
 
 ```json
 {"version": 1, "runId": "<echoed>", "phase": "<see list>",

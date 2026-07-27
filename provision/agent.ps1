@@ -76,7 +76,7 @@ $ShareUser = "syncshare"
 # behavior, so a GUI shipped alongside a newer agent can say so. The GUI carries
 # the same number in bridge.py and a test compares the two literals.
 $ProtocolVersion = 1
-$AgentBuild      = 4
+$AgentBuild      = 5
 
 # Cloud Files / FILE_ATTRIBUTE values.
 # DIRECTORY and UNPINNED are listed for reference and are deliberately unused:
@@ -521,7 +521,14 @@ function Write-JsonAtomic {
     try {
         [IO.File]::WriteAllText($tmp, $json, $enc)
         if ([IO.File]::Exists($Path)) {
-            [IO.File]::Replace($tmp, $Path, $null)
+            # [NullString]::Value, never $null: PowerShell marshals $null to the
+            # empty string when binding a [string] parameter, and File.Replace
+            # rejects "" as a backup path with "The path is not of a legal
+            # form". With $null the agent could publish status.json exactly once
+            # - the run that created it - and every write after that threw into
+            # the status subtask error, which is itself only reportable through
+            # the file that could not be written.
+            [IO.File]::Replace($tmp, $Path, [NullString]::Value)
         } else {
             [IO.File]::Move($tmp, $Path)
         }
