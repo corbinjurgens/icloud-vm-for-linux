@@ -174,6 +174,29 @@ Numbering is stable; completed items are removed without renumbering.
    failed there, that failure is the primary bug and this item is its
    detection.
 
+10. **Evaluate a host->guest execution channel (QEMU guest agent) as a
+    deliberate decision — or reject it in the register.** Operator question,
+    2026-07-27, from living through item 9's failure mode: "can the app not
+    handle the watcher bootstrap itself?" Today it cannot, structurally: the
+    host->guest surface is deliberately pull-only (the guest fetches from the
+    host's shares; the host executes nothing in Windows and holds only the
+    low-privilege share credential). Verified on the live VM: QEMU runs with
+    a human-facing `-monitor` socket only — no `org.qemu.guest_agent.0`
+    virtio-serial channel — so there is no existing hook. Closing the gap
+    would mean adding one of: a qga channel (compose `ARGUMENTS` +
+    guest-side qemu-ga service, giving SYSTEM-level `guest-exec`), WinRM/SSH
+    with a stored admin credential, or monitor-socket keystroke injection
+    (rejected out of hand: blind typing into whatever has focus). All of
+    them widen the host's power over a guest that holds a live Apple
+    session, which is why this needs a register decision either way. Honest
+    ROI note: a channel whose guest half is installed at OEM time can only
+    be relied on by VMs whose OEM step worked — the same class whose watcher
+    registration already works — so its marginal value is repairing broken
+    watchers on established VMs, not first bootstrap. Items 8-9 (verified
+    OEM registration, loud immediate detection, one-liner led with) may be
+    the better spend; decide once the `watcher-install.log` from the live
+    failure is known.
+
 ## Constraints
 
 - Items 1-2 first: they are the operator-facing circle-breakers, and item 2's
