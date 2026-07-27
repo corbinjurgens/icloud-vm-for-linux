@@ -113,6 +113,29 @@ Numbering is stable; completed items are removed without renumbering.
    the real cost is a few minutes and zero download. Cheap check, honest
    dialog. Cosmetic next to the others, so last.
 
+7. **The app should create the env file itself; choosing one becomes the
+   advanced path.** The Setup tab currently blocks on "choose the .env file",
+   and `check_env`'s failure hint is `cp .env.example .env  # then edit it` —
+   terminal work at the exact moment the GUI is supposed to be taking over.
+   Operator observation, 2026-07-27: allow picking a file up front for those
+   who have one, but by default the app should just make one. Nothing in the
+   file needs a human: `SHARE_PASS` is a machine-to-machine credential — the
+   app already delivers it to the guest over `docker exec` stdin (D41) and
+   `icloud-bridge-configure` reads it from the file, so the operator never
+   types or sees the value, and a generated high-entropy password is strictly
+   better than a hand-chosen one (and removes the placeholder-not-replaced
+   failure mode entirely). `DISK_SIZE`/`RAM_SIZE`/`CPU_CORES` can default from
+   the machine (and become editable fields on the Setup tab). Sketch: a
+   "Create configuration" default action writes a 0600 file at a fixed XDG
+   location (e.g. `~/.config/icloud-bridge/env`), which also retires the
+   ask-again-on-resume dance, since a conventional location can be found
+   rather than remembered; "Use an existing .env…" remains for the manual
+   SETUP.md flow. Needs a decision: D41's "never persists" language and
+   `firstrun`'s no-env-path-persistence rule were written for the
+   operator-owned-file world and must be amended deliberately — the GUI would
+   now write the secret exactly once, at creation, and still never log,
+   display, or re-read it outside the existing D41 channel.
+
 ## Constraints
 
 - Items 1-2 first: they are the operator-facing circle-breakers, and item 2's
