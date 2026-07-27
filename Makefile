@@ -43,7 +43,7 @@ PWSH_DIR     := build/pwsh
 PWSH         := $(PWSH_DIR)/pwsh
 
 .PHONY: help version venv venv-qt hooks test test-qt test-all lint lint-ps test-ps check \
-        deb install uninstall purge configure install-gui run deps acceptance \
+        deb install reinstall uninstall purge configure install-gui run deps acceptance \
         vm-up vm-down vm-ps vm-logs clean distclean
 
 # ------------------------------------------------------------------- meta ----
@@ -164,6 +164,12 @@ deb: ## Build dist/icloud-bridge_<version>_all.deb
 
 install: $(DEB) ## HOST: install the built .deb (then run 'make configure')
 	sudo apt install -y ./$(DEB)
+
+# The version string is a build stamp, not a release counter (pre-release), so
+# a rebuilt .deb usually carries the same version and `apt install` refuses it
+# with "already the newest version". This is the refresh path.
+reinstall: $(DEB) ## HOST: reinstall the built .deb even when the version is unchanged
+	sudo apt reinstall -y ./$(DEB)
 
 $(DEB):
 	$(MAKE) deb
