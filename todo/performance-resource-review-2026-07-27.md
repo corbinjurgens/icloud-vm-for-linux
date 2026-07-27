@@ -1,11 +1,12 @@
 # Todo: Performance and resource review, 2026-07-27
 
-> **Status: the checkout-executable findings have shipped; the rest need the
-> operator and a provisioned guest.** The review itself changed no VM, guest,
-> host, or application setting. The live VM was intentionally powered off through
-> the bridge lifecycle while the read-only measurements were in progress, so it
-> was left off and no later live test was attempted. `CHANGELOG.md` is the
-> durable ledger and now carries every item below.
+> **Status as this review closed (2026-07-27, morning): the checkout-executable
+> findings have shipped; the rest need the operator and a provisioned guest.**
+> The review itself changed no VM, guest, host, or application setting. The live
+> VM was intentionally powered off through the bridge lifecycle while the
+> read-only measurements were in progress, so it was left off and no later live
+> test was attempted that day. `CHANGELOG.md` is the durable ledger and now
+> carries every item below.
 >
 > - **Shipped** (see "A second read-only review" under 2026-07-27 in
 >   `CHANGELOG.md`): **P1**, the
@@ -21,6 +22,19 @@
 >   `I-001`, which now carries its four acceptance conditions), F2's actual runs
 >   and F3's PowerShell 5.1 proof (`I-010`, `I-009`), and F4's `halt_poll_ns`
 >   A/B (`DFR-003`).
+>
+> **Update, 2026-07-27, later the same day: the premise has expired.** The guest
+> was provisioned through the app-driven path, and the agent — build 7 after
+> that day's fix chain — now publishes `status.json` and completes scans of the
+> real library: a first full pass of **60,154 entries ending `lastError: none`
+> in 29 s**. See the 2026-07-27 shipped entries in `CHANGELOG.md` (the
+> long-paths entry, `agentBuild` 5 → 6, carries those figures; the
+> liveness-probe entry, 6 → 7, is the last build change), and `I-012` for the
+> same app-driven run's inspection timings.
+>
+> Nothing below is written against an unprovisioned guest any more: the
+> F-items now have obtainable numerators, and what separates them from done is
+> running the measurements and recording them, not waiting for the guest.
 
 ## Goal
 
@@ -28,12 +42,16 @@ Follow up the 2026-07-26/27 live-host findings, find remaining work that can
 materially improve performance or reduce recurring CPU, memory, network, or disk
 use, and avoid reopening already-settled unsafe tuning ideas.
 
-The main conclusion is unchanged: **do not optimize around an unprovisioned
-guest**. The current VM has never run `03-create-share.ps1` or
-`04-bridge-agent.ps1`, so it cannot produce the kernel-CIFS E0 result, a real
-agent scan duration, exclusion costs, or a representative GUI tree. Those
-measurements have much more value than another speculative QEMU or Windows
-debloat setting.
+The main conclusion when this was written was **do not optimize around an
+unprovisioned guest**: the VM had never run `03-create-share.ps1` or
+`04-bridge-agent.ps1`, so it could not produce the kernel-CIFS E0 result, a real
+agent scan duration, exclusion costs, or a representative GUI tree.
+
+**That premise expired later on 2026-07-27**, when the app-driven provisioning
+ran and the agent began scanning the real library. What survives is the reason
+behind it, now as an instruction rather than a blocker: those measurements have
+much more value than another speculative QEMU or Windows debloat setting, and
+they are finally takeable.
 
 ## Live snapshot
 
@@ -67,35 +85,53 @@ Upstream references checked during this pass:
 
 **Priority: highest; operator and guest desktop required.**
 
+**Status, 2026-07-27 (later the same day): substantively achieved — the guest is
+provisioned and scanning.** It went through the app-driven path rather than the
+manual sequence below, and the agent (build 7) completed a first full pass of
+the real library: 60,154 entries, `lastError: none`, 29 s. What remains open is
+not the provisioning but the recorded confirmations listed below — a second
+completed scan, the identity of the mounted data share, and the GUI check. The
+sequence below stands as the manual route and as the record of what those
+conditions were.
+
 Run the existing first-run sequence rather than a special performance setup:
 
 1. Run `C:\OEM\03-create-share.ps1` elevated with the intended share password.
-2. Run `C:\OEM\04-bridge-agent.ps1` elevated. This installs agent build 3.
+2. Run `C:\OEM\04-bridge-agent.ps1` elevated. This installs the agent build this
+   checkout carries.
 3. Complete/reconcile the host setup and mounts through the documented D29–D31
    path.
-4. Confirm the GUI sees protocol 1 / agent build 3 and no update banner.
+4. Confirm the GUI sees protocol 1 / that agent build and no update banner.
 
 Do not record a performance result until all of the following are true:
 
-- `status.json` advances every 15 seconds with `agentBuild: 3`;
+- `status.json` advances every 15 seconds with the checkout's `agentBuild`
+  — **done**, at build 7;
 - `scan.lastCompletedAt` becomes non-null, `scan.entries` is plausible for the
-  real library, and `lastError` does not report `tree`, `scan`, or ACL failure;
-- a second ten-minute scan completes, proving the result was not only startup
-  luck;
+  real library, and `lastError` does not report `tree`, `scan`, or ACL failure
+  — **done**, at 60,154 entries with `lastError: none`;
+- a *second* full scan completes, proving the result was not only startup luck
+  — **still open**. The ten-minute pass this note originally assumed was wrong
+  by more than an order of magnitude: the real first pass took 29 s, so a second
+  one costs nothing to obtain;
 - the mounted data share is the production `icloud` share, not the historical
-  `icloudtest` test share.
+  `icloudtest` test share — **still open as a recorded confirmation**;
+- the GUI shows protocol 1 with no update banner — **still open as a recorded
+  confirmation**.
 
-This directly follows up the most important prior discovery: until this is done,
-neither the old agent nor either agent optimization has run against the real
-library.
+This was the most important prior discovery: until it was done, neither the old
+agent nor either agent optimization had ever run against the real library. The
+2026-07-27 provisioning closed that gap, and the long-path ACL failure it
+immediately exposed is what a synthetic library would never have shown.
 
 ### F2 — Attribute the Windows idle CPU before changing Windows
 
 **Priority: highest after F1; operator must watch the guest desktop.**
 
 The 60-second sample again put 73.7% of QEMU CPU time in guest mode. Repository
-code cannot name the Windows process behind it. Add a read-only
-`tools/profile-windows-idle.ps1` rather than typing a long ad-hoc command:
+code cannot name the Windows process behind it. The sampler this section asked
+for, `tools/profile-windows-idle.ps1`, shipped on 2026-07-27 and **has still
+never run**; it is read-only rather than a long ad-hoc command, and it must:
 
 - take process CPU, working-set, private-byte, read-byte, and write-byte
   snapshots around a 300-second idle interval;
@@ -127,6 +163,14 @@ or explicitly accepted.
 ### F3 — Close the remaining I-009 guest proof
 
 **Priority: alongside F2.**
+
+**Status, 2026-07-27 (later the same day): partially satisfied.** A real-library
+pass has completed under the guest's Windows PowerShell 5.1 — the host the agent
+actually runs on — at 60,154 entries in 29 s with `lastError: none`. Still open,
+exactly as `I-009` records it: the `Join-Path`-versus-concatenation comparison
+on the guest, `tools/test-agent-walk.ps1` under PowerShell 5.1, and first/second
+scan durations written down as formal results rather than read out of a
+changelog entry.
 
 On Windows PowerShell 5.1:
 
@@ -241,7 +285,8 @@ snapshot would add invalidation/protocol semantics and is not justified yet.
 - mixed files/directories, zero/one entry, case ties, Unicode, and pages at
   999/1000/1001 boundaries;
 - synthetic 100,000-file allocation/time comparison under PowerShell 7, then a
-  Windows PowerShell 5.1 measurement when F1 is available.
+  Windows PowerShell 5.1 measurement on the guest — obtainable since the
+  2026-07-27 provisioning, so this no longer waits on F1.
 
 **Completion gate:** unchanged responses and a demonstrated large-folder
 allocation or latency reduction.
@@ -265,7 +310,9 @@ and path-segment boundaries are security-significant. Keep exact-case strings
 only for display; matching remains case-insensitive.
 
 Do not build this before measuring realistic exclusion counts. A user with ten
-folder roots will not notice it.
+folder roots will not notice it. Since the 2026-07-27 provisioning, that count
+can be read from the operator's live `exclusions.json` and a real scan instead
+of assumed: measuring is now the cheap step rather than the blocked one.
 
 **Verification:**
 
@@ -317,6 +364,12 @@ The earlier review already identified both:
    for `tree.json`.
 
 Do not implement either before F1 supplies scan duration and exclusion sizes.
+F1 has since supplied the first half: a 2026-07-27 full pass of 60,154 entries
+in **29 s**, which is a small budget to optimize and argues for measuring the
+exclusion-walk share before amending a locked row for it. The exclusion sizes
+are still missing, and both items remain worth nothing on a guest with no
+exclusions configured.
+
 For (1), amend D34 and retain the exact `$ConfigValid` gate; evaluate the skip
 before the resume-cursor comparison. For (2), resolve the ordering/staleness
 problem first: enforcement currently precedes the tree pass, so consuming the
@@ -345,14 +398,20 @@ duration reduction.
 
 ## Recommended order
 
-1. F1: provision scripts 03/04 and obtain two completed real tree passes.
+The order below is unchanged; what changed on 2026-07-27 is that step 1 is
+mostly behind us, so steps 2 onward are unblocked rather than queued.
+
+1. F1: provisioning is done (app-driven, 2026-07-27) and one real tree pass has
+   completed. Obtain the second, and record the share-identity and GUI checks.
 2. Run E0 and record the actual kernel-CIFS data-path baseline.
-3. F2/F3: attribute Windows idle CPU and prove the agent rewrite on Windows
-   PowerShell 5.1.
+3. F2/F3: attribute Windows idle CPU and finish the PowerShell 5.1 proof of the
+   agent rewrite.
 4. P1: add the content-preview hydration warning.
 5. F4 and P5: controlled host A/B tests, one variable at a time.
 6. Use real scan/list/exclusion counts to decide P2–P6. P2 is safe regardless
-   but intentionally low value; P3/P4/P6 need a numerator.
+   but intentionally low value; P3/P4/P6 need a numerator, and the guest can now
+   produce one — which is a reason to go and measure, not a licence to skip the
+   measurement.
 
 ## What this workspace could and could not verify
 
@@ -361,7 +420,13 @@ vhost state, cgroup CPU/memory/I/O, sparse allocation, host KVM/THP/KSM state,
 hybrid CPU topology and migration counts, helper-process idle CPU, and the
 graceful final shutdown state.
 
-Not verified: Windows process attribution, Windows PowerShell 5.1 execution,
-agent build 3 against the real library, production CIFS mounts, E0 throughput,
-exclusion costs, tree/list GUI scale, `halt_poll_ns=0`, or affinity variants.
-The guest was not restarted after the powered-off marker appeared.
+Not verified during this pass: Windows process attribution, Windows PowerShell
+5.1 execution, the agent against the real library, production CIFS mounts, E0
+throughput, exclusion costs, tree/list GUI scale, `halt_poll_ns=0`, or affinity
+variants. The guest was not restarted after the powered-off marker appeared.
+
+**Superseded later on 2026-07-27:** the guest was restarted and provisioned
+through the app-driven path, and the agent (build 7) ran against the real
+library, so the agent, the real library and Windows PowerShell 5.1 execution are
+no longer unknowns. The remaining items on that list stand until the operator
+runs them.
