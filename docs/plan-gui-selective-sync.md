@@ -865,8 +865,14 @@ list from a fresh inspection (D44). An inspect-only action is deliberately not
 offered: every confirmed run publishes its inspection before and during repair,
 and ordinary bridge monitoring is already the cheap continuous health probe.
 
-`status.json` is written by the guest orchestrator with the same atomic
-temp-then-rename pattern §4 step 6 uses in the guest:
+`status.json` is written by the guest orchestrator with the same
+temp-then-rename pattern §4 step 6 uses in the guest, with one UNC
+accommodation: .NET Framework's `File.Replace` rejects UNC paths outright, so
+on `\\host.lan\Data` an existing status file is deleted and the temp file
+renamed into place. The host already treats a momentarily missing or unreadable
+status as "not readable yet" rather than an error, so the sub-second non-atomic
+window is harmless; local-path writers (the agent, script 04) keep the fully
+atomic `Replace`:
 
 ```json
 {"version": 1, "runId": "<echoed>", "phase": "<see list>",

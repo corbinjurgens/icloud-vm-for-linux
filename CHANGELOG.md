@@ -245,6 +245,26 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-27 — The guest status writer no longer dies on its second write
+
+The first live provisioning run acknowledged, wrote one status, and then went
+silent forever. Root cause: `Write-JsonAtomic` in `guest-setup.ps1` and
+`watcher.ps1` uses `[IO.File]::Replace`, and .NET Framework's `File.Replace`
+rejects UNC paths ("The path is not of a legal form") — and the status file
+lives on `\\host.lan\Data`. The very first write ever succeeded because the
+file did not exist yet (the `Move` branch); every subsequent write, including
+`Stop-WithError`'s attempt to publish the failure, threw. The run was not
+stalled; it was crashing every time it tried to report progress, invisibly.
+
+The two UNC writers now delete-then-rename when the destination is a UNC path,
+keeping the same-directory temp file. The host reads a momentarily missing
+status as "not readable yet", never as an error, so the sub-second non-atomic
+window is harmless; the agent's and script 04's copies write local NTFS paths
+only and keep the fully atomic `Replace`. §4.1 of the v2 plan records the
+accommodation. Diagnosed end-to-end from the host via `tools/guest-ctl.sh`
+keystroke injection with output captured over `\\host.lan\Data` — the loop the
+tool was built for.
+
 ### 2026-07-27 — Guest scripts are pure ASCII; PS 5.1 was parsing them as ANSI
 
 The first live OEM install failed to register the provisioning watcher, and the
