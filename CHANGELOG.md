@@ -267,6 +267,90 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-28 — Two silent iCloudHome crashes, and the forensics that were not there
+
+Two modal `iCloudHome.exe - System Error ... overrun of a stack-based buffer`
+boxes appeared on the guest desktop at 10:19:44 and 10:20:39 UTC on 2026-07-27.
+Nothing recorded them beyond the boxes themselves: they exist only as System-log
+Application Popup Id 26 events (records 1021 and 1023). Both dying instances
+were toast/COM notification activations — command-line suffix
+`----AppNotificationActivated: -Embedding`, AppModel-Runtime launch events Id
+211, PIDs 3360 and 1064 — and each died 40-60 ms after writing its startup
+banner, which is why each popup is paired with a DCOM 10010 timeout for CLSID
+`{71E3DFFE-A4AD-4A16-A15B-7C85A2111AD8}`: a package-registered activator that
+died before it could register. The long-lived client (PID 5056, started
+09:22:58) survived, as did `iCloudDrive`, `iCloudCKKS` and `ApplePhotoStreams`,
+and nothing recurred in the following half hour. App version 15.9.60.0, its
+dependencies (VCLibs, WindowsAppRuntime.1.8) all `Status Ok`, and WebView2
+Evergreen 150.0.4078.99 with its six processes ran undisturbed through both
+crashes.
+
+**Every forensic trace was missing, and this repository is what turned them
+off.** `01-debloat.ps1` listed `WerSvc` among the services it disabled, and the
+live system key also carried `Disabled=1`, so the crashes produced no
+Application Event 1000, nothing in `ReportArchive` or `ReportQueue`, and no
+dump — while the kernel hard-error path still parked a modal box on a desktop
+nobody is watching. Apple's own per-launch logs stop at the banner. That is the
+wrong trade for an unattended appliance: it suppressed no UI that mattered and
+cost the only evidence.
+
+**The best-supported cause is an aftershock of the clock correction, and it can
+no longer be proven.** The 09:21 reboot moved the guest clock backwards by
+roughly six and a half to seven hours — the first-boot RTC/Pacific-TZ skew from
+the earlier *a guest clock seven hours out* entry, whose `RealTimeIsUniversal`
+fix only takes effect at the following boot. iCloudHome logged
+`TrayWnd::ThreadRegisterDevice: Last registration time from bag is in the
+future!` twice at 09:23:01, the notification platform database
+(`wpndatabase.db-wal`) was last written at crash time, and the deaths were on
+the notification-activation path. Meanwhile `w32tm /query /status` answered
+*The service has not been started* (0x80070426): debloat's in-session resync
+nudge had been failing silently against a stopped `W32Time`, so the session
+stayed skewed until Windows re-read the RTC. External research found no public
+report of iCloudHome failing this way and no fix to copy — 0xC0000409 is
+`__fastfail`, a deliberate abort rather than an actual buffer overrun, and the
+closest documented classes (WinAppSDK bootstrapper/deployment failures, the
+KB5072911 first-logon XAML registration race) are fresh-image phenomena. The
+hypothesis is unfalsifiable in retrospect precisely because crash recording was
+off, which is the part worth acting on.
+
+What changed:
+
+- **Crashes are now recorded silently instead of not at all** (`edd4412`).
+  `WerSvc` returns to `Manual` — it is trigger-started, so it costs no resident
+  RAM in the 3 GB guest — the live key is forced to `Disabled=0` with
+  `DontShowUI=1`, and per-app `LocalDumps` keys for `iCloudHome.exe`,
+  `iCloudDrive.exe`, `iCloudCKKS.exe` and `ApplePhotoStreams.exe` request a
+  minidump (`DumpType=1`, `DumpCount=3`) into the crashing user's default
+  `%LOCALAPPDATA%\CrashDumps`. There is no global `LocalDumps` key and no
+  `DumpFolder`, and the `QueueReporting` task stays disabled, so capture is
+  purely local and nothing is uploaded.
+- **The time service is started before it is asked to resync** (`fe30377`).
+  The RTC block sets `W32Time` to `Automatic` and starts it before
+  `w32tm /resync /force`, and surfaces a nonzero exit as a warning carrying
+  w32tm's own reason instead of discarding it.
+- **A client that dies before sign-in is relaunched** (`dfa492f`).
+  `guest-setup.ps1` waits up to two minutes for the MSIX registration to settle
+  before the first activation, and during the unbounded sign-in wait relaunches
+  a vanished client at most once per five minutes (`Start-IcloudClient`,
+  `Test-IcloudClientRunning`). Recorded in the v2 plan §4.1 and in the v1
+  runbook row *New files on host not uploading*.
+
+**Applied to the running guest**, which was provisioned long before any of this
+existed, by an elevated one-shot script staged over the bridge share. The
+policy-override check found no
+`HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Error Reporting` key at all,
+so nothing outranks the live setting and nothing had to be removed. Afterwards:
+`WerSvc` `Stopped`/`Manual` (correct for a trigger-started service), `W32Time`
+`Running`/`Automatic`, `w32tm /resync /force` exiting 0 with `Source:
+time.windows.com,0x9` and a real `Last Successful Sync Time` in place of the old
+0x80070426, the WER root reading `Disabled=0` `DontShowUI=1`, and all four
+`LocalDumps` keys reading `DumpType=1` `DumpCount=3`. The guest's UTC now agrees
+with the host's to within a second.
+
+What is still unproven: dump capture is configured but has never fired, since no
+crash has been induced and the next real one is its first test; and the settle
+probe and relaunch loop only execute during a future provisioning run.
+
 ### 2026-07-27 — A large exclusion can finally reach `applied` (`agentBuild` 7 → 8)
 
 Two independent reasons a real exclusion could sit at `pending-dehydrate`
