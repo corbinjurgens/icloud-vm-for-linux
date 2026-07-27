@@ -159,6 +159,21 @@ Numbering is stable; completed items are removed without renumbering.
    incidents, and notifications are explicitly disabled through provisioning,
    which is exactly when the operator has tabbed away to wait.
 
+9. **The app needs a positive signal that the watcher exists.**
+   Observed live 2026-07-27 (fresh OEM guest whose `install.bat` ran to
+   completion): a staged run sat unacknowledged 3+ minutes with the elapsed
+   clock ticking, and the host had no way to distinguish "the guest is busy"
+   from "nobody is listening" — the only signal is the 90-second timeout
+   heuristic behind the bootstrap hint. The watcher could write a small
+   beacon (task name, agent build, registered-at) to the Data outbox at
+   `-Install` time and refresh it at task start; the app could then say
+   *before* staging whether a watcher is present and, when absent, lead with
+   the one-liner instead of a counter and a delayed hint. Needs the §4.1
+   protocol table updated in the same commit. Check
+   `C:\OEM\watcher-install.log` on the live guest first: if OEM registration
+   failed there, that failure is the primary bug and this item is its
+   detection.
+
 ## Constraints
 
 - Items 1-2 first: they are the operator-facing circle-breakers, and item 2's
