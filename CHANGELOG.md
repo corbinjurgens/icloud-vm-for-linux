@@ -288,7 +288,7 @@ forever, both fixed in `ddcb273` and both recorded as D46 in the v2 plan.
   stores inside the MFT record, which no dehydration can release — so the agent
   re-requested an impossible dehydration forever and held the exclusion (and the
   D23 tray) yellow with it. Such files are now reported rather than blocking:
-  `localAllocatedBytes` carries their bytes and the detail names them. The
+  `localAllocatedBytes` carries their bytes and the detail counts them. The
   tolerance is bounded to one NTFS cluster per file, and a modified,
   not-in-sync, non-placeholder or uninspectable file still blocks `applied`
   whatever its size — its only good copy may be the local one (D20/D22).
