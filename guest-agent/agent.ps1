@@ -76,7 +76,7 @@ $ShareUser = "syncshare"
 # behavior, so a GUI shipped alongside a newer agent can say so. The GUI carries
 # the same number in bridge.py and a test compares the two literals.
 $ProtocolVersion = 1
-$AgentBuild      = 8
+$AgentBuild      = 9
 
 # Cloud Files / FILE_ATTRIBUTE values.
 # DIRECTORY and UNPINNED are listed for reference and are deliberately unused:
@@ -84,6 +84,8 @@ $AgentBuild      = 8
 # *intent*, not proof that content is gone -- the iCloud placeholders measured
 # in v2 plan section 0.5 carried RECALL without UNPINNED. Completion is decided
 # by CfGetPlaceholderInfo.OnDiskDataSize, and pin state by its PinState field.
+$ATTR_HIDDEN    = 0x00000002
+$ATTR_SYSTEM    = 0x00000004
 $ATTR_DIRECTORY = 0x00000010
 $ATTR_REPARSE   = 0x00000400
 $ATTR_PINNED    = 0x00080000   # FILE_ATTRIBUTE_PINNED
@@ -1044,7 +1046,9 @@ function Add-VerifyCandidate {
     param([hashtable]$Acc, [string]$Rel, [string]$Full, [uint32]$Attributes, [Int64]$Length)
     if ($null -eq $Acc.candidates -or $Length -le 0) { return }
     if ((($Attributes -band $ATTR_RECALL) -ne 0) -or $Length -le $ResidualFileMaxBytes) {
-        $Acc.candidates.Add(@{ rel = $Rel; full = $Full; length = $Length })
+        $Acc.candidates.Add(@{ rel = $Rel; full = $Full; length = $Length
+                               name = $Rel.Substring($Rel.LastIndexOf('/') + 1)
+                               attributes = $Attributes })
     }
 }
 
@@ -1387,17 +1391,25 @@ function Invoke-EnforcementPass {
             $info = Get-PlaceholderState $c.full $false
             if ($info.IsPlaceholder) {
                 $stale = ($info.InSyncState -ne $CF_IN_SYNC -or $info.ModifiedDataSize -gt 0)
+                # Windows rewrites a folder's hidden+system desktop.ini at boot,
+                # and the client can leave it "modified" indefinitely afterwards.
+                # It is machine-generated view configuration the shell recreates
+                # on loss, so it may pass the sync gate that guards real files (D47).
+                $bootIni = ($c.name -eq 'desktop.ini') -and
+                           (($c.attributes -band ($ATTR_HIDDEN -bor $ATTR_SYSTEM)) -eq
+                            ($ATTR_HIDDEN -bor $ATTR_SYSTEM))
                 if ($info.OnDiskDataSize -gt 0) {
-                    if (-not $stale -and $c.length -le $ResidualFileMaxBytes) {
+                    if ((-not $stale -or $bootIni) -and $c.length -le $ResidualFileMaxBytes) {
                         # Resident residue: dehydration cannot release it and the
-                        # cloud copy is current, so it is reported, not blocking (D46).
+                        # content is expendable or current, so it is reported, not
+                        # blocking (D46/D47).
                         $ep.residualFiles = [int]$ep.residualFiles + 1
                         $ep.residualBytes = [Int64]$ep.residualBytes + $info.OnDiskDataSize
                     } else {
                         $ep.allocatedBytes = [Int64]$ep.allocatedBytes + $info.OnDiskDataSize
                         if ($stale) { $ep.notInSync = [int]$ep.notInSync + 1 }
                     }
-                } elseif ($stale) {
+                } elseif ($stale -and -not $bootIni) {
                     $ep.notInSync = [int]$ep.notInSync + 1
                 }
             } elseif ($info.Queried) {
