@@ -243,7 +243,8 @@ needs the real host at true idle (I-001).
 
 **Status:** Ready; blocked on live acceptance  
 **Evidence:** The reviewed backlog in
-[`todo/further_improvements.md`](todo/further_improvements.md) has landed, so
+[`todo/archive/further_improvements.md`](todo/archive/further_improvements.md)
+has landed, so
 there is a coherent body of work to name. What is missing is the evidence, not
 the decision — every row in
 [`docs/acceptance-results.md`](docs/acceptance-results.md) is still
@@ -989,7 +990,8 @@ timing-sensitive.
 ### 2026-07-26 — Reviewed follow-up work: skew, backup, diagnostics, progress
 
 The reviewed backlog recorded in
-[`todo/further_improvements.md`](todo/further_improvements.md) landed as the
+[`todo/archive/further_improvements.md`](todo/archive/further_improvements.md)
+landed as the
 commits below. None of it is tagged; see I-007 for why it carries no release
 number of its own.
 
