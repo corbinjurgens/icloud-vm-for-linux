@@ -191,6 +191,32 @@ Numbering is stable; completed items are removed without renumbering.
    a real RDP client gives working clipboard and the operator's own
    keyboard layout.
 
+   Status 2026-07-27, later the same day — partially addressed, still open.
+   The *negative* half now exists for one failure class: `d1c7e2a` makes a
+   watcher that fails run acceptance publish an error status for that run, so
+   the app shows the guest's reason instead of polling forever. Acceptance is
+   the one step that cannot mark itself consumed when it fails, and the state
+   it left behind was exactly the one this item names — indistinguishable
+   from a guest with no watcher at all. `CHANGELOG.md`'s I-012 records the
+   sibling of the same silence problem from the other side: a healthy long
+   inspection scan writes no heartbeat, so §4.1's 120 s rule can call a
+   working run stalled. The alive-but-superseded-watcher half is closed by
+   `7739bb7` (amending D42): the watcher exits when its installed copy
+   changes, a one-minute keep-alive repetition starts the new one, and
+   `-Install` stops a running instance first, so the command the app offers
+   is a real reinstall rather than a silent no-op.
+
+   What keeps this item live is the *positive* half, which none of that
+   touches: nothing tells the app whether a watcher exists **before** a run
+   is staged. It still learns "nobody is listening" only by staging,
+   counting, and timing out. The beacon described above — task name, agent
+   build, registered-at, written at `-Install` time and refreshed at task
+   start — is not implemented. Neither is this item's hint wording: at HEAD
+   `GUEST_BOOTSTRAP_COMMAND` (`__main__.py`) still leads with the UNC form
+   `\\host.lan\Provision\watcher.ps1`; `7739bb7` reworded only the note
+   beside it, for the reinstall case. The typeable `C:/OEM` one-liner and the
+   RDP mention remain to do. This item is now those two things.
+
 10. **Evaluate a host->guest execution channel (QEMU guest agent) as a
     deliberate decision — or reject it in the register.** Operator question,
     2026-07-27, from living through item 9's failure mode: "can the app not
@@ -213,6 +239,27 @@ Numbering is stable; completed items are removed without renumbering.
     OEM registration, loud immediate detection, one-liner led with) may be
     the better spend; decide once the `watcher-install.log` from the live
     failure is known.
+
+    Status 2026-07-27, later the same day — the wait condition is met and
+    this item is ready to be decided. The `watcher-install.log` was never
+    needed: the root cause surfaced the same day from the host side alone.
+    UTF-8 em dashes read as CP1252 by PowerShell 5.1 broke `watcher.ps1`
+    outright (`446f376`, fixed and now guarded mechanically by the hygiene
+    checker), and the stuck run that followed it was diagnosed from the
+    guest's own outbox and task state (`d1c7e2a`, `7739bb7`). No host->guest
+    execution channel was required to find either failure or to ship either
+    fix — which is direct evidence for this item's own ROI argument against
+    adding one, since the pull-only surface that already exists carried the
+    whole diagnosis.
+
+    The item stays open because the accept-or-reject call is not this note's
+    to make. A todo cannot settle a decision (see this note's header, and
+    `CONTRIBUTING.md`'s "plans own decisions"): accepting the channel means a
+    new register row in `docs/plan-gui-selective-sync.md`, rejecting it means
+    a **Closed** entry in `CHANGELOG.md` recording the cost and the widened
+    host privilege over a guest holding a live Apple session. Either way the
+    operator records it. Until that entry exists the question is open, not
+    answered.
 
 ## Constraints
 
