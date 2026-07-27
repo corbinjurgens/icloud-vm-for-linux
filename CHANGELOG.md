@@ -245,6 +245,33 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-27 — The guest agent imported a DLL that does not exist (`agentBuild` 3 → 4)
+
+With the bridge finally built on the live guest, the agent task registered,
+started, and exited with code 1 before writing a single byte of status — so
+`04-bridge-agent.ps1` failed its runtime verification with "the task did not
+reach Running". Running the agent by hand named the cause exactly: `Unable to
+load DLL 'cfapi.dll': The specified module could not be found`
+(`0x8007007E`), thrown from the first `CfGetPlaceholderInfo` call.
+
+The module name was simply wrong. `cfapi.h` is the header and CfApi is the
+API's name, but the binary Windows ships in `System32` is **`CldApi.dll`** —
+the guest has `cldapi.dll` and no `cfapi.dll` at all, and `CldApi.dll` is what
+exports `CfGetPlaceholderInfo`. .NET resolves a `DllImport` module at the first
+call rather than at load, so this was not a startup or lint failure anywhere: it
+was a guaranteed crash on the agent's first placeholder probe, on every Windows
+guest, for as long as the native enumerator has existed. `make lint-ps` cannot
+see it (PowerShell 7 on Linux never resolves the import) and no host-side test
+can either.
+
+`guest-agent/agent.ps1` now imports `cldapi.dll`, `provision/agent.ps1` carries
+the byte-identical copy, and `$AgentBuild`/`bridge.py`'s `AGENT_BUILD` move to
+`4` per D35. Verified live: the fixed agent was deployed into the running guest,
+`04-bridge-agent.ps1 -Scope Agent` reported `task icloud-bridge-agent (Running,
+restarts on failure)`, and the host now mounts both shares with
+`/mnt/icloud_bridge/status.json` reporting `agentBuild 4`, `icloudClientRunning
+true` and `lastError null`.
+
 ### 2026-07-27 — A first run now builds the bridge, instead of dispatching an agent-only repair
 
 With the status writer fixed, the first complete live run got all the way to

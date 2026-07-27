@@ -76,7 +76,7 @@ $ShareUser = "syncshare"
 # behavior, so a GUI shipped alongside a newer agent can say so. The GUI carries
 # the same number in bridge.py and a test compares the two literals.
 $ProtocolVersion = 1
-$AgentBuild      = 3
+$AgentBuild      = 4
 
 # Cloud Files / FILE_ATTRIBUTE values.
 # DIRECTORY and UNPINNED are listed for reference and are deliberately unused:
@@ -198,7 +198,12 @@ public static class IcloudBridgeNative {
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern uint GetCompressedFileSizeW(string lpFileName, out uint lpFileSizeHigh);
 
-    [DllImport("cfapi.dll", CharSet = CharSet.Unicode)]
+    // cldapi.dll, not cfapi.dll: cfapi.h is the header and CfApi the API's name,
+    // but the binary Windows ships in System32 is CldApi.dll (CldApi.lib is the
+    // import library the documentation names). A wrong module name is not a
+    // link error here - .NET resolves it at the first call, so the whole agent
+    // died on its first placeholder probe with ERROR_MOD_NOT_FOUND.
+    [DllImport("cldapi.dll", CharSet = CharSet.Unicode)]
     static extern int CfGetPlaceholderInfo(IntPtr FileHandle, int InfoClass, IntPtr InfoBuffer,
         uint InfoBufferLength, out uint ReturnedLength);
 
