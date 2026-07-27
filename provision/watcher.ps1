@@ -348,7 +348,22 @@ function Invoke-TriggerPass {
 
     # Record acceptance BEFORE executing: a crash mid-run must not re-execute the
     # same run at the next logon.
-    Set-AcceptedToken $token
+    #
+    # A failure here is the one case that cannot be marked consumed, because the
+    # marker is what failed - so it must at least reach the host. Without this,
+    # the pass throws into the loop's catch, the trigger is still unconsumed 30 s
+    # later, and the watcher re-accepts and re-stages the same run forever while
+    # the app polls a run ID that no status ever mentions. That is
+    # indistinguishable from a guest with no watcher at all, which is the one
+    # thing the app cannot diagnose for the operator. Seen live, when a watcher
+    # still running the pre-fix File.Replace code could not rewrite an existing
+    # accepted-run.txt.
+    try { Set-AcceptedToken $token }
+    catch {
+        Write-WatcherError -RunId $runId -Message "could not record run acceptance: $($_.Exception.Message)"
+        Write-Warning "could not record run acceptance: $($_.Exception.Message)"
+        return
+    }
 
     $setup = Join-Path $runDir 'guest-setup.ps1'
     $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $setup, '-RunId', $runId)

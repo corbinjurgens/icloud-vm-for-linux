@@ -245,6 +245,32 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-27 — A watcher that cannot record acceptance now says so
+
+The first app-driven provisioning run staged, and then nothing: the app polled a
+run the guest never mentioned. The watcher was alive and could see the trigger;
+it had accepted the run, created `runs/<id>`, copied the payload and refreshed
+its own installed copy — and then `Set-AcceptedToken` threw, because the
+*running* watcher process still held the pre-fix `File.Replace` code from before
+its restart, and `accepted-run.txt` already existed. The exception unwound into
+the poll loop's catch, which only warns, so 30 s later the trigger was still
+unconsumed and the whole sequence repeated indefinitely.
+
+The `$null` cause is already fixed, but the failure mode it exposed is not
+specific to it: acceptance is the one step that cannot be "marked consumed" when
+it fails, because the marker is what failed. It now publishes a watcher error
+status for the run before returning, so the app shows the guest's reason instead
+of polling forever — the state that is otherwise indistinguishable from a guest
+with no watcher at all, which is precisely what the app cannot diagnose on its
+own.
+
+**Known gap, deliberately not improvised here:** D42 refreshes the installed
+`watcher.ps1` for its *next task start*, so a watcher fix reaches the running
+process only after a logon or an explicit
+`Stop-ScheduledTask`/`Start-ScheduledTask icloud-bridge-provision`. Every
+watcher change therefore needs that step, and a self-restart on detecting a
+changed installed copy would amend D42 rather than implement it.
+
 ### 2026-07-27 — The iCloud liveness probe watched a process that no longer exists (`agentBuild` 6 → 7)
 
 A diagnostic report from the working bridge showed every row green except
