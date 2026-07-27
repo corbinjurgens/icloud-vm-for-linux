@@ -76,7 +76,7 @@ $ShareUser = "syncshare"
 # behavior, so a GUI shipped alongside a newer agent can say so. The GUI carries
 # the same number in bridge.py and a test compares the two literals.
 $ProtocolVersion = 1
-$AgentBuild      = 7
+$AgentBuild      = 8
 
 # Cloud Files / FILE_ATTRIBUTE values.
 # DIRECTORY and UNPINNED are listed for reference and are deliberately unused:
@@ -106,10 +106,18 @@ $MaxRequestsPerTick = 10
 $RequestTtlSeconds = 600
 
 # Internal work bounds so one pass cannot overrun its cadence
-$MaxPlaceholderQueriesPerPass = 5000    # exclusion measurement
+$MaxPlaceholderQueriesPerPass = 5000    # exclusion measurement, per verification episode
 $MaxStage2QueriesPerPass      = 2000    # reclamation stage 2 batch
 $AclReconcileBudgetSeconds    = 120     # full-tree ACL reconciliation slice
 $SweepCooldownSeconds         = 600     # after an episode ends with nothing eligible
+
+# Residue tolerance for content dehydration cannot release (v2 plan D46). NTFS
+# keeps a few hundred bytes of file data resident inside the MFT record, so such
+# a placeholder reports OnDiskDataSize > 0 forever and iCloud never completes the
+# online-only request. One cluster leaves margin over the real resident bound and
+# caps the per-file misreport at that cluster. The tolerance applies only to
+# in-sync, unmodified placeholders; see Invoke-EnforcementPass.
+$ResidualFileMaxBytes = 4096
 
 # Steady-state work elision (v2 plan D34). These only decimate *reporting* work:
 # the deny/parent-guard ACEs are still asserted on every 60 s enforcement pass,
@@ -400,7 +408,8 @@ $script:LastAccessUsable = $false
 $script:TreeDirty        = $true
 $script:EnforcePassNo    = 0
 $script:DehydrateAttempts = @{}     # rel path -> @{ count; lastPass } (in memory only)
-$script:AppliedVerify    = @{}      # rel path -> @{ pass; verifications; logicalBytes } (D34)
+$script:AppliedVerify    = @{}      # rel path -> @{ pass; verifications; logicalBytes; residualFiles; residualBytes } (D34)
+$script:VerifyEpisodes   = @{}      # rel path -> in-flight verification episode (D46, in memory only)
 $script:SweepStage1      = $null    # cached sweep candidates for the active episode (D34)
 $script:SweepStage1Pass  = -999
 $script:SweepStage2      = $null
@@ -984,86 +993,88 @@ function Get-Entries {
 }
 
 function Measure-SubtreeCheap {
-    # Attribute-only recursive measurement. No handles are opened, so this never
-    # hydrates. Used for tree.json, fullyLocalLogicalBytes and applied roots.
-    param([string]$Full, [hashtable]$Acc)
+    # Attribute-only recursive measurement for exclusion verification: stage 1 of
+    # a pending root's episode and the decimated re-verification of an applied
+    # root (D46/D34). No handles are opened, so this never hydrates.
+    # $Rel is only needed by callers collecting candidates (D46); pass '' otherwise.
+    param([string]$Full, [string]$Rel, [hashtable]$Acc)
     $entries = @()
-    try { $entries = Get-Entries $Full } catch { return }
+    # A directory that cannot be enumerated hides whatever it holds, so it is
+    # counted rather than skipped: verification must not call a root applied over
+    # a subtree it never saw (D46).
+    try { $entries = Get-Entries $Full } catch { $Acc.unreadableItems++; return }
     foreach ($e in $entries) {
         $Acc.entries++
+        $child = $Full + '\' + $e.Name
+        $childRel = if ($Rel -eq '') { $e.Name } else { "$Rel/$($e.Name)" }
         if ($e.IsDirectory) {
             if (-not (Test-CloudReparseTag $e.ReparseTag)) { continue }
             $Acc.dirCount++
-            Measure-SubtreeCheap ($Full + '\' + $e.Name) $Acc
+            Measure-SubtreeCheap $child $childRel $Acc
         } else {
             $Acc.fileCount++
             $Acc.logicalBytes += $e.Length
-            if (($e.Attributes -band $ATTR_RECALL) -eq 0) {
-                $Acc.fullyLocalLogicalBytes += $e.Length
-                if ($e.Length -gt 0) { $Acc.nonRecallFiles++ }
+            if (($e.Attributes -band $ATTR_RECALL) -eq 0 -and $e.Length -gt $ResidualFileMaxBytes) {
+                $Acc.localAboveResidual++
+                $Acc.localAboveResidualBytes += $e.Length
             }
+            if ($null -ne $Acc.candidates) { Add-VerifyCandidate $Acc $childRel $child $e.Attributes $e.Length }
         }
     }
 }
 
 function New-CheapAccumulator {
-    return @{ entries = 0; dirCount = 0; fileCount = 0; logicalBytes = [Int64]0
-              fullyLocalLogicalBytes = [Int64]0; nonRecallFiles = 0 }
+    # $Candidates arms the D46 stage-2 list; an applied root's re-verification
+    # does not need it and must not pay for materializing one entry per file.
+    param([bool]$Candidates = $false)
+    $acc = @{ entries = 0; dirCount = 0; fileCount = 0; logicalBytes = [Int64]0
+              localAboveResidual = 0; localAboveResidualBytes = [Int64]0
+              unreadableItems = 0; candidates = $null }
+    if ($Candidates) { $acc.candidates = New-Object System.Collections.Generic.List[object] }
+    return $acc
 }
 
-function Measure-ExclusionAllocation {
-    # Exact local allocation under a pending exclusion. This is one of the three
-    # places allowed to open handles (v2 plan section 3).
-    param([string]$Full, [bool]$IsDirectory, [hashtable]$Acc)
-    if (-not $IsDirectory) {
-        $Acc.fileCount++
-        try { $Acc.logicalBytes += (New-Object System.IO.FileInfo($Full)).Length } catch { }
-        if ($Acc.queries -ge $MaxPlaceholderQueriesPerPass) { $Acc.capped = $true; return }
-        $Acc.queries++
-        $info = Get-PlaceholderState $Full $false
-        if ($info.IsPlaceholder) {
-            $Acc.allocatedBytes += [Math]::Max([Int64]0, $info.OnDiskDataSize)
-            if ($info.OnDiskDataSize -gt 0) { $Acc.localFiles++ }
-            if ($info.InSyncState -ne $CF_IN_SYNC -or $info.ModifiedDataSize -gt 0) { $Acc.notInSync++ }
-        } elseif ($info.Queried) {
-            if ($info.AllocatedSize -gt 0) { $Acc.allocatedBytes += $info.AllocatedSize; $Acc.localFiles++ }
-            $Acc.notPlaceholder++
-        } else {
-            $Acc.unreadable++
-        }
+function Add-VerifyCandidate {
+    # A file worth one placeholder query in verification stage 2: it carries
+    # RECALL (so it may still be partly hydrated) or it is small enough that its
+    # data may be resident and unreleasable (D46). Everything else that holds
+    # content locally is already visible to the attribute walk. Callers check
+    # that a list is armed first, so an applied root's re-verification walk pays
+    # nothing per file for this.
+    param([hashtable]$Acc, [string]$Rel, [string]$Full, [uint32]$Attributes, [Int64]$Length)
+    if ($null -eq $Acc.candidates -or $Length -le 0) { return }
+    if ((($Attributes -band $ATTR_RECALL) -ne 0) -or $Length -le $ResidualFileMaxBytes) {
+        $Acc.candidates.Add(@{ rel = $Rel; full = $Full; length = $Length })
+    }
+}
+
+function Measure-ExclusionCheap {
+    # Stage 1 of exclusion verification (D46): attribute-only and uncapped, over
+    # either kind of exclusion root. Directories recurse; a single file is
+    # measured in place with the same rules.
+    param([string]$Full, [string]$Rel, [bool]$IsDirectory, [hashtable]$Acc)
+    if ($IsDirectory) {
+        Measure-SubtreeCheap $Full $Rel $Acc
         return
     }
-    $entries = @()
-    try { $entries = Get-Entries $Full } catch { $Acc.unreadable++; return }
-    foreach ($e in $entries) {
-        $child = $Full + '\' + $e.Name
-        if ($e.IsDirectory) {
-            if (-not (Test-CloudReparseTag $e.ReparseTag)) { continue }
-            Measure-ExclusionAllocation $child $true $Acc
-        } else {
-            $Acc.fileCount++
-            $Acc.logicalBytes += $e.Length
-            if ($e.Length -eq 0) { continue }
-            if ($Acc.queries -ge $MaxPlaceholderQueriesPerPass) { $Acc.capped = $true; continue }
-            $Acc.queries++
-            $info = Get-PlaceholderState $child $false
-            if ($info.IsPlaceholder) {
-                $Acc.allocatedBytes += [Math]::Max([Int64]0, $info.OnDiskDataSize)
-                if ($info.OnDiskDataSize -gt 0) { $Acc.localFiles++ }
-                if ($info.InSyncState -ne $CF_IN_SYNC -or $info.ModifiedDataSize -gt 0) { $Acc.notInSync++ }
-            } elseif ($info.Queried) {
-                if ($info.AllocatedSize -gt 0) { $Acc.allocatedBytes += $info.AllocatedSize; $Acc.localFiles++ }
-                $Acc.notPlaceholder++
-            } else {
-                $Acc.unreadable++
-            }
-        }
+    $Acc.fileCount = 1
+    try { $Acc.logicalBytes = [Int64](New-Object System.IO.FileInfo($Full)).Length }
+    catch { $Acc.unreadableItems++ }
+    $attrs = 0
+    try { $attrs = [int][IO.File]::GetAttributes($Full) } catch { }
+    if (($attrs -band $ATTR_RECALL) -eq 0 -and $Acc.logicalBytes -gt $ResidualFileMaxBytes) {
+        $Acc.localAboveResidual = 1
+        $Acc.localAboveResidualBytes = [Int64]$Acc.logicalBytes
     }
+    if ($null -ne $Acc.candidates) { Add-VerifyCandidate $Acc $Rel $Full ([uint32]$attrs) ([Int64]$Acc.logicalBytes) }
 }
 
-function New-AllocationAccumulator {
-    return @{ fileCount = 0; logicalBytes = [Int64]0; allocatedBytes = [Int64]0; localFiles = 0
-              notInSync = 0; notPlaceholder = 0; unreadable = 0; queries = 0; capped = $false }
+function Get-ResidueDetail {
+    # Reported by an applied root that still holds resident residue (D46), and
+    # re-reported unchanged while its cheap re-verification is decimated.
+    param([int]$Files, [Int64]$Bytes)
+    if ($Files -le 0) { return '' }
+    return "$Files tiny file(s) ($Bytes bytes) stay local; NTFS keeps files this small inside its file table"
 }
 
 # ============================================================== enforcement ==
@@ -1105,7 +1116,12 @@ function Invoke-EnforcementPass {
 
     # A changed configuration re-arms every decimated re-verification below: a new
     # exclusion elsewhere can move content around an already-applied root (D34).
-    if ($cfg.hash -ne $script:State.wantedHash) { $script:AppliedVerify = @{} }
+    # An in-flight verification episode is measuring a tree that may have just
+    # changed shape underneath it, so it is abandoned for the same reason (D46).
+    if ($cfg.hash -ne $script:State.wantedHash) {
+        $script:AppliedVerify = @{}
+        $script:VerifyEpisodes = @{}
+    }
 
     # Disarm the D34 ACL-reconciliation fast path *before* the first ACL write,
     # not after. The flag licenses the ten-minute pass to skip per-entry DACL
@@ -1262,29 +1278,38 @@ function Invoke-EnforcementPass {
             }
             if (-not $due) {
                 $records.Add([ordered]@{
-                    path = $rel; state = 'applied'; detail = ''
-                    logicalBytes = [Int64]$seen.logicalBytes; localAllocatedBytes = [Int64]0
+                    path = $rel; state = 'applied'
+                    detail = (Get-ResidueDetail ([int]$seen.residualFiles) ([Int64]$seen.residualBytes))
+                    logicalBytes = [Int64]$seen.logicalBytes
+                    localAllocatedBytes = [Int64]$seen.residualBytes
                 })
                 continue
             }
             $acc = New-CheapAccumulator
-            if ($isDir) { Measure-SubtreeCheap $full $acc }
-            else {
-                $acc.fileCount = 1
-                try { $acc.logicalBytes = (New-Object System.IO.FileInfo($full)).Length } catch { }
-                $attrs = 0
-                try { $attrs = [int][IO.File]::GetAttributes($full) } catch { }
-                if (($attrs -band $ATTR_RECALL) -eq 0 -and $acc.logicalBytes -gt 0) { $acc.nonRecallFiles = 1 }
-            }
-            if ($acc.nonRecallFiles -eq 0) {
+            Measure-ExclusionCheap $full $rel $isDir $acc
+            # Residue this root was already applied with cannot be re-measured
+            # without handle opens, so it is carried, not recounted (D46). Files
+            # no larger than one cluster therefore do not read as returning
+            # content either, which is what stops an applied-with-residue root
+            # from oscillating back to pending on every verification.
+            if ($acc.localAboveResidual -eq 0) {
                 $verifications = 1
-                if ($null -ne $seen) { $verifications = [int]$seen.verifications + 1 }
+                $residualFiles = 0
+                $residualBytes = [Int64]0
+                if ($null -ne $seen) {
+                    $verifications = [int]$seen.verifications + 1
+                    $residualFiles = [int]$seen.residualFiles
+                    $residualBytes = [Int64]$seen.residualBytes
+                }
                 $script:AppliedVerify[$rel] = @{ pass = $script:EnforcePassNo
                                                  verifications = $verifications
-                                                 logicalBytes = [Int64]$acc.logicalBytes }
+                                                 logicalBytes = [Int64]$acc.logicalBytes
+                                                 residualFiles = $residualFiles
+                                                 residualBytes = $residualBytes }
                 $records.Add([ordered]@{
-                    path = $rel; state = 'applied'; detail = ''
-                    logicalBytes = [Int64]$acc.logicalBytes; localAllocatedBytes = [Int64]0
+                    path = $rel; state = 'applied'
+                    detail = (Get-ResidueDetail $residualFiles $residualBytes)
+                    logicalBytes = [Int64]$acc.logicalBytes; localAllocatedBytes = $residualBytes
                 })
                 continue
             }
@@ -1313,29 +1338,123 @@ function Invoke-EnforcementPass {
             $script:DehydrateAttempts[$rel] = $attempt
         }
 
-        $acc = New-AllocationAccumulator
-        Measure-ExclusionAllocation $full $isDir $acc
-        if ($acc.allocatedBytes -eq 0 -and -not $acc.capped -and $acc.unreadable -eq 0) {
+        # Verification is an episode that may span passes (D46). Stage 1 is the
+        # uncapped attribute walk above; stage 2 spends at most
+        # $MaxPlaceholderQueriesPerPass handle queries and resumes from a cursor,
+        # so a root with more files than that budget still reaches its end
+        # instead of reporting a capped measurement forever. Only a completed
+        # episode may decide `applied`.
+        $acc = New-CheapAccumulator $true
+        Measure-ExclusionCheap $full $rel $isDir $acc
+        if ($acc.localAboveResidual -gt 0) {
+            # Bulk dehydration is plainly still in flight: report the logical size
+            # of what is still local and spend no queries on it this pass.
+            $script:VerifyEpisodes.Remove($rel)
+            $script:AppliedVerify.Remove($rel)
+            $records.Add([ordered]@{
+                path = $rel; state = 'pending-dehydrate'
+                detail = "online-only requested; $($acc.localAboveResidual) file(s) still hold content locally"
+                logicalBytes = [Int64]$acc.logicalBytes
+                localAllocatedBytes = [Int64]$acc.localAboveResidualBytes
+            })
+            continue
+        }
+
+        # Ordinal-ignore-case, like the sweep's stage-2 cursor: any other ordering
+        # lets a resumed pass skip or repeat candidates.
+        $acc.candidates.Sort([System.Comparison[object]]{
+            param($a, $b)
+            $r = [string]::Compare($a.rel, $b.rel, [StringComparison]::OrdinalIgnoreCase)
+            if ($r -ne 0) { return $r }
+            return [string]::CompareOrdinal($a.rel, $b.rel)
+        })
+        $ep = $script:VerifyEpisodes[$rel]
+        if ($null -eq $ep) {
+            $ep = @{ cursor = $null; allocatedBytes = [Int64]0; residualBytes = [Int64]0
+                     residualFiles = 0; notInSync = 0; notPlaceholder = 0; unreadable = 0; checked = 0 }
+            $script:VerifyEpisodes[$rel] = $ep
+        }
+        $total = $acc.candidates.Count
+        $queries = 0
+        $reachedEnd = $true
+        foreach ($c in $acc.candidates) {
+            if ($null -ne $ep.cursor -and
+                [string]::Compare($c.rel, [string]$ep.cursor, [StringComparison]::OrdinalIgnoreCase) -le 0) { continue }
+            if ($queries -ge $MaxPlaceholderQueriesPerPass) { $reachedEnd = $false; break }
+            $queries++
+            $ep.checked = [int]$ep.checked + 1
+            $ep.cursor = $c.rel
+            $info = Get-PlaceholderState $c.full $false
+            if ($info.IsPlaceholder) {
+                $stale = ($info.InSyncState -ne $CF_IN_SYNC -or $info.ModifiedDataSize -gt 0)
+                if ($info.OnDiskDataSize -gt 0) {
+                    if (-not $stale -and $c.length -le $ResidualFileMaxBytes) {
+                        # Resident residue: dehydration cannot release it and the
+                        # cloud copy is current, so it is reported, not blocking (D46).
+                        $ep.residualFiles = [int]$ep.residualFiles + 1
+                        $ep.residualBytes = [Int64]$ep.residualBytes + $info.OnDiskDataSize
+                    } else {
+                        $ep.allocatedBytes = [Int64]$ep.allocatedBytes + $info.OnDiskDataSize
+                        if ($stale) { $ep.notInSync = [int]$ep.notInSync + 1 }
+                    }
+                } elseif ($stale) {
+                    $ep.notInSync = [int]$ep.notInSync + 1
+                }
+            } elseif ($info.Queried) {
+                # A non-placeholder is never residue, whatever its size: its content
+                # may exist nowhere but this disk, so `applied` would hide the only
+                # copy (D20/D22).
+                $ep.notPlaceholder = [int]$ep.notPlaceholder + 1
+                if ($info.AllocatedSize -gt 0) { $ep.allocatedBytes = [Int64]$ep.allocatedBytes + $info.AllocatedSize }
+            } else {
+                $ep.unreadable = [int]$ep.unreadable + 1
+            }
+        }
+
+        $unreadable = [int]$ep.unreadable + [int]$acc.unreadableItems
+        if (-not $reachedEnd) {
+            $script:AppliedVerify.Remove($rel)
+            $bits = New-Object System.Collections.Generic.List[string]
+            $bits.Add("verifying remaining content: $($ep.checked) of $total file(s) checked")
+            if ($ep.allocatedBytes -gt 0)  { $bits.Add('content is still allocated locally') }
+            if ($ep.notInSync -gt 0)       { $bits.Add("$($ep.notInSync) file(s) modified or not yet in sync") }
+            if ($ep.notPlaceholder -gt 0)  { $bits.Add("$($ep.notPlaceholder) file(s) are not cloud placeholders") }
+            if ($unreadable -gt 0)         { $bits.Add("$unreadable item(s) could not be inspected (open or locked)") }
+            $records.Add([ordered]@{
+                path = $rel; state = 'pending-dehydrate'; detail = ($bits -join '; ')
+                logicalBytes = [Int64]$acc.logicalBytes
+                localAllocatedBytes = [Int64]($ep.allocatedBytes + $ep.residualBytes)
+            })
+            continue
+        }
+
+        # The episode reached the end of its candidate list: decide from its
+        # totals and let the next pass start a fresh one.
+        $script:VerifyEpisodes.Remove($rel)
+        if ($ep.allocatedBytes -eq 0 -and $unreadable -eq 0) {
             $script:DehydrateAttempts.Remove($rel)
             # Seed the D34 re-verification schedule: zero verifications so far, so
             # the next few passes measure this root on every cycle.
             $script:AppliedVerify[$rel] = @{ pass = $script:EnforcePassNo; verifications = 0
-                                             logicalBytes = [Int64]$acc.logicalBytes }
+                                             logicalBytes = [Int64]$acc.logicalBytes
+                                             residualFiles = [int]$ep.residualFiles
+                                             residualBytes = [Int64]$ep.residualBytes }
             $records.Add([ordered]@{
-                path = $rel; state = 'applied'; detail = ''
-                logicalBytes = [Int64]$acc.logicalBytes; localAllocatedBytes = [Int64]0
+                path = $rel; state = 'applied'
+                detail = (Get-ResidueDetail ([int]$ep.residualFiles) ([Int64]$ep.residualBytes))
+                logicalBytes = [Int64]$acc.logicalBytes; localAllocatedBytes = [Int64]$ep.residualBytes
             })
         } else {
             $script:AppliedVerify.Remove($rel)
             $bits = New-Object System.Collections.Generic.List[string]
             $bits.Add('online-only requested; content is still allocated locally')
-            if ($acc.notInSync -gt 0)      { $bits.Add("$($acc.notInSync) file(s) modified or not yet in sync") }
-            if ($acc.notPlaceholder -gt 0) { $bits.Add("$($acc.notPlaceholder) file(s) are not cloud placeholders") }
-            if ($acc.unreadable -gt 0)     { $bits.Add("$($acc.unreadable) item(s) could not be inspected (open or locked)") }
-            if ($acc.capped)               { $bits.Add("measurement capped at $MaxPlaceholderQueriesPerPass files this pass") }
+            if ($ep.notInSync -gt 0)      { $bits.Add("$($ep.notInSync) file(s) modified or not yet in sync") }
+            if ($ep.notPlaceholder -gt 0) { $bits.Add("$($ep.notPlaceholder) file(s) are not cloud placeholders") }
+            if ($unreadable -gt 0)        { $bits.Add("$unreadable item(s) could not be inspected (open or locked)") }
             $records.Add([ordered]@{
                 path = $rel; state = 'pending-dehydrate'; detail = ($bits -join '; ')
-                logicalBytes = [Int64]$acc.logicalBytes; localAllocatedBytes = [Int64]$acc.allocatedBytes
+                logicalBytes = [Int64]$acc.logicalBytes
+                localAllocatedBytes = [Int64]($ep.allocatedBytes + $ep.residualBytes)
             })
         }
     }
@@ -1346,6 +1465,9 @@ function Invoke-EnforcementPass {
     }
     foreach ($stale in @($script:AppliedVerify.Keys)) {
         if ($wanted -notcontains $stale) { $script:AppliedVerify.Remove($stale) }
+    }
+    foreach ($stale in @($script:VerifyEpisodes.Keys)) {
+        if ($wanted -notcontains $stale) { $script:VerifyEpisodes.Remove($stale) }
     }
     $script:State.roots = @($newRoots.ToArray())
     $script:State.guardedParents = @($newGuards)

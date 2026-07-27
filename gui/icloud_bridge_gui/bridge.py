@@ -33,7 +33,7 @@ PROTOCOL_VERSION = 1
 #: any commit that changes `guest-agent/agent.ps1` behavior. `test_bridge`
 #: checks it against the PowerShell literal so the two cannot drift unnoticed.
 #: A date would not do: more than one agent change can land on the same day.
-AGENT_BUILD = 7
+AGENT_BUILD = 8
 
 # Mirrors the agent's own bounds so the two ends agree on what is acceptable.
 MAX_CONFIG_BYTES = 1024 * 1024

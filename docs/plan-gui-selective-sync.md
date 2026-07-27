@@ -232,6 +232,7 @@ Continues the v1 register (D1–D13).
 | D43 | Durable guest-provisioning transactions (amends D39) | The private record of D39 covers both `first-run` and `reprovision` and additionally stores the container id and its Docker `State.StartedAt` token, the guest run ID, the last guest phase, the mode, and the non-secret `resetShareCredential` intent — still **never** the env-file path and never its contents. It is written before the trigger and updated only after a matching status is parsed. A restart with a live matching container and start token plus an active run re-enters D31's no-CIFS `Phase.PROVISIONING` and polls the recorded run ID, asking the operator to reselect the env file if the guest is waiting for a secret (D41). A changed start token together with a missing or stale status offers a confirmed new idempotent run rather than adopting an uncorrelated status; without restart evidence, a missing status keeps polling and requires an explicit **Abandon and start a new run** confirmation. A record still in host `staging` with no acknowledged status retries `ensure_channel()`/`stage()` with the **same** saved run ID, covering a crash before the trigger's atomic rename. First-run success continues into **Check setup and connect**; reprovision success verifies the current bridge protocol and bundled agent build through a fresh gather, clears the record, invalidates caches and returns to monitoring. No status is trusted merely for being the newest file | D39 exists because Windows installs for 20-40 minutes; provisioning adds a second window, in which elevated guest scripts are rewriting the share, its ACLs and the agent task, and the wrong guess mounts CIFS into the middle of that. The run ID is what makes reattachment a match rather than an assumption, and `State.StartedAt` is what separates "the container restarted" from "the watcher is merely quiet" — two conditions whose correct responses are opposite. Keeping the env path out of the record is unchanged from D39, which is precisely why re-selection, not recovery, is the restart path for a pending secret |
 | D44 | Inspect, reconcile, verify | A provisioning run is a desired-state reconciliation, not an unconditional replay of scripts 03 and 04. Before changing any guest configuration the protected orchestrator evaluates the fixed checklist of §4.2 and publishes its observations plus a fixed-enum work plan. `ok` components are skipped; a safely repairable `missing` or `drifted` component invokes only its owning repair scope; a `blocked` or `unknown` observation stops the run before mutation instead of being read as absence. After the selected repairs the orchestrator evaluates the complete checklist again and reports `done` only when every required invariant is `ok` — `shareCredential`, which Windows cannot read back, is the one explicitly `unverifiable` exception. First-run and an explicit **Reset share password** request the credential (D41); ordinary reprovisioning preserves an existing credential unless the account is missing. The app renders the checklist and the proposed/completed work, but the elevated scripts independently re-probe every precondition and never authorize a mutation from guest-writable status JSON | An agent-build update must not reset a working SMB password, rerun share setup, or rewrite unrelated ACLs, while a partly built or hand-modified VM must still converge and say exactly what stopped it — requirements that are only compatible if the run inspects first and repairs by owner. Refusing to guess past `blocked`/`unknown` is the fail-closed rule D22(f) and D35 already apply: an ambiguous guest is diagnosed and contained, never overwritten to make a checklist green. Re-verifying afterwards is what makes `done` a claim about the VM rather than about which scripts exited zero |
 | D45 | Surfacing why a mount never came up | When `on`'s readiness wait expires, `icloud-bridge-power` appends an excerpt of the two `.mount` units' recent journal to its failure message. The excerpt is built by `sanitize_journal_excerpt`, a pure function of one string (like `classify_inspect_output`, and separately tested the same way): an allowlist keeps only lines carrying a mount/CIFS diagnosis, systemd's own restatements and ordinary unit chatter are dropped, a password-bearing `key=value` loses its value, and the tail is kept, bounded to a few short lines per unit. Collecting it is read-only, bounded by `timeout`, and never fatal — no journal or nothing that passes the filter simply leaves the message as it was. Everything else about the transaction is unchanged: the same `EXIT_READINESS`, the same marker and teardown, no new `==> ` phase line, and the GUI still shows stderr and derives no control decision from an exit code | §4.2 makes an authenticated connection the only proof that the host's share password matches the guest's, and the app acts on that proof by matching authentication wording in the helper's stderr to offer **Retry and reset share password…**. But the helper's only mount-failure text was the generic ready-deadline sentence, while the real CIFS error — a rejected credential, a share the guest does not export, an unreachable server — stayed in the mount units' journal, where the GUI cannot look. A wrong password was therefore indistinguishable from a slow guest and the credential route could almost never fire. The excerpt is filtered rather than quoted raw because this is a root helper on the privileged power path: it may explain a failure, never become a log pipe, and never carry a secret |
+| D46 | Episodic exclusion verification and resident residue | Verifying a pending root is an **episode** that may span enforcement passes. Stage 1 is the uncapped attribute-only walk: any file lacking `RECALL` and longer than `$ResidualFileMaxBytes` (4096, one NTFS cluster) means content is still plainly local, so the root reports `pending-dehydrate` with those files' summed `Length`, drops any in-flight episode, and spends no queries. Otherwise stage 2 queries the candidates that could still hold bytes — `RECALL` files and files no longer than the bound — ordered ordinal-ignore-case, resuming strictly after an in-memory cursor and spending at most `$MaxPlaceholderQueriesPerPass` queries per pass; mid-episode passes report `<checked> of <total> file(s) checked`. Only an episode that reaches the end of its list may decide, and only with zero blocking allocation and zero unreadable items. An in-sync, unmodified placeholder no longer than the bound whose `OnDiskDataSize` is nonzero is **residue**: reported in `detail` and `localAllocatedBytes`, not blocking. A not-in-sync, modified or non-placeholder file is never residue, whatever its size. Episode state is memory-only (like the dehydrate-request throttle) and is dropped when the root leaves the wanted set, when the configuration changes, and by stage 1 above. The D34 re-verification of an applied root likewise ignores files at or below the bound and carries the episode's residue figures forward rather than re-measuring them, which is what stops an applied-with-residue root oscillating. Enforcement is untouched: the deny and parent guard are still asserted every pass, and request throttling, the sweep and the status schema are unchanged | Both halves fix roots that could never leave `pending-dehydrate`. The measurement restarted from the top of the tree every pass and stopped after 5000 placeholder queries, and `applied` demanded an uncapped clean walk — so a 231 GB root of ~10^5 files reported "measurement capped" forever, because a dehydrated placeholder keeps its directory-entry `Length` and still costs a query. A cursor is the same answer D26/D34 already gave the reclamation sweep for the same shape of problem: bounded steady-state work, label freshness allowed to lag, safety unaffected. Separately, three app-container roots held a few hundred bytes each in in-sync, unmodified placeholders that iCloud will never dehydrate because NTFS stores data that small resident in the MFT record; without a tolerance those roots hold the exclusion (and the D23 tray) yellow forever while the agent re-requests a dehydration Windows cannot perform. The tolerance is bounded to one cluster per file so the misreport stays trivial, and its carve-outs are data safety, not tidiness: a non-placeholder's content may exist nowhere but this disk, and a not-in-sync placeholder's local copy is the newest one, so calling either "applied" would hide the only good copy (D20/D22) |
 
 **Known accepted limitations (do not attempt to fix):**
 
@@ -347,8 +348,19 @@ empty collections, key order, integer and double formatting, and the depth guard
 ```
 
 - `exclusions[].state` ∈ `applying` | `applied` | `pending-dehydrate` | `not-found` |
-  `error`. `applied` means: exact target deny and parent guard are present and
-  every non-empty regular file reports `OnDiskDataSize == 0`.
+  `error`. `applied` means: exact target deny and parent guard are present and a
+  verification episode ran to completion (D46) finding no blocking allocation and
+  nothing it could not inspect. The one tolerated exception is residue: an
+  in-sync, unmodified placeholder no larger than one NTFS cluster
+  (`$ResidualFileMaxBytes`, 4096) whose `OnDiskDataSize` is nonzero because NTFS
+  keeps data that small resident in the MFT record, which no dehydration can
+  release. Such files are *reported* — `localAllocatedBytes` carries their bytes
+  and `detail` names them — instead of blocking the transition. A file that is
+  modified, not in sync, or not a cloud placeholder blocks `applied` whatever its
+  size. Verification of a large root is spread across passes (at most
+  `$MaxPlaceholderQueriesPerPass` placeholder queries each), so after the content
+  is really gone the label can still take ceil(files / that budget) further
+  passes to advance, reporting its progress in `detail` meanwhile.
   `not-found` means the path does not (yet) exist under the sync root — the agent
   keeps checking each cycle (the item may arrive from the cloud later) and hides it
   the moment it appears. Because a missing object cannot be protected by a named
@@ -380,10 +392,15 @@ empty collections, key order, integer and double formatting, and the depth guard
   lower bound, not an allocation total. Do not open files to compute it.
   `diskFreeBytes` remains the authoritative whole-volume capacity signal; the GUI
   must never present this field as "space used by iCloud".
-- `exclusions[].localAllocatedBytes` is different and **is** exact: it comes from
+- `exclusions[].localAllocatedBytes` is different and **is** exact once the
+  episode has queried the file: it comes from
   `CfGetPlaceholderInfo.OnDiskDataSize` (plus `GetCompressedFileSizeW` for
   non-placeholders), because `applied` requires proving `OnDiskDataSize == 0`
-  and `RECALL` alone cannot prove it.
+  and `RECALL` alone cannot prove it. Two states report less precisely on
+  purpose (D46): while the attribute walk still finds fully local files, the
+  field carries their summed `Length` rather than spending queries on a tree
+  that is visibly still dehydrating, and mid-episode it carries the running
+  total of what has been queried so far.
 - `scan` describes the last completed routine tree scan. `cloudInfoQueries`
   counts per-file `CfGetPlaceholderInfo` calls made during it and exists to make
   a regression visible: it must stay proportional to exclusions being applied and
@@ -524,8 +541,9 @@ file. Keep all counters as `[Int64]`.
 **Call this helper only in these three cases** — it costs a handle open per file
 and must never run once per library file per cycle (D26):
 
-1. Files under an exclusion in `applying` or `pending-dehydrate`, where `applied`
-   requires proving `OnDiskDataSize == 0`.
+1. Candidate files under an exclusion in `applying` or `pending-dehydrate`, where
+   `applied` requires proving `OnDiskDataSize == 0` (or one cluster of residue,
+   D46), staged per §3.1 so a pass spends a bounded number of these calls.
 2. Candidates during an active low-disk reclamation episode, staged per §3.1.
 3. Reparse-point containment validation (§2.1).
 
@@ -579,18 +597,60 @@ for each existing wanted root:
     on first protection (and a bounded retry if still pending), run:
         directory: attrib +U -P "$full" /S /D
         file:      attrib +U -P "$full"
-    query placeholder state for its regular files; Cloud Files retains local
-        content for modified/not-in-sync/open files even though unpinned intent
-        was requested, so report those as pending-dehydrate
-    re-query on later passes; state=applied only when target deny + parent guard
-        are present and every non-empty file has OnDiskDataSize == 0
+
+    # verification is an episode that may span passes (D46)
+    # stage 1: attribute-only, uncapped, opens no handle, runs every pass
+    walk the root's files from attributes alone; a file WITHOUT $ATTR_RECALL and
+        longer than $ResidualFileMaxBytes is fully local content the request has
+        not moved yet
+    if any such file exists: state = pending-dehydrate,
+        localAllocatedBytes = their summed Length, drop any in-flight episode,
+        and spend no placeholder queries this pass
+    a directory the walk cannot enumerate counts as unreadable and blocks
+        `applied` the same way an unqueryable file does: it hides whatever it
+        holds, and a root is never applied over a subtree nothing inspected
+    otherwise collect the candidates worth a query -- non-empty files that carry
+        $ATTR_RECALL (possibly still partly hydrated) or are no longer than
+        $ResidualFileMaxBytes (possibly resident residue) -- ordered
+        ordinal-ignore-case by relative path, the same comparator the sweep's
+        stage-2 cursor uses
+
+    # stage 2: bounded placeholder queries, resumed from the episode cursor
+    process candidates strictly after the cursor, at most
+        $MaxPlaceholderQueriesPerPass per pass, advancing the cursor over each:
+        placeholder, OnDiskDataSize > 0, in sync, ModifiedDataSize == 0 and
+            Length <= $ResidualFileMaxBytes -> residue: count its bytes and
+            report them, but do not let them block (NTFS keeps data this small
+            resident in the MFT record, so no dehydration can free it and iCloud
+            never completes the request)
+        any other placeholder with OnDiskDataSize > 0 -> blocking allocation;
+            also count modified/not-in-sync for the detail
+        non-placeholder -> blocking if it has allocation, and never residue
+            whatever its size: its content may exist nowhere but this disk, so
+            calling it applied would hide the only copy (D20/D22)
+        unreadable -> blocking, reported as could-not-inspect
+    budget exhausted before the end: keep the episode, state = pending-dehydrate,
+        detail reports "<checked> of <total> file(s) checked"; the next pass
+        resumes at the cursor instead of restarting the tree
+    end of the list reached: decide from the episode totals and drop it.
+        state=applied only when target deny + parent guard are present and the
+        completed episode found zero blocking allocation and zero unreadable
+        items; residue (if any) goes in detail and localAllocatedBytes.
+        Otherwise pending-dehydrate, and a fresh episode starts next pass
+    an episode is also dropped when its root leaves the wanted set and whenever
+        the configuration changes; it lives in memory only, so an agent restart
+        merely re-measures
+
     once applied, the cheap re-verification walk that keeps that label honest is
         decimated (D34): every pass for the first few passes after the transition,
         then every ~10th, and immediately on any configuration change. It is
         reporting only -- the deny and guard above are re-asserted every pass --
         so a label (and its logicalBytes) may lag by up to ~10 min, matching the
-        tree.json cadence. Content reappearing under an applied root drops it back
-        to per-pass measurement
+        tree.json cadence. That walk ignores files at or below
+        $ResidualFileMaxBytes -- it cannot re-measure residue without opening
+        handles, so the episode's residue is carried forward instead, and a root
+        applied with residue does not oscillate back to pending. Content
+        reappearing above that bound drops the root back to per-pass measurement
 
 atomically persist {roots, guardedParents, appliedRevision, wantedHash} in private
 applied.json, alongside the reconciliation cursor, the D34 "nothing to reconcile"
