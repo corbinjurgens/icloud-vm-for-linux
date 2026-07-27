@@ -23,7 +23,17 @@ Set-ItemProperty -Path $tzKey -Name RealTimeIsUniversal -Value 1 -Type DWord -Fo
 # Takes full effect at the next boot, when Windows re-reads the RTC. A running
 # session is nudged now so the first provisioning run does not publish skewed
 # stamps; a failure here is not fatal, because the boot after this fixes it.
-& w32tm.exe /resync /force 2>&1 | Out-Null
+# The resync only works while W32Time is running: on the live guest the service
+# was stopped, so the call failed silently (0x80070426) and the whole first
+# session stayed hours skewed until the next boot. Automatic keeps the service
+# up for later sessions too, so they do not drift between boots.
+Set-Service W32Time -StartupType Automatic -ErrorAction SilentlyContinue
+Start-Service W32Time -ErrorAction SilentlyContinue
+$resync = & w32tm.exe /resync /force 2>&1
+if ($LASTEXITCODE -ne 0) {
+  # 2>&1 above folds w32tm's stderr into $resync, so one line carries the reason.
+  Write-Warning "time resync failed: $((($resync | ForEach-Object { "$_".Trim() }) -join ' ').Trim())"
+}
 
 # --- Services not needed on a sync appliance ---
 # NEVER extend this list with: AppXSvc, ClipSVC, InstallService, LicenseManager,
