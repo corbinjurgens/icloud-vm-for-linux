@@ -44,8 +44,8 @@ $services = @(
   "RemoteRegistry",
   # printing: no printer is reachable from this guest
   "Spooler", "PrintNotify",
-  # error reporting and diagnostics
-  "WerSvc", "wercplsupport", "DPS", "WdiServiceHost", "WdiSystemHost", "PcaSvc",
+  # diagnostics policy/tracing hosts (WerSvc itself is configured below, not disabled)
+  "wercplsupport", "DPS", "WdiServiceHost", "WdiSystemHost", "PcaSvc",
   "dmwappushservice",
   # hardware this QEMU guest does not have
   "lfsvc", "WbioSrvc", "bthserv", "BTAGService", "stisvc", "WiaRpc",
@@ -59,6 +59,33 @@ $services = @(
 foreach ($s in $services) {
   Stop-Service $s -Force -ErrorAction SilentlyContinue
   Set-Service  $s -StartupType Disabled -ErrorAction SilentlyContinue
+}
+
+# --- Error reporting: silent local capture, never a dialog ---
+# An unattended appliance wants crashes recorded and nothing shown. WerSvc used to
+# be in the list above, and with WER also Disabled=1 the 2026-07-27 iCloudHome.exe
+# fast-fail (0xC0000409, twice) produced no Event 1000, no report and no dump,
+# while the kernel hard-error path parked a modal "System Error" box on a desktop
+# nobody is watching. So: restore the service, force reporting back on, suppress
+# all UI. WerSvc is trigger-started (it runs only while a crash is being recorded),
+# so it costs no resident RAM in the 3 GB guest. Nothing is uploaded either - the
+# QueueReporting task below stays disabled, which makes capture purely local.
+Set-Service WerSvc -StartupType Manual -ErrorAction SilentlyContinue
+# Live system key (Consent, ExcludedApplications and friends live under it), so
+# create only what is missing, for the same reason the DeviceGuard block below does.
+$wer = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting"
+if (-not (Test-Path $wer)) { New-Item -Path $wer -Force | Out-Null }
+Set-ItemProperty $wer -Name Disabled   -Value 0 -Type DWord -Force   # observed as 1 on the live guest
+Set-ItemProperty $wer -Name DontShowUI -Value 1 -Type DWord -Force
+# Per-app LocalDumps only, so a crash of one of iCloud's own processes leaves a
+# minidump behind. No global LocalDumps key: that would dump every process in the
+# guest. No DumpFolder either - the default %LOCALAPPDATA%\CrashDumps of the
+# crashing user needs no pre-created directory or extra ACL.
+foreach ($exe in @("iCloudHome.exe", "iCloudDrive.exe", "iCloudCKKS.exe", "ApplePhotoStreams.exe")) {
+  $ld = Join-Path $wer "LocalDumps\$exe"
+  if (-not (Test-Path $ld)) { New-Item -Path $ld -Force | Out-Null }
+  Set-ItemProperty $ld -Name DumpType  -Value 1 -Type DWord -Force   # 1 = minidump
+  Set-ItemProperty $ld -Name DumpCount -Value 3 -Type DWord -Force
 }
 
 # --- Maintenance tasks that scan or rewrite the whole volume ---
