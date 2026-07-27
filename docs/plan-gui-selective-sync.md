@@ -362,8 +362,14 @@ empty collections, key order, integer and double formatting, and the depth guard
   parent guard behind it are re-asserted on every 60 s pass, so access never
   does. `applying`, `pending-dehydrate` and `not-found` are measured every pass
   as before, and any configuration change re-measures everything immediately.
-- `icloudClientRunning`: true iff a process named `iCloudServices` or `iCloudDrive`
-  exists. This is process liveness only; it does not prove Apple-side sync health.
+- `icloudClientRunning`: true iff a process named `iCloudHome`, `iCloudDrive` or
+  `iCloudServices` exists. This is process liveness only; it does not prove
+  Apple-side sync health. The shipping Store client runs `iCloudHome`,
+  `iCloudDrive`, `iCloudCKKS` and `ApplePhotoStreams`, and no `iCloudServices`
+  at all — that name belongs to the older Win32 client and is kept only so an
+  older install still answers. Watching the app process as well as the sync
+  engine is deliberate: the client's processes restart together as a group, and
+  a probe holding only the engine's name reports a routine restart as an outage.
 - `lastError` contains the most recent currently unresolved agent/config error and
   clears only after the failing sub-task completes successfully; do not clear it
   merely because a status write succeeded.

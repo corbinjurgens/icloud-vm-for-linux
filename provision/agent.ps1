@@ -76,7 +76,7 @@ $ShareUser = "syncshare"
 # behavior, so a GUI shipped alongside a newer agent can say so. The GUI carries
 # the same number in bridge.py and a test compares the two literals.
 $ProtocolVersion = 1
-$AgentBuild      = 6
+$AgentBuild      = 7
 
 # Cloud Files / FILE_ATTRIBUTE values.
 # DIRECTORY and UNPINNED are listed for reference and are deliberately unused:
@@ -1857,7 +1857,16 @@ function Write-Status {
     $space = Get-VolumeSpace
     $running = $false
     try {
-        $p = @(Get-Process -Name 'iCloudServices', 'iCloudDrive' -ErrorAction SilentlyContinue)
+        # The names the shipping Store client actually runs, observed live on
+        # iCloud for Windows in the guest: iCloudHome (the app itself),
+        # iCloudDrive (the Cloud Files sync engine), iCloudCKKS and
+        # ApplePhotoStreams. There is no iCloudServices process any more - that
+        # is the old Win32 client's name, kept here only so an older install
+        # still answers. Matching the app process as well as the sync engine is
+        # what stops a routine engine restart from reading as "the client is
+        # gone": all four were seen restarting together within three seconds,
+        # and a probe that watched only the engine would call that a fault.
+        $p = @(Get-Process -Name 'iCloudHome', 'iCloudDrive', 'iCloudServices' -ErrorAction SilentlyContinue)
         $running = ($p.Count -gt 0)
     } catch { }
 

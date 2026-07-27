@@ -245,6 +245,26 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-27 — The iCloud liveness probe watched a process that no longer exists (`agentBuild` 6 → 7)
+
+A diagnostic report from the working bridge showed every row green except
+**iCloud client**, which held the overall status at yellow. The dip was real —
+all four Apple processes restarted together between 09:22:58 and 09:23:01, and
+the status written at 09:22:30 correctly saw none of them — but enumerating the
+guest's processes showed the probe was also watching the wrong thing:
+
+```
+iCloudHome  5056   9:22:58     iCloudCKKS         6156   9:23:00
+iCloudDrive 8340   9:23:01     ApplePhotoStreams  7560   9:23:00
+```
+
+There is no `iCloudServices` process in the shipping Store client; that is the
+old Win32 client's name. Liveness therefore rested entirely on `iCloudDrive`,
+the Cloud Files sync engine — so an engine restart, which is routine, reads as
+"the client is gone" and turns the tray yellow. The probe now also accepts
+`iCloudHome`, the app's own process, keeping `iCloudServices` only so an older
+install still answers. §2 of the v2 plan records the observed process set.
+
 ### 2026-07-27 — Long paths in a real library, and a guest clock seven hours out (`agentBuild` 5 → 6)
 
 Two faults that only a real library and a real guest could show, both found by
