@@ -1032,7 +1032,8 @@ requires I-001.
 ### 2026-07-26 — In-session lifecycle, first run, usability and performance
 
 Commit `26d29ac` implemented the eight-item
-[`todo/gui_improvements.md`](todo/gui_improvements.md) review and the performance
+[`todo/archive/gui_improvements.md`](todo/archive/gui_improvements.md) review
+and the performance
 review now locked as v2 decisions D30–D34.
 
 - Added explicit **Power off bridge** / **Start bridge** controls without
@@ -1070,7 +1071,7 @@ than being clobbered by package defaults.
 ### 2026-07-25 — GUI-managed bridge lifecycle
 
 Commit `15c3079` implemented D29 from
-[`todo/gui_close_vm.md`](todo/gui_close_vm.md).
+[`todo/archive/gui_close_vm.md`](todo/archive/gui_close_vm.md).
 
 - Confirmed Quit can quiesce GUI mount work, disarm health and automounts,
   cleanly unmount both shares, then gracefully stop the VM.

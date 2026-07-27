@@ -1,9 +1,16 @@
-# Todo: GUI ease-of-use improvements
+# Archive: GUI ease-of-use improvements
+
+Archived 2026-07-27 from `todo/gui_improvements.md`. Every item shipped in
+commit `26d29ac` on 2026-07-26 — together with the performance review, they are
+v2 decisions D30-D34 — so the live note was deleted rather than shrunk. The rest
+of this file is that note verbatim — its own heading became the title above, and
+its CHANGELOG link was re-pointed for this directory. Ongoing candidates and
+ruled-out ideas continue to live in [`CHANGELOG.md`](../../CHANGELOG.md).
 
 > **Status: implemented.** All eight items landed in commit `26d29ac` on
 > 2026-07-26. This file is retained as the implementation review; ongoing
 > candidates and ruled-out ideas are tracked in
-> [`../CHANGELOG.md`](../CHANGELOG.md).
+> [`CHANGELOG.md`](../../CHANGELOG.md).
 
 ## Goal
 

@@ -1,9 +1,16 @@
-# Todo: Quit from the GUI powers off the VM and disconnects the drive
+# Archive: Quit from the GUI powers off the VM and disconnects the drive
+
+Archived 2026-07-27 from `todo/gui_close_vm.md`. Everything this note asked for
+shipped: the review became v2 decision D29 and landed in commit `15c3079` on
+2026-07-25, so the live note was deleted rather than shrunk. The rest of this
+file is that note verbatim — its own heading became the title above, and its
+CHANGELOG link was re-pointed for this directory. Ongoing candidates and
+ruled-out ideas continue to live in [`CHANGELOG.md`](../../CHANGELOG.md).
 
 > **Status: implemented.** This review became v2 decision D29 and landed in
 > commit `15c3079` on 2026-07-25. It is retained for the design rationale;
 > ongoing candidates and ruled-out ideas are tracked in
-> [`../CHANGELOG.md`](../CHANGELOG.md).
+> [`CHANGELOG.md`](../../CHANGELOG.md).
 
 ## Goal
 
