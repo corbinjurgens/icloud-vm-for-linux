@@ -245,6 +245,34 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-27 — A first run now builds the bridge, instead of dispatching an agent-only repair
+
+With the status writer fixed, the first complete live run got all the way to
+`verifying` and stopped there: `bridgeBoundary=missing; agentInstall=missing;
+agentRuntime=missing`, after a phase that had announced
+`04-bridge-agent.ps1 -Scope Agent`. Root cause: `guest-setup.ps1` derived the
+dispatch its bridge step executes **before** script 03 created the `syncshare`
+account. At that moment the boundary probe's dependency was unmet, so it
+answered `pending` — which correctly schedules nothing — while the agent probes
+answered `missing`. The resulting work plan therefore contained `update-agent`
+and no `repair-bridge-boundary`, and an agent-only scope is precisely what
+script 04 refuses on a guest whose `exclusions.json` the boundary scope has
+never written. Nothing installed, and the run's own convergence check was the
+first thing to notice.
+
+`guest-setup.ps1` now re-derives the checklist, the published work plan and the
+dispatch after the share stage as well as after the package/sign-in stage; the
+two sites share one `Update-Dispatch` helper, which also consumes the
+operator's credential-reset intent exactly once so a completed reset cannot look
+like a component that refused to converge. On a first run the bridge step now
+receives `-Scope All` and builds both halves. This is what §4.2 of the v2 plan
+already required — work is dependency ordered and a `pending` check is re-probed
+once its dependency converges — so the plan text is clarified rather than
+amended, and `packaging/test-guest-state.ps1` gains the three inspections a real
+first run performs, which is the fixture the existing matrix lacked: it fed each
+check independently and so never produced the intermediate state that made the
+wrong scope look right.
+
 ### 2026-07-27 — The guest status writer no longer dies on its second write
 
 The first live provisioning run acknowledged, wrote one status, and then went

@@ -997,7 +997,11 @@ Rules for deriving work:
 - Work is dependency ordered, not blindly script ordered: package and sign-in
   work precede share work, share-account and data-share work precede the bridge
   boundary, and the agent is last. Re-inspect downstream dependencies after a
-  wait such as sign-in, because the VM may have changed while the app waited.
+  wait such as sign-in, because the VM may have changed while the app waited —
+  and equally after any stage that satisfies another check's dependency. The
+  share stage is what makes the bridge-boundary probe answerable, so the scope
+  script 04 runs is derived after script 03 has run, never from the plan that
+  was current while the account was still missing.
 - `ok` means verified by current effect, not by a marker alone. Markers and
   hashes may establish bundle identity, but share paths, task definitions,
   service state, ACL boundaries and runtime freshness are probed directly.

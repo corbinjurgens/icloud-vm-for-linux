@@ -352,6 +352,46 @@ Check 'the boundary scope is skipped' $agentDispatch.BridgeScope 'Agent'
 Check 'no iCloud install'             ([string]$agentDispatch.InstallIcloud) 'False'
 Check 'no sign-in wait'               ([string]$agentDispatch.WaitForSignin) 'False'
 
+Write-Host '==> the inspections a first run really performs'
+# The work matrix above feeds each check independently; this is the sequence a
+# fresh VM produces, one inspection at a time. A probe whose dependency is unmet
+# reports 'pending' and schedules nothing, so the boundary repair can only enter
+# the plan at the inspection that follows the share work. A dispatch derived
+# before that carries no boundary work at all - which is why guest-setup.ps1
+# re-derives after script 03 instead of reusing the sign-in pass's dispatch.
+
+# 1. Nothing yet: no package and no sync root, so every dependent probe pends.
+$firstPass = Get-TestChecklist @{
+    icloudPackage = 'missing'; syncRoot = 'missing'; shareAccount = 'missing'
+    dataShare = 'pending'; bridgeBoundary = 'pending'
+    agentInstall = 'pending'; agentRuntime = 'pending'
+}
+$firstPlan = Get-GuestWorkPlan -Checks $firstPass -ResetShareCredential $false
+Check 'the first pass plans only what it can see' `
+    ($firstPlan -join ',') 'install-icloud,wait-for-signin,create-share-account'
+Check 'and dispatches no bridge scope' (Get-GuestRepairDispatch -Work $firstPlan).BridgeScope 'none'
+
+# 2. After the sign-in: the sync root exists, so the agent probes answer, but the
+#    syncshare account does not exist yet and the boundary probe still cannot.
+$afterSignin = Get-TestChecklist @{
+    shareAccount = 'missing'; dataShare = 'pending'; bridgeBoundary = 'pending'
+    agentInstall = 'missing'; agentRuntime = 'missing'
+}
+$signinPlan = Get-GuestWorkPlan -Checks $afterSignin -ResetShareCredential $false
+Check 'the sign-in pass cannot plan the boundary' ($signinPlan -join ',') 'create-share-account,update-agent'
+Check 'so its scope would install the agent alone' `
+    (Get-GuestRepairDispatch -Work $signinPlan).BridgeScope 'Agent'
+
+# 3. After script 03: the account and the data share exist, the boundary answers
+#    at last, and one 'All' scope builds both halves of the bridge.
+$afterShare = Get-TestChecklist @{
+    bridgeBoundary = 'missing'; agentInstall = 'missing'; agentRuntime = 'missing'
+}
+$sharePlan = Get-GuestWorkPlan -Checks $afterShare -ResetShareCredential $false
+Check 'the share pass plans the boundary and the agent' `
+    ($sharePlan -join ',') 'repair-bridge-boundary,update-agent'
+Check 'and its scope covers both' (Get-GuestRepairDispatch -Work $sharePlan).BridgeScope 'All'
+
 Write-Host ''
 if ($script:fail -gt 0) {
     Write-Host "FAIL: $($script:fail) assertion(s) failed, $($script:pass) passed."

@@ -256,6 +256,43 @@ function Get-BlockedDetail {
     return ($parts -join '; ')
 }
 
+function Update-Dispatch {
+    # Re-derive the checklist, the published work plan and the repair dispatch
+    # after a stage that can satisfy a downstream probe's dependency.
+    #
+    # A probe that was 'pending' answered nothing earlier - the bridge boundary
+    # before the syncshare account exists, for example - so the repair it owns
+    # only becomes real work here. That is why section 4.2 orders work by
+    # dependency and re-probes a 'pending' check once its dependency converges:
+    # a dispatch derived before the share stage cannot know whether the boundary
+    # needs building, and a 'pending' check may not survive to 'done'.
+    param(
+        [Parameter(Mandatory)][string]$Detail,
+        [Parameter(Mandatory)]$Performed
+    )
+    Set-Phase 'inspecting' $Detail
+    $checks = Update-Inspection
+    $blocked = Get-GuestBlockedChecks $checks
+    # The operator's reset intent is consumed once. It is scheduled from intent
+    # rather than from an observation, and shareCredential is never verifiable,
+    # so re-requesting it after the reset has run would look like a component
+    # that refused to converge.
+    $wantReset = ($script:Reset -and -not $Performed.Contains('reset-share-credential'))
+    $script:Work = Get-GuestWorkPlan -Checks $checks -ResetShareCredential $wantReset
+    Write-Status
+    if (@($blocked).Count -gt 0) {
+        Stop-WithError ("stopping before any further change: " + (Get-BlockedDetail $blocked))
+    }
+    foreach ($w in @($script:Work)) {
+        # At most one repair pass per component per run.
+        if ($Performed.Contains($w)) {
+            Stop-WithError ("'$w' did not converge after its one repair pass; " +
+                            "the checklist still reports it as outstanding")
+        }
+    }
+    return Get-GuestRepairDispatch -Work $script:Work
+}
+
 # ============================ 1. validate the run ============================
 # The watcher is the only caller, but validate its arguments anyway: this script
 # is the elevation boundary's inside face.
@@ -285,8 +322,7 @@ try {
     Set-Phase 'inspecting' 'evaluating the guest checklist'
     $checks = Update-Inspection
     $blocked = Get-GuestBlockedChecks $checks
-    $plan = Get-GuestWorkPlan -Checks $checks -ResetShareCredential $reset
-    $script:Work = $plan
+    $script:Work = Get-GuestWorkPlan -Checks $checks -ResetShareCredential $reset
     Write-Status
 
     if (@($blocked).Count -gt 0) {
@@ -294,7 +330,7 @@ try {
         # checklist, preserve every byte of data, and stop.
         Stop-WithError ("stopping before any change: " + (Get-BlockedDetail $blocked))
     }
-    $dispatch = Get-GuestRepairDispatch -Work $plan
+    $dispatch = Get-GuestRepairDispatch -Work $script:Work
 
     # ============================ 3. refresh the manual fallback =============
     # `current` is the protected bundle a diagnosed failure may tell the operator
@@ -390,23 +426,8 @@ try {
     if ($dispatch.InstallIcloud -or $dispatch.WaitForSignin) {
         # The VM may have changed while we waited, and the downstream probes were
         # 'pending' when the dependency was unmet, so re-derive from scratch.
-        Set-Phase 'inspecting' 're-evaluating after the package and sign-in work'
-        $checks = Update-Inspection
-        $blocked = Get-GuestBlockedChecks $checks
-        $plan = Get-GuestWorkPlan -Checks $checks -ResetShareCredential $reset
-        $script:Work = $plan
-        Write-Status
-        if (@($blocked).Count -gt 0) {
-            Stop-WithError ("stopping before any further change: " + (Get-BlockedDetail $blocked))
-        }
-        foreach ($w in @($plan)) {
-            # At most one repair pass per component per run.
-            if ($performed.Contains($w)) {
-                Stop-WithError ("'$w' did not converge after its one repair pass; " +
-                                "the checklist still reports it as outstanding")
-            }
-        }
-        $dispatch = Get-GuestRepairDispatch -Work $plan
+        $dispatch = Update-Dispatch -Detail 're-evaluating after the package and sign-in work' `
+                                    -Performed $performed
     }
 
     # ============================ 6. the secret ==============================
@@ -433,10 +454,20 @@ try {
         if ($dispatch.ShareMode -eq 'password-file') { $shareArgs += @('-PasswordFile', $SecretLocal) }
         else { $shareArgs += '-PreserveCredential' }
         foreach ($w in @('create-share-account', 'reset-share-credential', 'repair-data-share')) {
-            if ($plan -contains $w) { [void]$performed.Add($w) }
+            if ($script:Work -contains $w) { [void]$performed.Add($w) }
         }
         Invoke-GuestChild -FilePath 'powershell.exe' -ArgumentList $shareArgs `
             -What '03-create-share.ps1' -TimeoutSeconds $ScriptTimeout
+
+        # The syncshare account is the bridge boundary's dependency, so the
+        # boundary and data-share probes only answer from here on. Step 8 runs
+        # the scope this inspection derives, never the one that was derived
+        # while the account was still missing: on a first run that older
+        # dispatch carries no boundary work at all, and its agent-only scope is
+        # exactly what 04 refuses on a guest whose exclusions.json the boundary
+        # scope has never written.
+        $dispatch = Update-Dispatch -Detail 're-evaluating after the share work' `
+                                    -Performed $performed
     }
 
     # ============================ 8. bridge boundary and agent ===============
@@ -445,7 +476,7 @@ try {
         $phase = if ($dispatch.BridgeScope -eq 'Agent') { 'installing-agent' } else { 'installing-bridge-boundary' }
         Set-Phase $phase "running 04-bridge-agent.ps1 -Scope $($dispatch.BridgeScope)"
         foreach ($w in @('repair-bridge-boundary', 'update-agent')) {
-            if ($plan -contains $w) { [void]$performed.Add($w) }
+            if ($script:Work -contains $w) { [void]$performed.Add($w) }
         }
         Invoke-GuestChild -FilePath 'powershell.exe' `
             -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $bridgeScript,
