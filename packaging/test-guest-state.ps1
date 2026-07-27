@@ -89,17 +89,15 @@ Assert-NativeExitCode -ExitCode 0 -What 'icacls'
 $script:pass++
 
 # ------------------------------------------------ inspection heartbeat -------
-# Both proportional walks must invoke the explicitly injected callback. The
-# callback itself owns cadence; these functions only guarantee opportunities.
+# The proportional walk must invoke the explicitly injected callback. The
+# callback itself owns cadence; the scanner only guarantees opportunities.
 
 Write-Host '==> inspection heartbeat callback'
 $script:heartbeatCalls = 0
-Get-TraversalLinkPath -Path $PSScriptRoot -Heartbeat { $script:heartbeatCalls++ } | Out-Null
-Check 'traversal-link walk invokes callback' ([string]($script:heartbeatCalls -gt 0)) 'True'
-
-$script:heartbeatCalls = 0
-Get-BridgeAclScan -Path $PSScriptRoot -Heartbeat { $script:heartbeatCalls++ } | Out-Null
+$scan = Get-BridgeAclScan -Path $PSScriptRoot -Heartbeat { $script:heartbeatCalls++ }
 Check 'ACL walk invokes callback' ([string]($script:heartbeatCalls -gt 0)) 'True'
+Check 'scan reports traversal links' `
+    ([string]($scan.PSObject.Properties.Name -contains 'TraversalLink')) 'True'
 
 # --------------------------------------------------------- normalizers -------
 # Every normalizer must be total, and an observation that could not be taken at
@@ -310,6 +308,15 @@ Check 'fresh VM plan is dependency ordered' `
     'install-icloud,wait-for-signin,create-share-account,repair-data-share,repair-bridge-boundary,update-agent'
 Check 'a healthy VM plans nothing' `
     ((Get-GuestWorkPlan -Checks (Get-TestChecklist) -ResetShareCredential $false) -join ',') ''
+
+Write-Host '==> verification policy'
+Check 'no repair reuses the initial checklist' `
+    ([string](Test-GuestVerificationRequired -PerformedCount 0)) 'False'
+Check 'one repair requires verification' `
+    ([string](Test-GuestVerificationRequired -PerformedCount 1)) 'True'
+CheckThrows 'negative repair count is rejected' {
+    Test-GuestVerificationRequired -PerformedCount -1
+}
 
 # ------------------------------------------------------- repair dispatch -----
 # Exhaust every subset of the work vocabulary (2^7) against the dispatch rules,

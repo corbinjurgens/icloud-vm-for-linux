@@ -269,6 +269,24 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-28 — A healthy provisioning run walked the full library four times
+
+The provisioning checklist scanned the iCloud tree once for traversal links
+and then enumerated it again while reading every descendant DACL for protected
+ACLs and legacy `syncshare` grants. It unconditionally repeated the complete
+checklist in `verifying`, even when the first inspection selected no repair.
+On the live 60 000-entry guest this made the no-op run spend minutes in active
+metadata work; reducing heartbeat intervals could only make the same scan
+report more often, not finish sooner.
+
+D44 now treats a complete initial checklist that schedules no repair as the
+run's verification. Traversal-link detection shares the required DACL walk, and
+script 04 reuses that same pass for its preflight and protected-DACL list. A
+healthy no-op run therefore performs one full-tree pass instead of four. Any run
+that changes guest state still re-evaluates the complete checklist afterwards,
+and traversal links, protected DACLs and legacy explicit grants remain
+fail-closed checks.
+
 ### 2026-07-28 — Two silent iCloudHome crashes, and the forensics that were not there
 
 Two modal `iCloudHome.exe - System Error ... overrun of a stack-based buffer`

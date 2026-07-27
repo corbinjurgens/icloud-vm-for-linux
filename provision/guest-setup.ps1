@@ -546,22 +546,27 @@ try {
     }
 
     # ============================ 9. verify ==================================
-    # (The child runner that steps 4, 7 and 8 all go through is defined above;
-    # step 9 in the plan's numbering is that helper, not a phase.)
-    Set-Phase 'verifying' 're-evaluating the complete checklist'
-    $checks = Update-Inspection
-    $script:Work = @()
-    Write-Status
-    if (-not (Test-GuestChecklistConverged $checks)) {
-        $residual = @()
-        foreach ($id in $GuestCheckIds) {
-            $want = if ($id -eq 'shareCredential') { 'unverifiable' } else { 'ok' }
-            if ($checks[$id] -ne $want) { $residual += $id }
+    # The initial complete inspection is already proof of convergence when it
+    # selected no repairs. Re-scan only after this run changed guest state.
+    if (Test-GuestVerificationRequired -PerformedCount $performed.Count) {
+        # (The child runner that steps 4, 7 and 8 all go through is defined
+        # above; step 9 in the plan's numbering is that helper, not a phase.)
+        Set-Phase 'verifying' 're-evaluating the complete checklist'
+        $checks = Update-Inspection
+        $script:Work = @()
+        Write-Status
+        if (-not (Test-GuestChecklistConverged $checks)) {
+            $residual = @()
+            foreach ($id in $GuestCheckIds) {
+                $want = if ($id -eq 'shareCredential') { 'unverifiable' } else { 'ok' }
+                if ($checks[$id] -ne $want) { $residual += $id }
+            }
+            # Terminal and specific. No second automatic repair pass: the
+            # protected fallback bundle in $ProvisionCurrent is what a human
+            # runs next.
+            Stop-WithError ("provisioning did not converge: " + (Get-BlockedDetail $residual) +
+                            ". The protected fallback bundle is $ProvisionCurrent")
         }
-        # Terminal and specific. No second automatic repair pass: the protected
-        # fallback bundle in $ProvisionCurrent is what a human runs next.
-        Stop-WithError ("provisioning did not converge: " + (Get-BlockedDetail $residual) +
-                        ". The protected fallback bundle is $ProvisionCurrent")
     }
 
     Set-Phase 'done' $(

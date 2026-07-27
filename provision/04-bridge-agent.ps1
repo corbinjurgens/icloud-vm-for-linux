@@ -155,24 +155,23 @@ if ($doBoundary) {
 # grants, then re-add one inheritable Modify grant at the root (v2 plan D15).
 Step "3/9 Normalizing the syncshare ACL on the sync root (this walks the library)"
 
-# Refuse to walk a tree containing junctions or symlinks: icacls /T and the
-# protected-DACL scan below would follow one out of the sync root and mutate
-# ACLs on unrelated objects with admin rights. Both scans live in
-# guest-state.ps1 so the inspection that decides this component is healthy uses
-# exactly the rules this repair enforces.
-Step "    scanning for junctions/symlinks that would redirect the walk"
-$reparseLinks = Get-TraversalLinkPath -Path $SyncRoot
+# Refuse to walk a tree containing junctions or symlinks: icacls /T would follow
+# one out of the sync root and mutate ACLs on unrelated objects with admin
+# rights. This same pass also records protected child DACLs, so the library is
+# not enumerated twice before repair.
+Step "    scanning traversal links and child ACLs"
+$treeScan = Get-BridgeAclScan -Path $SyncRoot
+$reparseLinks = $treeScan.TraversalLink
 if (@($reparseLinks).Count -gt 0) {
     throw ("refusing to touch ACLs: junction/symlink(s) inside the sync root would redirect " +
            "the recursive walk outside it: " + ($reparseLinks -join '; ') +
            " -- remove them and re-run")
 }
+$protected = $treeScan.Protected
 
 Invoke-Icacls @($SyncRoot, '/remove:g', $ShareUser, '/T', '/C', '/Q') 'normalizing syncshare ACLs'
 Invoke-Icacls @($SyncRoot, "/grant", "${ShareUser}:(OI)(CI)M", '/Q') 'granting sync-root access'
 
-Step "    scanning for protected child DACLs that do not inherit"
-$protected = Get-ProtectedDaclPath -Path $SyncRoot
 if (@($protected).Count -gt 0) {
     Write-Warning "$($protected.Count) object(s) below the sync root have a protected DACL and do not inherit:"
     foreach ($p in ($protected | Select-Object -First 50)) { Write-Host "      $p" }
