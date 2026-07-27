@@ -76,7 +76,7 @@ $ShareUser = "syncshare"
 # behavior, so a GUI shipped alongside a newer agent can say so. The GUI carries
 # the same number in bridge.py and a test compares the two literals.
 $ProtocolVersion = 1
-$AgentBuild      = 5
+$AgentBuild      = 6
 
 # Cloud Files / FILE_ATTRIBUTE values.
 # DIRECTORY and UNPINNED are listed for reference and are deliberately unused:
@@ -208,7 +208,11 @@ public static class IcloudBridgeNative {
         uint InfoBufferLength, out uint ReturnedLength);
 
     // \\?\ form so deep trees enumerate; components are still <= 255 chars.
-    static string Long(string path) {
+    // Public because the ACL helpers need the same form: .NET Framework's
+    // path-based GetAccessControl/SetAccessControl reject anything over
+    // MAX_PATH with "Invalid name", and this is the one place that knows how a
+    // path is lengthened.
+    public static string Long(string path) {
         if (path.StartsWith(@"\\?\")) return path;
         if (path.StartsWith(@"\\"))   return @"\\?\UNC\" + path.Substring(2);
         return @"\\?\" + path;
@@ -679,17 +683,29 @@ function Get-FullFromRelative {
 
 # ===================================================================== ACLs ==
 
+# Both take the \\?\ form. The managed ACL APIs are path-based and apply the
+# legacy MAX_PATH check, so a 277-character item inside a real library fails
+# with "Invalid name" and its exclusion silently never gets enforced. The
+# enumerator has always used this form; the ACL pass has to agree with it, or
+# the two disagree about which files exist. The switches that are supposed to
+# lift the limit (UseLegacyPathHandling / BlockLongPaths) do not help under
+# PowerShell 5.1, which has already cached the legacy behavior: verified in the
+# guest, where only the prefixed form succeeds, for get and set, on both a long
+# directory and a long file.
+
 function Get-DaclSecurity {
     param([string]$Full, [bool]$IsDirectory)
     $sections = [Security.AccessControl.AccessControlSections]::Access
-    if ($IsDirectory) { return [IO.Directory]::GetAccessControl($Full, $sections) }
-    return [IO.File]::GetAccessControl($Full, $sections)
+    $long = [IcloudBridgeNative]::Long($Full)
+    if ($IsDirectory) { return [IO.Directory]::GetAccessControl($long, $sections) }
+    return [IO.File]::GetAccessControl($long, $sections)
 }
 
 function Set-DaclSecurity {
     param([string]$Full, [bool]$IsDirectory, $Security)
-    if ($IsDirectory) { [IO.Directory]::SetAccessControl($Full, $Security) }
-    else              { [IO.File]::SetAccessControl($Full, $Security) }
+    $long = [IcloudBridgeNative]::Long($Full)
+    if ($IsDirectory) { [IO.Directory]::SetAccessControl($long, $Security) }
+    else              { [IO.File]::SetAccessControl($long, $Security) }
 }
 
 function New-TargetDenyRule {

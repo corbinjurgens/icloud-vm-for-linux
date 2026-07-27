@@ -245,6 +245,34 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-27 — Long paths in a real library, and a guest clock seven hours out (`agentBuild` 5 → 6)
+
+Two faults that only a real library and a real guest could show, both found by
+watching the first agent that could actually publish status.
+
+**ACL reconciliation stopped at 277 characters.** The first full scan (60 154
+entries) ended with `lastError: ACL reconciliation failed on '…' : Invalid
+name`. .NET Framework's path-based `GetAccessControl`/`SetAccessControl` apply
+the legacy `MAX_PATH` check, so any item whose full path exceeds 260 characters
+— ordinary in a synced library — could not be read or written, which means an
+exclusion on such an item would never have been enforced. The agent's native
+enumerator has always used the `\\?\` form; the ACL helpers now use the same
+one, through the existing `Long()` helper rather than a second copy of the rule.
+The documented escape hatches do not work here: `UseLegacyPathHandling` and
+`BlockLongPaths` were both tried live and PowerShell 5.1 has already cached the
+legacy behavior. Verified in the guest first — get and set, long directory and
+long file, at 274 and 280 characters — then confirmed on the live library:
+`lastError: none`, 60 154 entries in 29 s.
+
+**The guest's UTC was seven hours ahead of the host's.** QEMU presents the RTC
+in UTC and Windows assumed it was local time, so a guest Setup had placed in
+Pacific time computed a UTC hours ahead. The desktop clock coincidentally
+matched the host's UTC, which is what makes this easy to miss, but every stamp
+the agent and orchestrator publish was future-dated — and D23 correctly refuses
+to call a future-dated status fresh. `01-debloat.ps1` now sets
+`RealTimeIsUniversal` and the UTC zone at install, and the running guest was
+corrected in place.
+
 ### 2026-07-27 — Every JSON writer could publish exactly once (`agentBuild` 4 → 5)
 
 With a working agent finally running, the guest rebooted, the agent restarted,

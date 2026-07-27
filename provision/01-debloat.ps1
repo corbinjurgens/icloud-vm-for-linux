@@ -7,6 +7,24 @@
 # the thin-provisioned qcow2 image on the host (v2 plan section 8.1).
 $ErrorActionPreference = "Continue"
 
+# --- The RTC is UTC, and Windows must be told so ---
+# QEMU presents the emulated clock in UTC; Windows assumes the RTC holds local
+# time. Left alone, a guest that Setup placed in Pacific time reads a UTC RTC as
+# a Pacific wall clock and computes a UTC that is hours ahead of the host's -
+# observed live as a 7-hour skew. Nothing in the guest looks wrong (the desktop
+# clock even matches the host's UTC by coincidence), but every UTC stamp the
+# agent and the orchestrator publish is future-dated, and D23 reads a
+# future-dated status exactly as it should: not fresh. Both halves are set, so
+# the guest is correct whichever way a later Windows build resolves the RTC, and
+# the displayed local time is then the same UTC the host reasons in.
+$tzKey = "HKLM:\SYSTEM\CurrentControlSet\Control\TimeZoneInformation"
+Set-ItemProperty -Path $tzKey -Name RealTimeIsUniversal -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+& tzutil.exe /s UTC
+# Takes full effect at the next boot, when Windows re-reads the RTC. A running
+# session is nudged now so the first provisioning run does not publish skewed
+# stamps; a failure here is not fatal, because the boot after this fixes it.
+& w32tm.exe /resync /force 2>&1 | Out-Null
+
 # --- Services not needed on a sync appliance ---
 # NEVER extend this list with: AppXSvc, ClipSVC, InstallService, LicenseManager,
 # StorSvc, DoSvc, wuauserv, cryptsvc (Store/servicing stack - hard rule 5, D3/D12),
