@@ -53,7 +53,8 @@ the security, lifecycle, Files On-Demand, and no-secret contracts in
 
 ### I-012 — The inspection scan owes the host a heartbeat
 
-**Status:** Open. **Evidence:** D44's table states that the bridge-boundary
+**Status:** Implemented 2026-07-28; live completion gate pending. **Evidence:**
+D44's table states that the bridge-boundary
 scan "writes heartbeats", and §4.1 makes 120 s of frozen status mtime during an
 active phase a "stalled" warning. The implementation cannot do either:
 `Get-GuestChecklist` lives in `guest-state.ps1`, which is deliberately
@@ -65,12 +66,12 @@ threshold with about a third to spare, so nothing warned this time — but the
 scan is proportional to library size, and the first symptom on a larger one is
 the app calling a healthy run stalled.
 
-The fix is an explicitly injected callback — `Get-GuestChecklist -Heartbeat
-{ Write-Heartbeat }`, invoked periodically inside the traversal-link and
-protected-DACL walks — not ambient I/O in `guest-state.ps1`: the pure reasoning
-functions beneath it (`Get-GuestWorkPlan`, `Get-GuestRepairDispatch`) must stay
-pure, and the Linux fixture test depends on that. Verify by timing a run whose
-inspection exceeds 120 s and confirming the app shows no stall.
+The orchestrator now injects a throttled callback into `Get-GuestChecklist`;
+both proportional scans invoke it while walking, without adding ambient I/O to
+`guest-state.ps1` or its pure reasoning functions. The Linux fixture proves
+both callback paths. The live run that exposed this still needs the updated
+watcher payload and a retry; completion is a scan lasting over 120 s without the
+app showing a frozen-heartbeat warning.
 
 ### I-001 — Close the live-hardware acceptance matrix
 

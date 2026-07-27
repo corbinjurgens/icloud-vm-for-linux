@@ -12,10 +12,12 @@
 # reason inspection and reasoning are separated in the first place.
 #
 # Scope limit, stated because it is easy to overclaim: nothing here executes a
-# Windows probe, an ACL read, an SMB cmdlet or a scheduled task, and PowerShell 7
-# on Linux parses a superset of the Windows PowerShell 5.1 the guest runs. This
-# proves the state machine's contract and nothing else. M5 on the real host is
-# the Windows proof.
+# Windows cmdlet or scheduled task. The callback checks below walk this script's
+# small source directory; ACL reads are unsupported on Linux and are caught by
+# the production scanner. PowerShell 7 on Linux parses a superset of the Windows
+# PowerShell 5.1 the guest runs. This proves the state machine and callback
+# wiring contracts, not the Windows probes or ACL results. M5 on the real host
+# is the Windows proof.
 #
 # Idempotent and read-only: it reads one script and writes nothing.
 
@@ -85,6 +87,19 @@ CheckThrows 'a non-zero exit throws' { Assert-NativeExitCode -ExitCode 5 -What '
 CheckThrows 'a null exit throws'     { Assert-NativeExitCode -ExitCode $null -What 'icacls' }
 Assert-NativeExitCode -ExitCode 0 -What 'icacls'
 $script:pass++
+
+# ------------------------------------------------ inspection heartbeat -------
+# Both proportional walks must invoke the explicitly injected callback. The
+# callback itself owns cadence; these functions only guarantee opportunities.
+
+Write-Host '==> inspection heartbeat callback'
+$script:heartbeatCalls = 0
+Get-TraversalLinkPath -Path $PSScriptRoot -Heartbeat { $script:heartbeatCalls++ } | Out-Null
+Check 'traversal-link walk invokes callback' ([string]($script:heartbeatCalls -gt 0)) 'True'
+
+$script:heartbeatCalls = 0
+Get-BridgeAclScan -Path $PSScriptRoot -Heartbeat { $script:heartbeatCalls++ } | Out-Null
+Check 'ACL walk invokes callback' ([string]($script:heartbeatCalls -gt 0)) 'True'
 
 # --------------------------------------------------------- normalizers -------
 # Every normalizer must be total, and an observation that could not be taken at

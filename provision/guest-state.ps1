@@ -421,24 +421,39 @@ function Test-IsTraversalLink {
 
 function Add-TraversalLinkPath {
     # Recursive worker for Get-TraversalLinkPath. Never descends through a link.
-    param([string]$Dir, [System.Collections.Generic.List[string]]$Found)
+    param(
+        [string]$Dir,
+        [System.Collections.Generic.List[string]]$Found,
+        [scriptblock]$Heartbeat,
+        [hashtable]$Progress
+    )
+    if ($null -ne $Heartbeat) { & $Heartbeat }
     $children = @()
     try { $children = Get-ChildItem -LiteralPath $Dir -Force -ErrorAction Stop } catch {
         Write-Warning "cannot enumerate ${Dir}: $($_.Exception.Message)"
         return
     }
     foreach ($c in $children) {
+        $Progress.Entries = [int]$Progress.Entries + 1
+        if ($null -ne $Heartbeat -and ([int]$Progress.Entries % 128) -eq 0) {
+            & $Heartbeat
+        }
         if (Test-IsTraversalLink $c) { $Found.Add($c.FullName); continue }
-        if ($c -is [IO.DirectoryInfo]) { Add-TraversalLinkPath -Dir $c.FullName -Found $Found }
+        if ($c -is [IO.DirectoryInfo]) {
+            Add-TraversalLinkPath -Dir $c.FullName -Found $Found `
+                -Heartbeat $Heartbeat -Progress $Progress
+        }
     }
 }
 
 function Get-TraversalLinkPath {
     # Read-only scan for junctions/symlinks that would take a recursive icacls or
     # a protected-DACL walk outside the sync root.
-    param([Parameter(Mandatory)][string]$Path)
+    param([Parameter(Mandatory)][string]$Path, [scriptblock]$Heartbeat)
     $found = New-Object System.Collections.Generic.List[string]
-    Add-TraversalLinkPath -Dir $Path -Found $found
+    $progress = @{ Entries = 0 }
+    Add-TraversalLinkPath -Dir $Path -Found $found `
+        -Heartbeat $Heartbeat -Progress $progress
     return , $found.ToArray()
 }
 
@@ -448,11 +463,18 @@ function Add-BridgeAclScan {
     param(
         [string]$Dir,
         [System.Collections.Generic.List[string]]$Protected,
-        [System.Collections.Generic.List[string]]$LegacyAllow
+        [System.Collections.Generic.List[string]]$LegacyAllow,
+        [scriptblock]$Heartbeat,
+        [hashtable]$Progress
     )
+    if ($null -ne $Heartbeat) { & $Heartbeat }
     $children = @()
     try { $children = Get-ChildItem -LiteralPath $Dir -Force -ErrorAction Stop } catch { return }
     foreach ($c in $children) {
+        $Progress.Entries = [int]$Progress.Entries + 1
+        if ($null -ne $Heartbeat -and ([int]$Progress.Entries % 128) -eq 0) {
+            & $Heartbeat
+        }
         if (Test-IsTraversalLink $c) { continue }   # TOCTOU guard
         $isDir = $c -is [IO.DirectoryInfo]
         try {
@@ -474,7 +496,10 @@ function Add-BridgeAclScan {
                 break
             }
         } catch { }
-        if ($isDir) { Add-BridgeAclScan -Dir $c.FullName -Protected $Protected -LegacyAllow $LegacyAllow }
+        if ($isDir) {
+            Add-BridgeAclScan -Dir $c.FullName -Protected $Protected `
+                -LegacyAllow $LegacyAllow -Heartbeat $Heartbeat -Progress $Progress
+        }
     }
 }
 
@@ -482,10 +507,12 @@ function Get-BridgeAclScan {
     # Read-only sweep below the sync root for the two conditions section 4.2 names:
     # children whose DACL does not inherit (so the root syncshare grant never
     # reaches them), and legacy explicit syncshare allows left by v1's /T.
-    param([Parameter(Mandatory)][string]$Path)
+    param([Parameter(Mandatory)][string]$Path, [scriptblock]$Heartbeat)
     $protected = New-Object System.Collections.Generic.List[string]
     $legacy = New-Object System.Collections.Generic.List[string]
-    Add-BridgeAclScan -Dir $Path -Protected $protected -LegacyAllow $legacy
+    $progress = @{ Entries = 0 }
+    Add-BridgeAclScan -Dir $Path -Protected $protected -LegacyAllow $legacy `
+        -Heartbeat $Heartbeat -Progress $progress
     [pscustomobject]@{ Protected = $protected.ToArray(); LegacyAllow = $legacy.ToArray() }
 }
 
@@ -637,7 +664,7 @@ function Read-DataShareObservation {
 }
 
 function Read-BridgeBoundaryObservation {
-    param([bool]$DependencyMet)
+    param([bool]$DependencyMet, [scriptblock]$Heartbeat)
     $obs = @{
         DependencyMet = $DependencyMet; ExclusionsSafe = $true
         TraversalLinkCount = 0; ProtectedDaclCount = 0; LegacyAllowCount = 0
@@ -664,13 +691,13 @@ function Read-BridgeBoundaryObservation {
             return $obs
         }
 
-        $links = Get-TraversalLinkPath -Path $SyncRoot
+        $links = Get-TraversalLinkPath -Path $SyncRoot -Heartbeat $Heartbeat
         $obs.TraversalLinkCount = @($links).Count
         if ($obs.TraversalLinkCount -gt 0) {
             $obs.Detail = "junction/symlink inside the sync root: " + (@($links)[0])
             return $obs
         }
-        $scan = Get-BridgeAclScan -Path $SyncRoot
+        $scan = Get-BridgeAclScan -Path $SyncRoot -Heartbeat $Heartbeat
         $obs.ProtectedDaclCount = @($scan.Protected).Count
         $obs.LegacyAllowCount = @($scan.LegacyAllow).Count
         if ($obs.ProtectedDaclCount -gt 0) {
@@ -790,7 +817,7 @@ function Get-GuestChecklist {
     # The complete read-only inspection, run before the first mutation and again
     # in the verifying pass. Downstream probes whose dependency is unmet report
     # 'pending' rather than a meaningless answer (D44).
-    param([Parameter(Mandatory)][string]$StagedDir)
+    param([Parameter(Mandatory)][string]$StagedDir, [scriptblock]$Heartbeat)
 
     $stagedAgent = Join-Path $StagedDir 'agent.ps1'
     $agentSid = $null
@@ -817,7 +844,8 @@ function Get-GuestChecklist {
     $dataState = Resolve-DataShareState $dataObs
     $result['dataShare'] = New-GuestCheckResult -Id 'dataShare' -State $dataState
 
-    $boundaryObs = Read-BridgeBoundaryObservation -DependencyMet ($syncOk -and $accountState -ne 'missing')
+    $boundaryObs = Read-BridgeBoundaryObservation `
+        -DependencyMet ($syncOk -and $accountState -ne 'missing') -Heartbeat $Heartbeat
     $result['bridgeBoundary'] = New-GuestCheckResult -Id 'bridgeBoundary' `
         -State (Resolve-BridgeBoundaryState $boundaryObs) -Detail ([string]$boundaryObs['Detail'])
 

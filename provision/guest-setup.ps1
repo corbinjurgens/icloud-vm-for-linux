@@ -258,9 +258,19 @@ $script:Inspected = $null
 
 function Update-Inspection {
     # The complete read-only checklist, used before the first mutation and again
-    # in the verifying pass. It never mutates anything, so calling it twice is
-    # free of consequence beyond the walk cost.
-    $script:Inspected = Get-GuestChecklist -StagedDir $PSScriptRoot
+    # in the verifying pass. The inspection remains read-only; the injected
+    # callback only keeps this orchestrator's existing status document fresh.
+    $heartbeatState = @{ Last = [DateTime]::UtcNow }
+    $heartbeatInterval = $HeartbeatSeconds
+    $heartbeat = {
+        $now = [DateTime]::UtcNow
+        if (($now - $heartbeatState.Last).TotalSeconds -ge $heartbeatInterval) {
+            Write-Heartbeat
+            $heartbeatState.Last = $now
+        }
+    }.GetNewClosure()
+    $script:Inspected = Get-GuestChecklist -StagedDir $PSScriptRoot `
+        -Heartbeat $heartbeat
     $script:Checks = ConvertTo-GuestCheckStateMap $script:Inspected
     return $script:Checks
 }

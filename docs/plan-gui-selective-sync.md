@@ -1006,7 +1006,10 @@ Rules a weaker model must not improvise around:
   be slow. The orchestrator rewrites a heartbeat at least every 30 s during both
   waits and while each child process runs, which is what makes 120 s of silence
   meaningful. The two waiting phases have the heartbeat check and no elapsed
-  deadline.
+  deadline. The read-only checklist injects that same heartbeat into both
+  proportional bridge-boundary walks, so a large library remains visibly live
+  during `inspecting` and `verifying` without putting ambient status I/O into
+  `guest-state.ps1`.
 - The sign-in wait is unbounded but not passive. `winget` returns before the
   MSIX registration is necessarily usable, so the orchestrator waits up to two
   minutes for the package to report itself installed before it activates the
