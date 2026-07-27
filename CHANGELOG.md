@@ -51,6 +51,27 @@ These are ordered by current value. They are not commitments and must preserve
 the security, lifecycle, Files On-Demand, and no-secret contracts in
 `CONTRIBUTING.md`.
 
+### I-012 — The inspection scan owes the host a heartbeat
+
+**Status:** Open. **Evidence:** D44's table states that the bridge-boundary
+scan "writes heartbeats", and §4.1 makes 120 s of frozen status mtime during an
+active phase a "stalled" warning. The implementation cannot do either:
+`Get-GuestChecklist` lives in `guest-state.ps1`, which is deliberately
+side-effect-free, so nothing refreshes the status while it walks the library.
+Measured on the author's guest during the first app-driven run: `inspecting`
+held for **82 s** (09:39:12 → 09:40:34) and `verifying` for **81 s** (09:40:46 →
+09:42:07), both silent, on a 60 000-entry library. That is inside the 120 s
+threshold with about a third to spare, so nothing warned this time — but the
+scan is proportional to library size, and the first symptom on a larger one is
+the app calling a healthy run stalled.
+
+The fix is an explicitly injected callback — `Get-GuestChecklist -Heartbeat
+{ Write-Heartbeat }`, invoked periodically inside the traversal-link and
+protected-DACL walks — not ambient I/O in `guest-state.ps1`: the pure reasoning
+functions beneath it (`Get-GuestWorkPlan`, `Get-GuestRepairDispatch`) must stay
+pure, and the Linux fixture test depends on that. Verify by timing a run whose
+inspection exceeds 120 s and confirming the app shows no stall.
+
 ### I-001 — Close the live-hardware acceptance matrix
 
 **Status:** Candidate, highest priority  
