@@ -169,10 +169,13 @@ Numbering is stable; completed items are removed without renumbering.
    `-Install` time and refresh it at task start; the app could then say
    *before* staging whether a watcher is present and, when absent, lead with
    the one-liner instead of a counter and a delayed hint. Needs the §4.1
-   protocol table updated in the same commit. Check
-   `C:\OEM\watcher-install.log` on the live guest first: if OEM registration
-   failed there, that failure is the primary bug and this item is its
-   detection.
+   protocol table updated in the same commit. Root cause of the live failure
+   FOUND 2026-07-27: UTF-8 em dashes parsed as CP1252 by PowerShell 5.1 broke
+   `watcher.ps1` outright (see CHANGELOG "Guest scripts are pure ASCII"); the
+   OEM registration and the bootstrap both failed on the same parser error.
+   Fixed and mechanically guarded the same day. This item remains valid as
+   *detection*: had the beacon existed, the app would have said "no watcher"
+   at staging time instead of counting silently.
 
    Amendment from the live walkthrough: the bootstrap hint's command must be
    *typeable through the web viewer*. The operator could neither paste into
