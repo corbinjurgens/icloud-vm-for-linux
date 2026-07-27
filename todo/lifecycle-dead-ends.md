@@ -174,6 +174,20 @@ Numbering is stable; completed items are removed without renumbering.
    failed there, that failure is the primary bug and this item is its
    detection.
 
+   Amendment from the live walkthrough: the bootstrap hint's command must be
+   *typeable through the web viewer*. The operator could neither paste into
+   noVNC nor type a backslash (host keyboard layout vs the guest's `en-US`),
+   so the UNC form `\\host.lan\Provision\watcher.ps1` was effectively
+   unusable. On any OEM-built VM the identical script already sits at
+   `C:\OEM\watcher.ps1`, and Windows accepts forward slashes, so the hint
+   should lead with
+   `powershell -ep bypass -File C:/OEM/watcher.ps1 -Install`
+   (short, no backslash, no paste needed) and keep the UNC form only as the
+   fallback for pre-feature VMs with no `C:\OEM` payload. Mention RDP
+   (published on 127.0.0.1:3389 for exactly this) as the comfortable route:
+   a real RDP client gives working clipboard and the operator's own
+   keyboard layout.
+
 10. **Evaluate a host->guest execution channel (QEMU guest agent) as a
     deliberate decision — or reject it in the register.** Operator question,
     2026-07-27, from living through item 9's failure mode: "can the app not
