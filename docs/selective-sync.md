@@ -124,6 +124,15 @@ when they are fully uploaded and unmodified: a file that is modified, still
 uploading, not a cloud placeholder, or that the agent cannot inspect holds the
 item at `pending-dehydrate` whatever its size.
 
+The one exception to "fully uploaded and unmodified" is `desktop.ini`, the
+hidden file Windows itself writes into folders to remember their view
+settings. Windows rewrites it at every boot, and iCloud can leave it flagged
+as modified indefinitely afterwards — which would put these items back at
+`pending-dehydrate` after each reboot for a file that contains no user
+content and that Windows recreates on its own. A `desktop.ini` within the
+same small-file limit therefore counts as tolerated residue regardless of
+its upload state.
+
 Once a folder has settled at `applied`, the agent stops re-walking it every
 minute and re-confirms it about every ten minutes instead — the same cadence the
 folder tree already refreshes at. Only the displayed size can lag; the

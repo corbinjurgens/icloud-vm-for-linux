@@ -269,6 +269,25 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-28 — Boot-rewritten `desktop.ini` no longer holds exclusions yellow (`agentBuild` 8 → 9)
+
+Live follow-up to D46 (`9cac9c6`, recorded as D47). With everything else
+released, three app-container roots stayed at `pending-dehydrate` because
+their only remaining allocation was `desktop.ini` — rewritten by the shell at
+boot (after the iCloud client's startup scan) and left flagged "modified" by
+the client for over an hour, with re-requests and a fresh change event both
+failing to move it. Every reboot would have re-opened that window.
+
+A cloud placeholder named `desktop.ini` carrying `HIDDEN`+`SYSTEM` within the
+one-cluster residue bound now passes the D46 sync gate and is reported as
+residue instead of blocking `applied`. The gate exists so `applied` never
+hides the only good copy of user data; `desktop.ini` is per-machine
+folder-view configuration the shell regenerates on its own, so nothing a user
+made can be lost. All other names keep the full in-sync requirement.
+
+**Operator step: redeploy the agent** (`agentBuild` 9) and reinstall the
+rebuilt package so the GUI matches.
+
 ### 2026-07-28 — A healthy provisioning run walked the full library four times
 
 The provisioning checklist scanned the iCloud tree once for traversal links
