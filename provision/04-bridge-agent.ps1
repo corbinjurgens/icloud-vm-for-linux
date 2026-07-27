@@ -1,4 +1,4 @@
-# ============ 04-bridge-agent.ps1 — run as Administrator ============
+# ============ 04-bridge-agent.ps1 - run as Administrator ============
 # Install the v2 bridge: control share, guest agent task, Access-Based
 # Enumeration on the data share, and the ACL boundaries the agent depends on.
 #
@@ -40,7 +40,7 @@ $ErrorActionPreference = 'Stop'
 # means. Never derived from the elevated process's profile (v2 plan section 4).
 $stateLib = Join-Path $PSScriptRoot 'guest-state.ps1'
 if (-not (Test-Path -LiteralPath $stateLib)) {
-    throw "missing $stateLib — guest-state.ps1 must sit beside this script"
+    throw "missing $stateLib - guest-state.ps1 must sit beside this script"
 }
 . $stateLib
 
@@ -88,14 +88,14 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     throw "run this script from an elevated PowerShell (Administrator)"
 }
 if ($doAgent -and -not (Test-Path -LiteralPath $SourceScript)) {
-    throw "missing $SourceScript — agent.ps1 must sit beside this script (copy guest-agent/agent.ps1 into provision/ before building)"
+    throw "missing $SourceScript - agent.ps1 must sit beside this script (copy guest-agent/agent.ps1 into provision/ before building)"
 }
 if (-not (Test-Path -LiteralPath $SyncRoot)) {
-    throw "missing sync root $SyncRoot — finish the Apple ID sign-in and the initial sync first"
+    throw "missing sync root $SyncRoot - finish the Apple ID sign-in and the initial sync first"
 }
 foreach ($u in @($AgentUser, $ShareUser)) {
     if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
-        throw "local account '$u' does not exist — run 03-create-share.ps1 first"
+        throw "local account '$u' does not exist - run 03-create-share.ps1 first"
     }
 }
 
@@ -179,8 +179,8 @@ if (@($protected).Count -gt 0) {
 
 # ============================ 4. agent ACL authority (D28) ==================
 # Editing a DACL needs WRITE_DAC. An owner has it implicitly, but ownership of
-# a new object depends on who created it — cloud-created items are owned by
-# icloud, items created through SMB may be owned by syncshare — so grant it
+# a new object depends on who created it - cloud-created items are owned by
+# icloud, items created through SMB may be owned by syncshare - so grant it
 # explicitly by SID and nothing else. No WO, no D, no data access. The ACE
 # names icloud, never syncshare, so it cannot weaken an exclusion deny.
 Step "4/9 Granting the agent RC,WDAC on the sync root"
@@ -202,7 +202,7 @@ foreach ($p in $protected) {
 }
 if ($failedRepairs.Count -gt 0) {
     throw ("could not repair the protected DACLs on: " + ($failedRepairs -join '; ') +
-           " — fix these objects by hand and re-run; nothing else was reset")
+           " - fix these objects by hand and re-run; nothing else was reset")
 }
 if (@($protected).Count -gt 0) {
     throw ("$(@($protected).Count) object(s) below the sync root carry a protected DACL, so they no " +
@@ -225,7 +225,7 @@ if (@($protected).Count -gt 0) {
 function Assert-NoShareUserWrite {
     param([string]$Path, [bool]$IsDirectory)
     if (-not (Test-NoShareUserWrite -Path $Path -IsDirectory $IsDirectory)) {
-        throw "$ShareUser has write access to $Path — the D27 privilege boundary is not in place"
+        throw "$ShareUser has write access to $Path - the D27 privilege boundary is not in place"
     }
 }
 
@@ -273,7 +273,7 @@ if ($check.Path -ne $IoDir) { throw "the '$ShareName' share resolved to $($check
 # `ls /mnt/icloud`: SMB omits entries the connecting user cannot read (D15).
 Step "7/9 Enabling Access-Based Enumeration on the '$DataShare' share"
 if (-not (Get-SmbShare -Name $DataShare -ErrorAction SilentlyContinue)) {
-    throw "the '$DataShare' share does not exist — run 03-create-share.ps1 first"
+    throw "the '$DataShare' share does not exist - run 03-create-share.ps1 first"
 }
 Set-SmbShare -Name $DataShare -FolderEnumerationMode AccessBased -Force | Out-Null
 }   # end of the Boundary-scope share/config work (steps 6-7)
@@ -295,7 +295,7 @@ $settings = New-ScheduledTaskSettingsSet -RestartCount 999 `
 Register-ScheduledTask -TaskName $TaskName -Action $action `
   -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 }
-# Step 1 stopped the task for every scope, so every scope restarts it — a
+# Step 1 stopped the task for every scope, so every scope restarts it - a
 # Boundary-only run must not leave the guest without a running agent.
 if ($null -ne (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
     Start-ScheduledTask -TaskName $TaskName
@@ -335,10 +335,10 @@ while ((Get-Date) -lt $deadline -and -not ($taskRunning -and $statusFresh)) {
     }
 }
 if (-not $taskRunning) {
-    throw "the '$TaskName' task did not reach Running — check Task Scheduler; the agent only runs in the logged-on '$AgentUser' session"
+    throw "the '$TaskName' task did not reach Running - check Task Scheduler; the agent only runs in the logged-on '$AgentUser' session"
 }
 if (-not $statusFresh) {
-    throw "no fresh $statusPath appeared within 90 s — run the agent by hand to see its error: powershell -NoProfile -ExecutionPolicy Bypass -File $AgentScript"
+    throw "no fresh $statusPath appeared within 90 s - run the agent by hand to see its error: powershell -NoProfile -ExecutionPolicy Bypass -File $AgentScript"
 }
 }   # end of the agent-runtime verification
 

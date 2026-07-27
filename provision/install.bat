@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================================
-REM  install.bat — dockur/windows OEM bootstrap.
+REM  install.bat - dockur/windows OEM bootstrap.
 REM
 REM  dockur copies this whole folder (mounted at /oem) to C:\OEM and runs this
 REM  file, as Administrator, at the final step of Windows installation.
@@ -31,19 +31,19 @@ powershell -ExecutionPolicy Bypass -NoProfile -File "C:\OEM\watcher.ps1" -Instal
 
 echo [OEM] Writing next-steps note to the desktop...
 > "C:\Users\Public\Desktop\NEXT-STEPS.txt" (
-  echo iCloud-on-Linux — remaining one-time setup:
+  echo iCloud-on-Linux - remaining one-time setup:
   echo.
   echo The app on the Linux host now drives setup. You only need two things:
   echo.
   echo 1. Open the iCloud Bridge app on the Linux host and start setup there.
   echo 2. When the app asks, sign in to iCloud in this VM with your Apple ID and
   echo    complete 2FA. Turn iCloud Drive ON; LEAVE Files On-Demand ON; leave
-  echo    Photos/Mail/etc OFF. Do NOT pin the library — placeholders hydrate when
+  echo    Photos/Mail/etc OFF. Do NOT pin the library - placeholders hydrate when
   echo    the Linux host reads them ^(v2 plan D14/D25^). The app continues on its own
   echo    once the sync folder appears.
   echo.
   echo ----------------------------------------------------------------------------
-  echo FALLBACK — the full manual sequence, if the app cannot drive setup:
+  echo FALLBACK - the full manual sequence, if the app cannot drive setup:
   echo.
   echo 1. Reboot once ^(debloat has been applied^).
   echo 2. Open PowerShell as Administrator and run:

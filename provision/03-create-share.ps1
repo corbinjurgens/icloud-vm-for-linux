@@ -1,11 +1,11 @@
-# ============ 03-create-share.ps1 — run as Administrator ============
+# ============ 03-create-share.ps1 - run as Administrator ============
 # Create/repair the `syncshare` account and the `icloud` data share (v1 D8, v2
 # D15/D32). Runs INSIDE the Windows guest, AFTER the Apple ID sign-in and the
 # initial iCloud Drive sync, so that C:\Users\icloud\iCloudDrive already exists.
 #
 # Three mutually exclusive modes:
 #
-#   Manual (no switches) — the documented fallback. Set $plain below to the
+#   Manual (no switches) - the documented fallback. Set $plain below to the
 #   SHARE_PASS value from your host .env, then:
 #     powershell -ExecutionPolicy Bypass -NoProfile -File C:\OEM\03-create-share.ps1
 #
@@ -22,7 +22,7 @@
 # Idempotent, and drift-only: an already-correct account, share, service or SMB
 # setting is verified and left alone. Safe to re-run after a Windows feature
 # update (v1 plan section 10). Exit zero means the desired state was re-probed
-# and verified after the change, not merely that the cmdlets were called — an
+# and verified after the change, not merely that the cmdlets were called - an
 # orchestrator may not treat a bare exit zero as proof otherwise, because most
 # of what this script drives is non-terminating or native.
 # =====================================================================
@@ -39,7 +39,7 @@ $ErrorActionPreference = 'Stop'
 # orchestrator that dispatches it cannot disagree about what "correct" means.
 $stateLib = Join-Path $PSScriptRoot 'guest-state.ps1'
 if (-not (Test-Path -LiteralPath $stateLib)) {
-    throw "missing $stateLib — guest-state.ps1 must sit beside this script"
+    throw "missing $stateLib - guest-state.ps1 must sit beside this script"
 }
 . $stateLib
 
@@ -64,8 +64,8 @@ function Invoke-Icacls {
 }
 
 function Read-DeliveredPassword {
-    # Read the whole BOM-less UTF-8 file exactly as delivered — no newline added
-    # or removed, no quote processing — and delete it immediately, in a finally,
+    # Read the whole BOM-less UTF-8 file exactly as delivered - no newline added
+    # or removed, no quote processing - and delete it immediately, in a finally,
     # before the account is touched. The grammar is deliberately tiny (v2 plan
     # section 4.1) so the guest account and /etc/credentials-icloud cannot
     # silently receive different passwords.
@@ -95,10 +95,10 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     throw "run this script from an elevated PowerShell (Administrator)"
 }
 if (-not (Test-Path -LiteralPath $SyncRoot)) {
-    throw "missing sync root $SyncRoot — finish the Apple ID sign-in and the initial sync first"
+    throw "missing sync root $SyncRoot - finish the Apple ID sign-in and the initial sync first"
 }
 if (-not ((Get-Item -LiteralPath $SyncRoot -Force) -is [IO.DirectoryInfo])) {
-    throw "$SyncRoot exists but is not a directory — diagnose this by hand; nothing here deletes it"
+    throw "$SyncRoot exists but is not a directory - diagnose this by hand; nothing here deletes it"
 }
 
 $existingUser = Get-LocalUser -Name $ShareUser -ErrorAction SilentlyContinue

@@ -1,4 +1,4 @@
-# ============ watcher.ps1 — the elevated provisioning watcher ============
+# ============ watcher.ps1 - the elevated provisioning watcher ============
 # The only elevated code that reacts to the host. It polls the read-only
 # \\host.lan\Provision inbox for a trigger, copies the fixed payload allowlist
 # into an administrator-only per-run directory, and runs that protected copy of
@@ -6,7 +6,7 @@
 #
 # Runs INSIDE the Windows guest. Two modes:
 #
-#   Install (elevated, once per VM — provision/install.bat does this at OEM time,
+#   Install (elevated, once per VM - provision/install.bat does this at OEM time,
 #   or the operator pastes it by hand on a VM created before this feature):
 #     powershell -ExecutionPolicy Bypass -NoProfile -File C:\OEM\watcher.ps1 -Install
 #     powershell -ExecutionPolicy Bypass -NoProfile -File \\host.lan\Provision\watcher.ps1 -Install
@@ -25,13 +25,13 @@
 #      in the guest can replace a script staged there; executing it elevated
 #      would turn the deliberately limited D28 agent into an administrator.
 #      Only the protected copy under C:\ProgramData\icloud-bridge-provision runs.
-#   2. The trigger carries a version, an action, a UUID and a boolean — never a
+#   2. The trigger carries a version, an action, a UUID and a boolean - never a
 #      path, a command, a script name, or a work list. The orchestrator derives
 #      the work from its own inspection.
 #
 # This file deliberately restates its handful of constants instead of
 # dot-sourcing guest-state.ps1: only watcher.ps1 is installed into the protected
-# directory, so its envelope has to stand alone. D42 pins that envelope —
+# directory, so its envelope has to stand alone. D42 pins that envelope -
 # changing it requires re-running the bootstrap, because a running old watcher
 # cannot safely upgrade the protocol that authenticates its own replacement.
 # =========================================================================
@@ -201,7 +201,7 @@ function Install-Watcher {
     }
 
     $user = Get-LocalUser -Name $AgentUser -ErrorAction SilentlyContinue
-    if ($null -eq $user) { throw "local account '$AgentUser' does not exist — this is not a provisioned dockur guest" }
+    if ($null -eq $user) { throw "local account '$AgentUser' does not exist - this is not a provisioned dockur guest" }
     $userSid = $user.SID.Value
 
     # dockur's current answer file puts its configured local user in

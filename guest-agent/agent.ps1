@@ -1,5 +1,5 @@
 # ============================================================================
-#  agent.ps1 — iCloud bridge guest agent (v2 plan section 3)
+#  agent.ps1 - iCloud bridge guest agent (v2 plan section 3)
 #
 #  copied by 04-bridge-agent.ps1; source of truth: guest-agent/agent.ps1
 #

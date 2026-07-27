@@ -1,4 +1,4 @@
-# ============ guest-setup.ps1 — the elevated provisioning orchestrator ============
+# ============ guest-setup.ps1 - the elevated provisioning orchestrator ============
 # Inspect, reconcile, verify (v2 plan D44 and section 4.2). One run is a
 # desired-state reconciliation, never an unconditional replay of scripts 03
 # and 04: components that are already `ok` are skipped, `missing` or enumerated
@@ -16,7 +16,7 @@
 # every repair scope it dispatches is itself idempotent.
 #
 # It publishes progress to \\host.lan\Data\.provision\status.json, which is
-# guest-writable and therefore explanatory only — the host validates it
+# guest-writable and therefore explanatory only - the host validates it
 # defensively and it never authorizes anything. In the other direction this
 # script accepts no host-supplied phase list, path, command, script name,
 # account name or share name: the only things that cross the elevation boundary
@@ -137,7 +137,7 @@ function Set-Phase {
     param([Parameter(Mandatory)][string]$Phase, [string]$Detail = '')
     $script:Phase = $Phase
     $script:Detail = $Detail
-    Step "$Phase$(if ($Detail) { " — $Detail" })"
+    Step "$Phase$(if ($Detail) { " - $Detail" })"
     Write-Status
 }
 
@@ -257,7 +257,7 @@ if ($RunId -cnotmatch '^[0-9a-f]{32}$') {
 }
 $expectedRunDir = Join-Path $ProvisionRunsDir $RunId
 if ([IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\') -ne [IO.Path]::GetFullPath($expectedRunDir).TrimEnd('\')) {
-    throw "refusing to run from $PSScriptRoot — the protected run directory for $RunId is $expectedRunDir"
+    throw "refusing to run from $PSScriptRoot - the protected run directory for $RunId is $expectedRunDir"
 }
 foreach ($name in $ProvisionPayload) {
     if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot $name))) {

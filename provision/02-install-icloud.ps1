@@ -1,9 +1,9 @@
-# ============ 02-install-icloud.ps1 — run as Administrator ============
+# ============ 02-install-icloud.ps1 - run as Administrator ============
 # Installs Apple's official iCloud for Windows client.
 #
 # Fallback (if winget/msstore errors, e.g. region or Store-source issues):
 #   open Microsoft Store from Start, search "iCloud", install manually. No
-#   Microsoft account sign-in is required for free apps — if prompted, choose
+#   Microsoft account sign-in is required for free apps - if prompted, choose
 #   the option to proceed without signing in.
 # NOTE: with --source msstore the --id is the *Store product ID*, not the AppX
 # package name. Passing "AppleInc.iCloud" here fails with "No package found

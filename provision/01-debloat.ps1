@@ -1,4 +1,4 @@
-# ============ 01-debloat.ps1 — run as Administrator ============
+# ============ 01-debloat.ps1 - run as Administrator ============
 # Idempotent. Auto-run by provision/install.bat at first boot, and safe to re-run
 # after a Windows feature update reset something (plan section 10).
 #
@@ -9,12 +9,12 @@ $ErrorActionPreference = "Continue"
 
 # --- Services not needed on a sync appliance ---
 # NEVER extend this list with: AppXSvc, ClipSVC, InstallService, LicenseManager,
-# StorSvc, DoSvc, wuauserv, cryptsvc (Store/servicing stack — hard rule 5, D3/D12),
+# StorSvc, DoSvc, wuauserv, cryptsvc (Store/servicing stack - hard rule 5, D3/D12),
 # TermService (the RDP maintenance path), LanmanServer (the whole bridge),
 # Schedule (the agent's logon task, D17), W32Time (Kerberos/TLS and the Apple
 # session need sane time), CldFlt/FltMgr (Files On-Demand, D14), or
 # TabletInputService/TextInputManagementService (on Windows 11 that breaks
-# keyboard entry into Start, Settings and UWP apps — and iCloud is a Store app
+# keyboard entry into Start, Settings and UWP apps - and iCloud is a Store app
 # whose sign-in the operator types into).
 $services = @(
   "WSearch",        # Search indexer: the classic CPU/RAM hog over big sync folders
@@ -73,7 +73,7 @@ foreach ($t in $tasks) {
 # --- Defender: exclude the sync root; kill scheduled scans (D11) ---
 # Real-time protection stays ON: the guest holds a live Apple session, and a full
 # disable fights Tamper Protection anyway. Only paths this project itself churns
-# are excluded — never powershell.exe as a process.
+# are excluded - never powershell.exe as a process.
 $icloudPath = "$env:USERPROFILE\iCloudDrive"
 Add-MpPreference -ExclusionPath $icloudPath
 # The bridge control directory: the agent rewrites status.json every 15 s and the
@@ -94,7 +94,7 @@ Set-ItemProperty $au -Name AUOptions -Value 2 -Type DWord                       
 Set-ItemProperty $au -Name NoAutoRebootWithLoggedOnUsers -Value 1 -Type DWord
 
 # Delivery Optimization: HTTP only (mode 0). This kills peer caching and its
-# cache-scan I/O while leaving the DoSvc *service* running — disabling the service
+# cache-scan I/O while leaving the DoSvc *service* running - disabling the service
 # would break Store/winget downloads and therefore iCloud updates (hard rule 5).
 $do = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization"
 New-Item -Path $do -Force | Out-Null
@@ -162,7 +162,7 @@ try {
 # Reserved Storage: Windows 11 holds back ~7 GB for update staging. The D26 sweep
 # already guarantees a 20 GB free floor on this volume, so updates have scratch
 # space without the reservation, and the reclaimed space raises the distance to
-# that floor — directly fewer sweep episodes. This is Microsoft's supported knob
+# that floor - directly fewer sweep episodes. This is Microsoft's supported knob
 # and does not touch the servicing stack. It fails while servicing is in flight;
 # re-running the script later applies it.
 try {
@@ -179,7 +179,7 @@ $edge = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
 New-Item -Path $edge -Force | Out-Null
 Set-ItemProperty $edge -Name "StartupBoostEnabled" -Value 0 -Type DWord
 # Widgets board (its WebView2 hosts are the largest reclaimable RAM block in the
-# always-logged-on session). This is the Widgets *app* and its policy — the
+# always-logged-on session). This is the Widgets *app* and its policy - the
 # Evergreen WebView2 runtime that iCloud sign-in uses is a separate component and
 # stays installed (hard rule 5).
 $dsh = "HKLM:\SOFTWARE\Policies\Microsoft\Dsh"
@@ -233,7 +233,7 @@ if (Test-Path $onedrive) {
 #     `fsutil behavior set disablelastaccess 1` would silently degrade eviction
 #     ordering to LastWriteTime.
 #   * Memory compression (Disable-MMAgent -MemoryCompression): in a 3 GB guest it
-#     trades cheap CPU for avoided pagefile I/O — the right trade on qcow2.
+#     trades cheap CPU for avoided pagefile I/O - the right trade on qcow2.
 #   * Defender real-time protection: stays on (D11).
 
 Write-Host "`nDebloat complete. Reboot now with: Restart-Computer" -ForegroundColor Green

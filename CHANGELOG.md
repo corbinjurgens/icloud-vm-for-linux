@@ -245,6 +245,24 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-27 — Guest scripts are pure ASCII; PS 5.1 was parsing them as ANSI
+
+The first live OEM install failed to register the provisioning watcher, and the
+first bootstrap attempt failed the same way: a PowerShell **parser error** in
+`watcher.ps1`. Root cause: the guest scripts contained UTF-8 em dashes, and
+Windows PowerShell 5.1 (and cmd.exe) read BOM-less files as the ANSI codepage,
+not UTF-8 — the em dash's trailing `0x94` byte is a curly closing quote in
+CP1252, which terminates a double-quoted string early and breaks the whole
+parse. `make lint-ps` could never catch it, because PowerShell 7 reads the same
+bytes as UTF-8; this is exactly the 5.1-compatibility gap CONTRIBUTING warns
+about, now with a live specimen.
+
+Every em dash (and one `§`) in `provision/*.ps1`, `provision/install.bat` and
+`guest-agent/agent.ps1` is replaced with ASCII; text-only, no behaviour change.
+`tools/hygiene-checks.sh` gains a guest-scripts-are-ASCII check so the class of
+bug is mechanically extinct, and CONTRIBUTING's LF rule now states the ASCII
+requirement and why the PowerShell linter cannot enforce it.
+
 ### 2026-07-27 — The v1 plan's recovery guidance now leads with the app
 
 `docs/implementation-plan.md` still told the operator to recover by hand — edit

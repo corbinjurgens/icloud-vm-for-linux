@@ -1,4 +1,4 @@
-# ============ guest-state.ps1 — dot-sourced library, no side effects ============
+# ============ guest-state.ps1 - dot-sourced library, no side effects ============
 # The single definition of the guest's desired state: the fixed constants, the
 # fixed check-state and work-ID vocabularies, read-only probes for the eight
 # checklist rows, and the dependency-ordered work-plan derivation (v2 plan D44).
@@ -14,7 +14,7 @@
 #
 # Idempotent, and stronger than that: loading this file has no side effects. It
 # defines constants and functions and does nothing else. Nothing here repairs
-# anything, writes status, or mutates the guest — even creating a missing
+# anything, writes status, or mutates the guest - even creating a missing
 # directory counts as repair and belongs to a repair scope.
 #
 # Two layers, deliberately separated so the state machine can be tested off
@@ -410,8 +410,8 @@ function Get-StagedAgentBuild {
 
 function Test-IsTraversalLink {
     # Cloud placeholder directories also carry FILE_ATTRIBUTE_REPARSE_POINT, but
-    # PS 5.1's LinkType resolves only mount points and symlinks — exactly the two
-    # reparse tags that redirect traversal — so it is the discriminator to use
+    # PS 5.1's LinkType resolves only mount points and symlinks - exactly the two
+    # reparse tags that redirect traversal - so it is the discriminator to use
     # (v2 plan section 4 step 3; the agent applies the same rule to its walks).
     param([IO.FileSystemInfo]$Entry)
     if (($Entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) { return $false }
@@ -479,7 +479,7 @@ function Add-BridgeAclScan {
 }
 
 function Get-BridgeAclScan {
-    # Read-only sweep below the sync root for the two conditions §4.2 names:
+    # Read-only sweep below the sync root for the two conditions section 4.2 names:
     # children whose DACL does not inherit (so the root syncshare grant never
     # reaches them), and legacy explicit syncshare allows left by v1's /T.
     param([Parameter(Mandatory)][string]$Path)
@@ -629,7 +629,7 @@ function Read-DataShareObservation {
         $obs.SigningDisabled = (-not $smb.RequireSecuritySignature)
         $obs.EncryptionDisabled = ((-not $smb.EncryptData) -and (-not $smb.RejectUnencryptedAccess))
 
-        # One inheritable Modify grant at the root only (D15) — never /T.
+        # One inheritable Modify grant at the root only (D15) - never /T.
         $modify = [int][Security.AccessControl.FileSystemRights]::Modify
         $obs.RootAceOk = (Test-AceGrant -Path $SyncRoot -Identity $ShareUser -Rights $modify -IsDirectory $true)
     } catch { $obs.Error = $_.Exception.Message }

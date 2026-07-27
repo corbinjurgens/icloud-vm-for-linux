@@ -4,8 +4,9 @@
 # What:    every repo rule a machine can decide on its own — no live secret and
 #          no intact-placeholder regressions (hard rule 2), loopback-only
 #          published ports (hard rule 3), LF endings and no BOM (hard rule 8),
-#          no decorative emoji, no leftover conflict markers, the two agent.ps1
-#          copies byte-identical, and shell/Python syntax.
+#          guest-executed scripts pure ASCII (same rule — PS 5.1 reads no-BOM
+#          files as ANSI), no decorative emoji, no leftover conflict markers,
+#          the two agent.ps1 copies byte-identical, and shell/Python syntax.
 # Where:   Linux host. Deliberately takes the tree to check as an argument so
 #          the pre-commit hook can point it at a snapshot of the *index* — what
 #          is actually being committed — while `make lint` points it at the
@@ -77,6 +78,30 @@ for f in "${TEXT[@]}"; do
   fi
 done
 [ $endings -eq 0 ] && echo "PASS: ${#TEXT[@]} text files are LF, no BOM"
+
+# --------------------------------------------- guest scripts are ASCII ------
+
+# Windows PowerShell 5.1 and cmd.exe read BOM-less files as the ANSI codepage,
+# not UTF-8, so a multi-byte UTF-8 character parses as several CP1252 ones —
+# and an em dash's trailing 0x94 byte is a curly closing quote there, which
+# ends a double-quoted string early and breaks the whole parse (observed live:
+# the OEM watcher registration failed exactly this way). The repo is no-BOM by
+# hard rule 8, so everything the guest executes must stay plain ASCII.
+
+echo "==> guest scripts are ASCII-only"
+gascii=0 gcount=0
+for f in "${TEXT[@]}"; do
+  case "$f" in
+    provision/*.ps1|provision/*.bat|guest-agent/*.ps1) ;;
+    *) continue ;;
+  esac
+  gcount=$((gcount + 1))
+  if LC_ALL=C grep -q -P '[^\x00-\x7F]' "$ROOT/$f" 2>/dev/null; then
+    bad "$f: non-ASCII byte — PS 5.1/cmd.exe read this file as ANSI, not UTF-8"
+    gascii=1
+  fi
+done
+[ $gascii -eq 0 ] && echo "PASS: $gcount guest scripts are pure ASCII"
 
 # ------------------------------------------------------ conflict markers ----
 

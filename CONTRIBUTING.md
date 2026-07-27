@@ -226,10 +226,18 @@ Host shell scripts use `#!/usr/bin/env bash`. Setup scripts use
 use `set -u` so they report all failures. Root-requiring scripts check `id -u`
 up front and exit 1 with a message.
 
-### Keep LF line endings
+### Keep LF line endings, and keep guest scripts pure ASCII
 
 The batch and PowerShell files run correctly from LF under dockur. Do not
 introduce CRLF or a whole-file line-ending diff.
+
+Everything the guest executes — `provision/*.ps1`, `provision/*.bat`, and
+`guest-agent/*.ps1` — must contain only ASCII. Windows PowerShell 5.1 and
+cmd.exe read BOM-less files as the ANSI codepage, not UTF-8, so a multi-byte
+character parses as CP1252 garbage; an em dash inside a double-quoted string
+ends the string early and breaks the whole parse. `make lint-ps` cannot catch
+this (PowerShell 7 reads the same bytes as UTF-8), so the hygiene checker
+enforces it mechanically.
 
 ## Working alongside other sessions
 
@@ -326,9 +334,9 @@ make deb    # additionally, when packaging or install paths changed
 
 `make check` runs the shared hygiene checks, Docker Compose validation, optional
 linters, and `pytest gui/tests`. The hygiene checker covers secrets and
-placeholders, loopback ports, LF/no-BOM, conflict markers, agent-copy equality,
-executable bits, and shell/Python syntax. Missing optional tools print an
-explicit `SKIP:`.
+placeholders, loopback ports, LF/no-BOM, guest-script ASCII, conflict markers,
+agent-copy equality, executable bits, and shell/Python syntax. Missing optional
+tools print an explicit `SKIP:`.
 
 The pre-commit hook lists the paths being committed and checks a snapshot of
 the exact tree being committed. The commit-message hook enforces the subject
