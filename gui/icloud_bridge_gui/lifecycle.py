@@ -342,6 +342,10 @@ _ENTER_PROVISIONING = (
     Effect.MARK_CONTAINER_RUNNING,
     Effect.STOP_POLLING,
     Effect.QUIESCE_IO,
+    # The startup resume path (D39) arrives here with the "Checking the
+    # Windows VM..." banner still up; every other door happens to enter with
+    # no banner showing. Hiding is idempotent, so all doors clear it.
+    Effect.HIDE_BANNER,
     Effect.SHOW_SETUP_TAB,
     Effect.CLEAR_SETUP_CHECKS,
     Effect.RENDER_SETUP,
