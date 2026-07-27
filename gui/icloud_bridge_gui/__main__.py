@@ -80,10 +80,12 @@ GUEST_BOOTSTRAP_COMMAND = (
     r"powershell -ExecutionPolicy Bypass -NoProfile -File "
     r"\\host.lan\Provision\watcher.ps1 -Install")
 GUEST_BOOTSTRAP_NOTE = (
-    "The VM has not picked this up yet, and this app keeps waiting. A VM "
-    "created before automated provisioning has no watcher task, so run this "
-    "once in an elevated PowerShell inside the VM — the request already staged "
-    "here is then picked up with no further click.")
+    "The VM has not picked this up yet, and this app keeps waiting. Either the "
+    "VM has no watcher task — one created before automated provisioning never "
+    "had one — or its watcher is running but cannot start this request. Run "
+    "this once in an elevated PowerShell inside the VM; it stops any running "
+    "watcher and reinstalls it, and the request already staged here is then "
+    "picked up with no further click.")
 
 PROVISION_WINDOWS_INSTALLING = (
     "Windows is still installing — this app cannot reach it yet. Watch the VM "

@@ -196,6 +196,53 @@ function Remove-SupersededRun {
     }
 }
 
+# ------------------------------------------------------- liveness envelope ---
+
+function New-KeepAliveTrigger {
+    # What actually keeps the watcher alive. Not RestartCount: Task Scheduler's
+    # restart-on-failure does not fire when the action itself exits non-zero -
+    # measured in the guest, where a task exiting 3 with RestartCount 3 and a
+    # one-minute interval was never relaunched in three minutes. A repetition
+    # trigger does fire: with MultipleInstances IgnoreNew it is a no-op while the
+    # watcher is running, and it starts the watcher again within a minute of any
+    # exit - a crash, a kill, or the deliberate exit below. Measured the same
+    # way: relaunches at 09:56:03, 09:57:03, 09:58:02 after clean exits.
+    #
+    # The repetition is dated from midnight today so it is already inside its
+    # window when registered, and bounded by a decade rather than an infinite
+    # duration, which Task Scheduler rejects through this cmdlet.
+    New-ScheduledTaskTrigger -Once -At (Get-Date).Date `
+        -RepetitionInterval (New-TimeSpan -Minutes 1) `
+        -RepetitionDuration (New-TimeSpan -Days 3650)
+}
+
+function Get-WatcherDigest {
+    # Identity of the file this process was started from, so a refresh of the
+    # installed copy is detectable from inside the loop.
+    try { return (Get-FileHash -LiteralPath $InstalledWatcher -Algorithm SHA256).Hash }
+    catch { return '' }
+}
+
+function Confirm-KeepAlive {
+    # A guest registered before the keep-alive existed would otherwise never get
+    # it: the task definition is written only by -Install, and the operator has
+    # no reason to re-run it while the watcher looks fine. The watcher is
+    # already elevated, and this adds the missing trigger to its own task
+    # without disturbing the running instance. A failure here is a warning: the
+    # watcher still works, it just is not self-restarting yet.
+    try {
+        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        foreach ($t in @($task.Triggers)) {
+            if ($null -ne $t.Repetition -and -not [string]::IsNullOrEmpty($t.Repetition.Interval)) { return }
+        }
+        Step "Adding the keep-alive repetition to the '$TaskName' task"
+        Set-ScheduledTask -TaskName $TaskName `
+            -Trigger (@($task.Triggers) + (New-KeepAliveTrigger)) | Out-Null
+    } catch {
+        Write-Warning "could not add the keep-alive repetition: $($_.Exception.Message)"
+    }
+}
+
 # ------------------------------------------------------------- install mode --
 
 function Install-Watcher {
@@ -245,6 +292,15 @@ function Install-Watcher {
         Copy-Item -LiteralPath $self -Destination $InstalledWatcher -Force
     }
 
+    # Stop a running instance before touching the definition. This command is
+    # the operator's whole recovery path, and the state it most needs to repair
+    # is a watcher that is *alive* but running superseded code: registering over
+    # it leaves that process untouched, and `IgnoreNew` then makes the
+    # Start-ScheduledTask below a silent no-op. Stopping first is what makes
+    # -Install actually reinstall.
+    Step "Stopping any running '$TaskName' instance"
+    try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null } catch { }
+
     # Mirrors 04-bridge-agent.ps1 step 8 exactly, except RunLevel Highest and the
     # protected target: interactive principal in the auto-logged-on icloud
     # session, no stored password, infinite loop with restart, IgnoreNew (D17/D40).
@@ -259,7 +315,8 @@ function Install-Watcher {
       -MultipleInstances IgnoreNew `
       -ExecutionTimeLimit (New-TimeSpan -Seconds 0)   # no time limit
     Register-ScheduledTask -TaskName $TaskName -Action $action `
-      -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+      -Trigger @($trigger, (New-KeepAliveTrigger)) `
+      -Principal $principal -Settings $settings -Force | Out-Null
 
     try { Start-ScheduledTask -TaskName $TaskName } catch {
         # At OEM time the icloud session does not exist yet; the logon trigger
@@ -270,7 +327,7 @@ function Install-Watcher {
     Write-Host ""
     Write-Host "PASS: watcher installed" -ForegroundColor Green
     Write-Host "  script : $InstalledWatcher"
-    Write-Host "  task   : $TaskName (RunLevel Highest, restarts on failure)"
+    Write-Host "  task   : $TaskName (RunLevel Highest, restarted every minute if it stops)"
     Write-Host "  inbox  : $Inbox (read-only to this guest)"
 }
 
@@ -394,9 +451,27 @@ if ($Install) {
 
 New-Item -ItemType Directory -Force -Path $RunsDir -ErrorAction SilentlyContinue | Out-Null
 Remove-StaleSecret
+Confirm-KeepAlive
+$StartedFromDigest = Get-WatcherDigest
 Step "Watching $TriggerPath every $PollSeconds s"
 
 while ($true) {
+    # D42 refreshes the installed watcher "for its next task start" - this is
+    # how that start now happens. No run is in flight at the top of the loop
+    # (a pass runs guest-setup.ps1 synchronously), so exiting here loses
+    # nothing, and the keep-alive brings the new copy up within a minute.
+    #
+    # Without it, a watcher fix reached the running process only at the next
+    # logon, and a watcher that was alive but superseded was indistinguishable
+    # to the host from no watcher at all: it can accept a run, fail on the new
+    # code path, and retry silently forever while the app polls a run ID that no
+    # status ever mentions. That cost an evening.
+    $digest = Get-WatcherDigest
+    if ($digest -ne '' -and $digest -ne $StartedFromDigest) {
+        Step "The installed watcher changed - exiting so the keep-alive starts the new copy"
+        exit 0
+    }
+
     try { Invoke-TriggerPass } catch {
         # The loop is the product: a malformed trigger, an unreachable share, or
         # a failed launch must never take the watcher down.

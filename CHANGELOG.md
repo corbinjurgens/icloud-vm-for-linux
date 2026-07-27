@@ -266,6 +266,50 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-27 — The watcher restarts itself into new code, and `-Install` can actually replace it
+
+The stuck-provisioning state had two halves, and only one of them was the
+`File.Replace` bug. The other was structural: D42 refreshed the installed
+`watcher.ps1` "for its next task start", which in practice meant the next
+**logon**, so a watcher that was alive but running superseded code stayed that
+way indefinitely — and the app's own remedy could not clear it either.
+`Install-Watcher` registered over the running instance with `-Force` and then
+called `Start-ScheduledTask`, which `MultipleInstances IgnoreNew` refuses while
+the old instance is still running. The documented recovery was a no-op against
+precisely the state it existed to repair.
+
+Both halves are fixed, and the mechanism was chosen by measurement rather than
+by reading the documentation:
+
+- **The keep-alive is a repetition trigger, not `RestartCount`.** Task
+  Scheduler's restart-on-failure does not fire when the action itself exits
+  non-zero: a scratch task exiting 3 under `RestartCount 3` with a one-minute
+  interval was never relaunched in three minutes. A one-minute repetition with
+  `MultipleInstances IgnoreNew` does fire — restarting a cleanly exiting scratch
+  task at 09:56:03, 09:57:03 and 09:58:02 — and costs nothing while the watcher
+  is running. It also means the watcher now survives a crash or a kill, which
+  the previous definition did not: before this, a dead watcher stayed dead until
+  the next logon.
+- **The watcher exits when its own installed copy changes**, at the top of a
+  poll pass where no run is in flight, and the keep-alive starts the new copy.
+  Verified live twice on the running guest: modifying the installed script at
+  10:03:24 relaunched the watcher at 10:04:01 (PID 8060 → 2268), and restoring
+  it relaunched again at 10:07:01 (→ 3424). Roughly 40 s, with no logon, no
+  reboot and no operator step.
+- **`-Install` stops a running instance first**, so the command the app offers
+  is a real reinstall. Verified live: it replaced the running watcher (PID 8520
+  → 8060) instead of silently leaving it.
+- **Existing guests self-upgrade.** The task definition is written only by
+  `-Install`, so a guest registered before the keep-alive would never gain it;
+  the watcher now adds the missing repetition to its own task at startup.
+- The app's unacknowledged-run hint named only one of the two causes ("a VM
+  created before automated provisioning has no watcher task"). It now names both
+  — absent watcher, or a watcher that cannot start the request — since the one
+  command fixes both.
+
+§1's D42 row records the amendment: envelope currency still requires the
+explicit bootstrap, but code currency no longer waits for a logon.
+
 ### 2026-07-27 — A watcher that cannot record acceptance now says so
 
 The first app-driven provisioning run staged, and then nothing: the app polled a
