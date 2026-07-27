@@ -53,8 +53,7 @@ the security, lifecycle, Files On-Demand, and no-secret contracts in
 
 ### I-012 — The inspection scan owes the host a heartbeat
 
-**Status:** Implemented 2026-07-28; live completion gate pending. **Evidence:**
-D44's table states that the bridge-boundary
+**Status:** Done 2026-07-28. **Evidence:** D44's table states that the bridge-boundary
 scan "writes heartbeats", and §4.1 makes 120 s of frozen status mtime during an
 active phase a "stalled" warning. The implementation cannot do either:
 `Get-GuestChecklist` lives in `guest-state.ps1`, which is deliberately
@@ -69,9 +68,11 @@ the app calling a healthy run stalled.
 The orchestrator now injects a throttled callback into `Get-GuestChecklist`;
 both proportional scans invoke it while walking, without adding ambient I/O to
 `guest-state.ps1` or its pure reasoning functions. The Linux fixture proves
-both callback paths. The live run that exposed this still needs the updated
-watcher payload and a retry; completion is a scan lasting over 120 s without the
-app showing a frozen-heartbeat warning.
+both callback paths. A fresh run with the committed payload then remained in
+`inspecting` from 14:47:14 to 14:56:19 UTC on the author's 60 000-entry live
+guest, rewriting valid status about every 25 seconds throughout. The run
+therefore exceeded the host's 120-second stall threshold by more than four
+times without ever presenting a frozen heartbeat.
 
 ### I-001 — Close the live-hardware acceptance matrix
 
