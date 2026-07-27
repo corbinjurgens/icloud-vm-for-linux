@@ -267,6 +267,41 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-27 — A large exclusion can finally reach `applied` (`agentBuild` 7 → 8)
+
+Two independent reasons a real exclusion could sit at `pending-dehydrate`
+forever, both fixed in `ddcb273` and both recorded as D46 in the v2 plan.
+
+- **Verification is now an episode that spans passes.** The old check restarted
+  at the top of the tree every minute and gave up after 5 000 placeholder
+  queries, while `applied` demanded a complete clean walk — so a 231 GB root of
+  ~10^5 files reported a capped measurement indefinitely, no matter how long ago
+  its content was released. The agent now keeps an in-memory cursor and spends a
+  bounded number of queries per pass, resuming where it stopped; only an episode
+  that reaches the end of its candidate list may decide. A large root therefore
+  reaches `applied` a few minutes after the content is really gone, reporting
+  `verifying remaining content: <checked> of <total> file(s) checked` meanwhile.
+  This is the same answer D26/D34 already gave the reclamation sweep: bounded
+  steady-state work, label freshness allowed to lag, safety unchanged.
+- **Resident residue no longer blocks `applied`.** Three app-container roots
+  held a few hundred bytes each in in-sync, unmodified placeholders that NTFS
+  stores inside the MFT record, which no dehydration can release — so the agent
+  re-requested an impossible dehydration forever and held the exclusion (and the
+  D23 tray) yellow with it. Such files are now reported rather than blocking:
+  `localAllocatedBytes` carries their bytes and the detail names them. The
+  tolerance is bounded to one NTFS cluster per file, and a modified,
+  not-in-sync, non-placeholder or uninspectable file still blocks `applied`
+  whatever its size — its only good copy may be the local one (D20/D22).
+
+Enforcement is untouched: the deny and parent guard are still asserted every
+pass, and access is denied throughout regardless of state.
+`docs/selective-sync.md` explains both behaviours for users.
+
+**Operator step: redeploy the agent.** This is `agentBuild` 8, so a GUI built
+from this tree running against a build-7 guest reports skew; take the banner's
+**Re-run Windows provisioning…** action (or re-run `04-bridge-agent.ps1`
+elevated in the guest) once.
+
 ### 2026-07-27 — The watcher restarts itself into new code, and `-Install` can actually replace it
 
 The stuck-provisioning state had two halves, and only one of them was the

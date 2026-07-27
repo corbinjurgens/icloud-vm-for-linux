@@ -15,7 +15,7 @@ it builds on is in [`implementation-plan.md`](implementation-plan.md).
 |---|---|---|
 | Visible in `ls /mnt/icloud` | no | yes |
 | Downloaded | never | on first read |
-| Uses guest disk | no (once reclaimed) | while cached |
+| Uses guest disk | no (once reclaimed, bar a few tiny files) | while cached |
 | Present in iCloud and on your other devices | **yes, always** | yes |
 
 **Exclusion never deletes anything.** It changes what *this Linux host* can see
@@ -83,8 +83,8 @@ content unreachable from this host at all, whatever asks for it.
 |---|---|
 | *(blank)* | included |
 | `applying` | the deny permissions are being established |
-| `pending-dehydrate` | hidden and inaccessible already, but the guest still holds the content |
-| `applied` | hidden, inaccessible, and no local content remains |
+| `pending-dehydrate` | hidden and inaccessible already, but the guest still holds the content — or is still confirming that it does not |
+| `applied` | hidden, inaccessible, and the guest has released the content |
 | `not-found` | the configured path does not exist under the sync root |
 | `error` | something went wrong; the detail says what |
 
@@ -95,10 +95,34 @@ Freeing the disk space is not. Windows refuses to dehydrate a file that is open,
 that has unsaved local modifications, or that has not finished uploading to
 iCloud. The agent reports which of those it observed and re-checks every minute;
 the state becomes `applied` on its own once the content is safe to release. The
-tray icon shows yellow meanwhile.
+tray icon shows yellow meanwhile. Hover the *State* cell at any point to read
+the detail the agent published — it says what is still holding the item back.
 
 This ordering is deliberate: you are never in a window where the item is still
 readable from the host but its content is already gone.
+
+**A large folder stays at `pending-dehydrate` for a few minutes after its
+content has actually gone.** Proving a folder holds nothing locally means asking
+Windows about its files one at a time, and the agent asks a bounded number of
+those questions per minute so it never monopolises the guest. For a folder with
+many files that check runs in slices across several one-minute passes, resuming
+where the previous one stopped, and the detail counts its way through
+(`verifying remaining content: 15000 of 98000 file(s) checked`). Nothing is
+wrong and nothing is being re-downloaded; the item is hidden and unreadable from
+the host the whole time.
+
+**A handful of very small files stay on the guest disk for good.** NTFS stores
+a small enough file's data inside its own file table rather than giving it a
+disk cluster, and data stored there cannot be dehydrated at all — iCloud
+accepts the request and frees nothing, forever. Rather than wait for something
+that cannot happen, the exclusion reports `applied` and counts those files in
+its detail (`3 tiny file(s) (912 bytes) stay local; NTFS keeps files this small
+inside its file table`), and their bytes are included in the size it reports.
+Access is denied throughout, exactly as for everything else under the
+exclusion. Only files no larger than one 4 KB cluster are tolerated, and only
+when they are fully uploaded and unmodified: a file that is modified, still
+uploading, not a cloud placeholder, or that the agent cannot inspect holds the
+item at `pending-dehydrate` whatever its size.
 
 Once a folder has settled at `applied`, the agent stops re-walking it every
 minute and re-confirms it about every ten minutes instead — the same cadence the
@@ -259,7 +283,7 @@ destructive.
 - **E6** `docker stop icloud-windows` → tray red within 15 s; start again →
   green. Stop the guest scheduled task → tray yellow within 2 min.
 - **E7** Reboot host and guest → the agent auto-starts and exclusions are still
-  enforced (hidden, protected, no local content) with no manual action.
+  enforced (hidden, protected, content released) with no manual action.
   Launching the desktop entry while the tray is already running raises the
   existing window instead of silently doing nothing.
 

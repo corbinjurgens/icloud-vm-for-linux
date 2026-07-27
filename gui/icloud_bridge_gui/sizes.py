@@ -3,9 +3,12 @@
 The Selective Sync tab shows a one-line summary of the current selection.  The
 temptation is to call it "disk space saved"; this module deliberately does not,
 and the caller must not either.  `logicalBytes` is *logical content size* — what
-the data would occupy — while dehydration is asynchronous and an exclusion can
-sit at `pending-dehydrate` indefinitely.  The honest claim is "about N GB
-logical", plus how many roots have no size at all.
+the data would occupy — while dehydration is asynchronous: a root reaches
+`applied` only once the guest has released its content and the agent has
+finished verifying that, which takes extra enforcement passes on a large root
+and does not happen at all while content is open, modified or not yet uploaded
+(D46).  A little content also stays resident by design.  The honest claim is
+"about N GB logical", plus how many roots have no size at all.
 
 The size sources are incomplete and only make sense combined:
 
