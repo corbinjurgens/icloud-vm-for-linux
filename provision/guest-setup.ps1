@@ -47,6 +47,9 @@ $WingetAttempts   = 5
 $WingetRetrySleep = 120
 $WingetTimeout    = 600      # 10 min per attempt (section 4.1)
 $ScriptTimeout    = 900
+$PackageReadyTimeout = 120   # bounded wait for the MSIX registration to settle
+$PackageReadyPoll    = 10
+$ClientRelaunchSeconds = 300 # at most one sign-in-wait relaunch per 5 min
 
 function Step { param([string]$Message) Write-Host "==> $Message" -ForegroundColor Cyan }
 
@@ -226,6 +229,29 @@ function Get-ChildOutputTail {
     return Get-BoundedLine (($lines | Select-Object -Last 3) -join ' | ')
 }
 
+# ------------------------------------------------------------ iCloud client --
+
+function Start-IcloudClient {
+    # Launched through explorer.exe so the client runs in the ordinary
+    # unelevated icloud session rather than inheriting this token
+    # (docs/automation-notes.md section 3).
+    #
+    # Warn-only on failure: the sign-in wait relaunches on its own schedule, and
+    # the operator can always start the client from the Start menu.
+    try {
+        Start-Process -FilePath 'explorer.exe' -ArgumentList $IcloudAppsFolder | Out-Null
+    } catch {
+        Write-Warning "could not launch the iCloud client: $($_.Exception.Message)"
+    }
+}
+
+function Test-IcloudClientRunning {
+    # The two processes the Store client leaves resident once it is up. Neither
+    # present means it has crashed, been closed, or never started.
+    $running = @(Get-Process -Name 'iCloudHome', 'iCloudDrive' -ErrorAction SilentlyContinue)
+    return ($running.Count -gt 0)
+}
+
 # ------------------------------------------------------------- inspection ----
 
 $script:Inspected = $null
@@ -402,20 +428,47 @@ try {
     # ============================ 5. sign-in wait ============================
     if ($dispatch.WaitForSignin) {
         [void]$performed.Add('wait-for-signin')
-        Set-Phase 'launching-icloud' 'starting the iCloud client for sign-in'
-        try {
-            # Launched through explorer.exe so the client runs in the ordinary
-            # unelevated icloud session rather than inheriting this token
-            # (docs/automation-notes.md section 3).
-            Start-Process -FilePath 'explorer.exe' -ArgumentList $IcloudAppsFolder | Out-Null
-        } catch {
-            Write-Warning "could not launch the iCloud client: $($_.Exception.Message)"
+        Set-Phase 'launching-icloud' 'waiting for the iCloud package registration to settle'
+        # winget returns as soon as the install command succeeds, which is not
+        # the same moment the MSIX registration is usable; activating a
+        # half-registered package is a plausible trigger for the client's
+        # fast-crash class. Bounded, because the probe can only ever be advisory:
+        # on timeout the launch goes ahead anyway, since a visible failed launch
+        # is more diagnosable than an abort and the wait below self-heals.
+        $readyDeadline = (Get-Date).AddSeconds($PackageReadyTimeout)
+        while ((Resolve-IcloudPackageState (Read-IcloudPackageObservation)) -ne 'ok') {
+            if ((Get-Date) -ge $readyDeadline) {
+                Write-Warning ("the iCloud package did not report itself installed within " +
+                               "${PackageReadyTimeout}s; launching the client anyway")
+                break
+            }
+            Start-Sleep -Seconds $PackageReadyPoll
+            Write-Heartbeat
         }
+
+        $script:Detail = 'starting the iCloud client for sign-in'
+        Write-Status
+        Start-IcloudClient
+        $lastLaunch = Get-Date
+
         Set-Phase 'waiting-for-signin' 'sign in with your Apple ID, leaving iCloud Drive and Files On-Demand ON'
         # No timeout: this is the operator's only guest interaction, and it may
         # legitimately take as long as it takes (section 4.1).
+        #
+        # The wait heals itself instead. A client that crashes here used to leave
+        # provisioning heartbeating a healthy "sign in on the VM screen" forever
+        # with nothing on screen to sign into, so a vanished client is relaunched
+        # - rate limited, so a client that fast-crashes every time cannot turn
+        # this into a restart loop.
         while ((Resolve-SyncRootState (Read-SyncRootObservation)) -ne 'ok') {
             Start-Sleep -Seconds $SignInPollSeconds
+            if (-not (Test-IcloudClientRunning) -and
+                ((Get-Date) - $lastLaunch).TotalSeconds -ge $ClientRelaunchSeconds) {
+                Start-IcloudClient
+                $lastLaunch = Get-Date
+                $script:Detail = 'the iCloud client was not running and has been relaunched; sign in on the VM screen'
+                Write-Status
+            }
             Write-Heartbeat
         }
     }

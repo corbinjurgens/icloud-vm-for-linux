@@ -1007,6 +1007,16 @@ Rules a weaker model must not improvise around:
   waits and while each child process runs, which is what makes 120 s of silence
   meaningful. The two waiting phases have the heartbeat check and no elapsed
   deadline.
+- The sign-in wait is unbounded but not passive. `winget` returns before the
+  MSIX registration is necessarily usable, so the orchestrator waits up to two
+  minutes for the package to report itself installed before it activates the
+  client for the first time, and launches anyway on timeout — a visible failed
+  launch is more diagnosable than an abort. During the wait itself, an absent
+  client process means the operator has nothing to sign into while the heartbeat
+  keeps saying otherwise, so the client is relaunched, at most once every five
+  minutes. The rate limit is what keeps a client that fast-crashes on every
+  activation from becoming a restart loop. Neither addition puts a deadline on
+  the wait: it still ends only when the sync root appears.
 - Re-triggering is always safe: reconciliation re-probes instead of trusting the
   previous phase, the 03/04 repair scopes are idempotent, `installing-icloud`
   skips when `Get-AppxPackage AppleInc.iCloud` already answers, and the watcher
