@@ -1052,12 +1052,19 @@ Rules a weaker model must not improvise around:
   evidence needed to resume safely after a GUI crash.
 
 On a VM created before this feature there is no watcher task, so a staged
-trigger is simply never acknowledged — which is not an error. The GUI keeps
-polling and shows the one-time elevated bootstrap, run once in the guest:
+trigger is simply never acknowledged — which is not an error. The GUI consults
+the `watcher.json` beacon before staging and leads with the one-time elevated
+bootstrap immediately when no watcher is present (keeping the 90-second
+acknowledgement fallback for pre-beacon watchers), run once in the guest:
 
 ```
-powershell -ExecutionPolicy Bypass -NoProfile -File \\host.lan\Provision\watcher.ps1 -Install
+powershell -ep bypass -File C:/OEM/watcher.ps1 -Install
 ```
+
+(the noVNC-typeable form; a pre-feature VM with no `C:\OEM` payload uses
+`powershell -ExecutionPolicy Bypass -NoProfile -File
+\\host.lan\Provision\watcher.ps1 -Install` from the share instead, and RDP on
+127.0.0.1:3389 gives a real clipboard and keyboard layout)
 
 The installer asserts its own elevation and that `icloud` is a member of the
 built-in Administrators SID `S-1-5-32-544` — dockur currently places its

@@ -217,9 +217,10 @@ Set:
 
 - `SHARE_PASS` — **generate a strong 20+ char random password.** This is the SMB
   account password. The app delivers this same value into the guest during setup
-  (§9), from an env file you select at that moment; the manual fallback pastes it
-  by hand instead. `.env` is gitignored — never commit it, and never put the real
-  value in this file or any other tracked file.
+  (§9), from the configuration in use — the app-created file, or an env file you
+  select at that moment; the manual fallback pastes it by hand instead. `.env`
+  is gitignored — never commit it, and never put the real value in this file or
+  any other tracked file.
 - `DISK_SIZE` / `RAM_SIZE` / `CPU_CORES` — size per `.env.example` comments. The
   qcow2 grows on demand, so oversizing `DISK_SIZE` is free. Don't drop `RAM_SIZE`
   below 2.5G (Windows servicing needs it).
@@ -501,13 +502,25 @@ alone.
 ### One-time bootstrap on a VM created before automated provisioning
 
 A VM installed before this feature has no watcher task inside it, so a staged run
-is simply never picked up. That is **not an error** — the app keeps polling and,
-after 90 seconds without an acknowledgement, shows this command to run **once**,
-in an elevated PowerShell inside the guest:
+is simply never picked up. That is **not an error** — the app checks the watcher
+beacon before staging (and keeps a 90-second acknowledgement fallback for
+pre-beacon watchers), and when no watcher is present it shows this command to
+run **once**, in an elevated PowerShell inside the guest:
+
+```
+powershell -ep bypass -File C:/OEM/watcher.ps1 -Install
+```
+
+The forward slashes are deliberate: Windows accepts them, and they stay typeable
+through noVNC on a mismatched keyboard layout. On a pre-feature VM with no
+`C:\OEM` payload, use the share copy instead:
 
 ```
 powershell -ExecutionPolicy Bypass -NoProfile -File \\host.lan\Provision\watcher.ps1 -Install
 ```
+
+RDP is the comfortable route for either: connect a real RDP client to
+127.0.0.1:3389 for a working clipboard and your own keyboard layout.
 
 The installer checks its own elevation and that the `icloud` account really is an
 administrator before registering anything. Once it has run, the watcher picks up
@@ -786,7 +799,7 @@ in every state, including setup and powered-off.
 | An exclusion reports `acl-write-denied` | Provisioning step 4 (the agent's `RC,WDAC` grant) did not take, or that object has a protected DACL | **Re-run Windows provisioning…** — the bridge-boundary repair re-applies the grant, and a protected child DACL is reported as blocked with the exact paths so you restore inheritance deliberately (§9) |
 | *"The guest agent does not match this app"* (yellow banner) | The GUI was updated but `C:\ProgramData\icloud-bridge\agent.ps1` was not — a package upgrade cannot reach inside the guest (v2 plan D35). Everything still works | Use the banner's **Re-run Windows provisioning…** button. On a healthy VM the plan is just *Update bridge agent*: no password is asked for and your exclusions are untouched. A VM created before automated provisioning needs the one-time bootstrap in §9 first |
 | *"not speaking this app's bridge protocol"* (red banner); Apply and browsing disabled | Same cause, but the guest agent predates the version check entirely, so nothing will be written to it | The same **Re-run Windows provisioning…** action — it stays available in this state precisely because it is the way out. The current `exclusions.json` is deliberately left exactly as it is until the versions agree |
-| Provisioning runs but the VM never acknowledges it (the app shows a one-line bootstrap command after ~90 s) | The VM was created before automated provisioning, so it has no watcher task. Not an error — the app is still polling | Run that command once in an elevated PowerShell inside the VM (§9). The already-staged request is then picked up with no further click on the host |
+| Provisioning runs but the VM never acknowledges it (the app shows a one-line bootstrap command — immediately when no watcher beacon exists, or after ~90 s on a pre-beacon watcher) | The VM was created before automated provisioning, so it has no watcher task. Not an error — the app is still polling | Run that command once in an elevated PowerShell inside the VM (§9). The already-staged request is then picked up with no further click on the host |
 | GUI shows *"could not be powered on/off within the time allowed"* and offers only **Retry** | The outer timeout fired. Killing this app's `sudo` is no proof the root helper stopped, so nothing is read or changed until you retry (v2 plan D38) | Give the helper a moment, then press **Retry** — `flock` serializes it against any surviving run. `journalctl -u icloud-health.timer` and the diagnostic report show what actually happened |
 | After restarting the GUI mid-install it says *"Setup was interrupted while Windows was installing"* | The D39 record survived the restart, so the app resumed the no-CIFS Provisioning state instead of guessing | Continue the guest steps and choose **Check setup and connect**; the note clears itself once the bridge powers on |
 | Setup offers **Discard failed setup record** | This app noted that a VM creation was started, but Docker says that container is absent or is a different one | Use it if you gave up on that attempt. It removes only this app's note — no container, no virtual disk, no `.env` |
