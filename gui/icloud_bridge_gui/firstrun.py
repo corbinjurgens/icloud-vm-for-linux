@@ -93,6 +93,8 @@ CONFIG_FILE_MODE = 0o600
 MIN_DISK_GB = 120
 MIN_RAM_GB = 3
 MIN_CPU_CORES = 2
+WINDOWS_STORAGE_DIR = "/srv/icloud-vm/storage"
+CUSTOM_ISO_NAME = "custom.iso"
 
 
 # ----------------------------------------------------------------- results --
@@ -161,6 +163,16 @@ def resource_defaults(*, cpu_count: int | None = None,
     free_gb = available_disk_bytes // (1024 ** 3)
     disk_gb = max(MIN_DISK_GB, ((free_gb // 2 + 19) // 20) * 20)
     return ResourceDefaults(f"{disk_gb}G", f"{ram_gb}G", str(cores))
+
+
+def cached_windows_install_media(storage_dir: str = WINDOWS_STORAGE_DIR,
+                                 *, exists: Callable[[str], bool] = os.path.exists) -> bool:
+    """Whether the dockur Windows installer cache is already present.
+
+    The compose file mounts the host storage directory at ``/storage`` and
+    dockur reuses ``custom.iso`` from there when it exists.
+    """
+    return exists(os.path.join(storage_dir, CUSTOM_ISO_NAME))
 
 
 #: The values come from free-text fields, and anything written next to the

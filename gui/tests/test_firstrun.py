@@ -165,6 +165,23 @@ def test_resource_defaults_are_clamped_to_the_example_floors():
     assert defaults == firstrun.ResourceDefaults("120G", "3G", "2")
 
 
+@pytest.mark.parametrize(("cached", "expected"), [
+    (False, False),
+    (True, True),
+])
+def test_cached_windows_install_media_checks_for_custom_iso_in_storage(
+        cached, expected):
+    seen = []
+
+    def exists(path):
+        seen.append(path)
+        return cached
+
+    assert firstrun.cached_windows_install_media("/srv/icloud-vm/storage",
+                                                 exists=exists) is expected
+    assert seen == [os.path.join("/srv/icloud-vm/storage", "custom.iso")]
+
+
 # -------------------------------------------------------------- env parsing --
 
 def write_env(tmp_path, text) -> str:

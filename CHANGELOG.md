@@ -269,6 +269,20 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-28 — The Create-VM dialog is honest when the installer is cached
+
+todo/lifecycle-dead-ends.md item 6: the confirmation always warned "several
+gigabytes" and "20-40 minutes" even when `custom.iso` was already present in
+`/srv/icloud-vm/storage`, where the real cost is a few minutes and zero
+download. `firstrun.cached_windows_install_media()` now owns the cheap check
+and `_confirm_create_vm` words the dialog accordingly; the dialog also
+describes the automatic continuation (the item-8 auto-start) and names the
+iCloud sign-in as the one step the operator does themselves. Alongside: the Qt
+test fixture's teardown now drains a second worker generation, fixing an
+intermittent cross-test leak where a late forced-refresh worker from one test
+called the next test's health fakes (seen as a spurious
+no-CIFS-resume failure roughly every other combined run).
+
 ### 2026-07-28 — Create Windows VM flows straight into the first provisioning run
 
 todo/lifecycle-dead-ends.md item 8: after **Create Windows VM** the app sat

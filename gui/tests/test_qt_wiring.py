@@ -37,6 +37,7 @@ from icloud_bridge_gui import __main__ as app_module              # noqa: E402
 from icloud_bridge_gui import window as window_module             # noqa: E402
 
 _RealMessageBox = window_module.QMessageBox
+_confirm_create_vm = app_module.Application._confirm_create_vm
 from icloud_bridge_gui import (backup, bridge, diagnostics, firstrun,  # noqa: E402
                                guestprov, health, lifecycle, listing, power)
 
@@ -144,6 +145,7 @@ class FakeMessageBox:
         cls.answer = _RealMessageBox.StandardButton.Cancel
         cls.clicked_index = -1
         cls.calls = []
+        cls.last_dialog = None
 
     @classmethod
     def count(cls, kind: str) -> int:
@@ -169,22 +171,26 @@ class FakeMessageBox:
     # --- the instance form, used by the controller's own confirmations ---
     #: Index of the button `exec` should report as clicked; tests set it.
     clicked_index = -1                  # -1 means the last (usually Cancel)
+    last_dialog = None
 
     def __init__(self, parent=None):
         self._buttons: list[object] = []
+        self._text = ""
+        self._informative_text = ""
         type(self).calls.append(("dialog", ()))
+        type(self).last_dialog = self
 
     def setWindowTitle(self, _title):
-        pass
+        self._window_title = _title
 
     def setIcon(self, _icon):
         pass
 
-    def setText(self, _text):
-        pass
+    def setText(self, text):
+        self._text = text
 
-    def setInformativeText(self, _text):
-        pass
+    def setInformativeText(self, text):
+        self._informative_text = text
 
     def addButton(self, label, _role):
         button = object()
@@ -385,8 +391,12 @@ def controller(qapp, fakes, request):
         instance._window.close()
         # Let every in-flight worker land before the next test's fakes replace
         # the ones it captured, or a late callback runs against a dead window.
-        QThreadPool.globalInstance().waitForDone(5000)
-        pump(0.2)
+        # Twice: a done-callback delivered by the first pump may itself schedule
+        # one more worker (a pending forced refresh does exactly that), and that
+        # second generation would otherwise run into the next test's fakes.
+        for _ in range(2):
+            QThreadPool.globalInstance().waitForDone(5000)
+            pump(0.2)
 
 
 def _connectable(tray):
@@ -508,6 +518,32 @@ def test_create_vm_starts_the_first_provisioning_run(controller, fakes, monkeypa
 
     assert pump(3.0, until=lambda: fakes.stage.count == 1)
     assert app._model.phase is lifecycle.Phase.PROVISIONING
+
+
+@pytest.mark.parametrize(("cached", "expected"), [
+    (False, "This downloads several gigabytes of Windows installation media and can take 20-40 minutes, sometimes longer."),
+    (True, "The cached Windows installer will be reused, so no download is needed and installation usually takes only a few minutes."),
+])
+def test_create_vm_confirmation_text_tracks_cached_install_media(controller, fakes,
+                                                                 monkeypatch, cached,
+                                                                 expected):
+    fakes.inspect.result = power.DockerStatus("absent", detail="no such object")
+    monkeypatch.setattr(firstrun, "cached_windows_install_media",
+                        lambda: cached)
+    app = controller()
+
+    assert pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.SETUP
+                and not app._setup_busy)
+    app._window.configuration_requested.emit("120G", "3G", "2")
+    assert pump(2.0, until=lambda: bool(app._env_path) and not app._setup_busy)
+
+    _confirm_create_vm(app)
+
+    dialog = FakeMessageBox.last_dialog
+    assert dialog is not None
+    assert dialog._informative_text.startswith(expected)
+    assert "It creates a long-lived virtual machine" in dialog._informative_text
+    assert "Windows setup then continues automatically" in dialog._informative_text
 
 
 def test_provisioning_notifications_are_once_per_run(controller, fakes):

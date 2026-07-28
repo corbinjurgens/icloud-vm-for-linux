@@ -855,10 +855,27 @@ class Application(QObject):
         box.setWindowTitle("Create the Windows VM?")
         box.setIcon(QMessageBox.Icon.Question)
         box.setText("Create the Windows VM now?")
+        if firstrun.cached_windows_install_media():
+            install_text = (
+                "The cached Windows installer will be reused, so no download is "
+                "needed and installation usually takes only a few minutes."
+            )
+        else:
+            install_text = (
+                "This downloads several gigabytes of Windows installation media "
+                "and can take 20-40 minutes, sometimes longer."
+            )
         box.setInformativeText(
-            "This downloads several gigabytes of Windows installation media and can take "
-            "20–40 minutes, sometimes longer. It creates a long-lived virtual machine "
-            "that keeps running until you power it off from this app.\n\n"
+            f"{install_text} It creates a long-lived virtual machine that keeps "
+            "running until you power it off from this app.\n\n"
+            "Windows setup then continues automatically: this app installs "
+            "iCloud for Windows, creates the SMB share and installs the bridge "
+            "agent, notifying you at the moments that need you. Nothing on the "
+            "iCloud mounts is read until \"Check setup and connect\" "
+            "succeeds.\n\n"
+            "Signing in to iCloud in the VM, including two-factor "
+            "authentication, and leaving iCloud Drive and Files On-Demand "
+            "switched on, is the only step you do yourself.\n\n"
             f"Command: {' '.join(firstrun.compose_argv(self._bundle, self._env_path))}")
         create = box.addButton("Create Windows VM", QMessageBox.ButtonRole.AcceptRole)
         cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
