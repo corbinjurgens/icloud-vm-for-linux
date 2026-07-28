@@ -273,6 +273,24 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-28 — F2 executed: the guest's idle CPU has names now
+
+The three-sample idle attribution the 2026-07-27 performance review asked for
+ran to completion (the fixed sampler's first real runs), concurrent with three
+host-side `vcpu-profile.py` windows; full numbers and dispositions are in
+`docs/acceptance-results.md` ("F2: the Windows idle CPU is attributed"). The
+headline: **the largest single idle consumer is WindowsTerminal at a constant
+~6% of one core, and it is ours** — it hosts the provisioning watcher's
+console, because the scheduled task's `-WindowStyle Hidden` is not honored
+once Windows 11 delegates consoles to Windows Terminal, which then renders a
+static elevated window forever in a VM with no GPU. The bridge agent itself
+idles at 0.4-0.5% with a 14.9% window during a periodic full scan (matching
+I-012's timings); iCloudDrive reads ~2.3 MB/s from disk at idle in two of
+three windows; Defender, DWM, `System` and every helper are fractions of a
+percent and stay accepted under the closed R-rows. The watcher-console fix is
+D51's to record; F2's gate closes when it lands and a re-measure shows the
+share gone.
+
 ### 2026-07-28 — tools/*.ps1 made pure ASCII after a live parse failure on first run
 
 `tools/profile-windows-idle.ps1`, shipped 2026-07-27 and written and parsed but

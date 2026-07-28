@@ -88,41 +88,16 @@ and the GUI protocol check are all recorded — see
 [`archive/performance-resource-review-2026-07-27.md`](archive/performance-resource-review-2026-07-27.md)
 and the 2026-07-28 "F1 closed" CHANGELOG entry.
 
-### F2 — Attribute the Windows idle CPU before changing Windows
+### F2 — measured 2026-07-28; gate open on the D51 fix
 
-**Priority: highest after F1; operator must watch the guest desktop.**
-
-The 60-second sample again put 73.7% of QEMU CPU time in guest mode. Repository
-code cannot name the Windows process behind it. The sampler this section asked
-for, `tools/profile-windows-idle.ps1`, shipped on 2026-07-27 and **has still
-never run**; it is read-only rather than a long ad-hoc command, and it must:
-
-- take process CPU, working-set, private-byte, read-byte, and write-byte
-  snapshots around a 300-second idle interval;
-- report **deltas**, not lifetime totals;
-- include `System`, Defender, iCloud, DWM, Service Host, Store/update, and the
-  bridge agent without assuming any of them is the cause;
-- record aggregate processor time as a cross-check so missing/exited processes
-  are visible;
-- write bounded plain text or JSON to dockur's `\\host.lan\Data` share;
-- collect no command lines, environment, file paths, Apple identity, or file
-  contents.
-
-Run it three times after the guest has settled, alongside three matching
-`vcpu-profile.py --seconds 300` host samples. A process is actionable only when
-its delta is repeatable and large enough to explain a useful fraction of the
-8–9 guest core-seconds per minute. Closed rows R-012 and R-019–R-022 still apply:
-attribution to Defender, WNS, memory compression, ScheduledDefrag, or a required
-input/servicing component records an accepted cost; it does not license
-disabling it.
-
-If process deltas leave a large unattributed `System` share, use a Windows
-Performance Recorder idle trace as the next diagnostic. Do not jump from that
-gap to another service-disable list.
-
-**Completion gate:** named process/service shares account for the recurring
-guest-mode CPU in `docs/acceptance-results.md`, with each material share fixed
-or explicitly accepted.
+The three 300 s guest samples and matching host samples ran on 2026-07-28
+(first-ever completed runs of `tools/profile-windows-idle.ps1`, after its PS
+5.1 parse failure was fixed the same day). Attribution and dispositions are
+recorded in `docs/acceptance-results.md` ("F2: the Windows idle CPU is
+attributed"): the dominant share is the watcher's own console rendered by
+WindowsTerminal (~6% of one core, constant) because `-WindowStyle Hidden` is
+not honored under Windows 11 console delegation — the fix is D51. The gate
+closes on a post-fix re-measure showing that share gone.
 
 ### F3 — done 2026-07-28; archived
 

@@ -94,6 +94,40 @@ Every row starts as `not yet run`. `Result` is one of `not yet run`, `pass`,
 
 ## Remediation evidence outside the Phase E matrix
 
+### 2026-07-28 — F2: the Windows idle CPU is attributed
+
+Method: three 300 s guest-internal delta samples
+(`tools/profile-windows-idle.ps1`, first-ever completed runs, elevated, WMI
+`Win32_PerfRawData_PerfProc_Process`) concurrent with three 300 s host samples
+(`tools/vcpu-profile.py`). Aggregate cross-checks closed (unattributed
+remainder -0.98/-0.48/0.00 core-s), so the process rows account for what the
+guest kernel charged to processes.
+
+- Guest-internal non-Idle totals: **11.0% / 22.2% / 8.7%** of one core.
+  Concurrent host view: 27.5% / 37.4% / 22.1% (guest share 82.2/87.6/80.6%,
+  kernel 17.6/12.3/19.3%, QEMU ~0.2%). An untouched pre-run baseline the same
+  hour (display asleep, no sampler): 15.4% / 21.0% / 24.4%. The host-minus-WMI
+  gap is guest kernel/interrupt time no process owns, plus sampling overhead.
+- **WindowsTerminal: 6.4 / 6.1 / 6.3% of one core, constant** — the largest
+  single share. It hosts the provisioning watcher's console: the scheduled
+  task passes `-WindowStyle Hidden`, but Windows 11's default-terminal
+  delegation to Windows Terminal does not honor it, so a visible static
+  console renders forever in a GPU-less VM. Disposition: **fix** (D51).
+- **Bridge agent (`powershell`, watcher-launched): 0.4-0.5% baseline**, one
+  window at **14.9%** containing a periodic full scan — consistent with
+  I-012's measured scan timings against 69,620 entries. Disposition: accepted
+  baseline; scan cost is P6/p3 follow-up territory.
+- **iCloudDrive: ~0.5%** but with **~2.3 MB/s sustained disk reads** in two of
+  three windows; **iCloudHome: 1.8%** in one window, near-zero after.
+  Disposition: accepted (Apple's client, R-012 class); the read stream is
+  worth watching if DFR-002 ever gets event-rate evidence.
+- Defender (`MsMpEng` + core service): ~0.2-0.8%; `System` 0.4-0.8%; `dwm`
+  0.1-0.3%; every dockur helper and remaining service row rounds to zero.
+  Disposition: accepted (R-012/R-019-R-022 remain closed).
+
+F2's completion gate stays open until the D51 fix lands and a re-measure
+shows the WindowsTerminal share gone; the attribution itself is done.
+
 ### 2026-07-27 — I-008: D33 applied to the running container; D32 disproven
 
 Executed on the author's live host. The bridge host setup (mounts, units,
