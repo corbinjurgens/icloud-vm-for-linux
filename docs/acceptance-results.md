@@ -172,3 +172,71 @@ reduces to stopping the container, done with a graceful `docker compose down`
   profiler on this kernel (7.0.0 `vhost_task`).
 - **Not measured:** `CPU_CORES` stayed at the operator's 4 (R-039 predicted no
   win and `.env` is operator state; changing it was not this session's call).
+
+## Safe Workspaces acceptance matrix (A1-A14)
+
+Safe Workspaces (register **D52**, design in
+[`plan-safe-local-workspaces.md`](plan-safe-local-workspaces.md)) has its own
+live acceptance matrix, specified once in that plan's
+[section 15](plan-safe-local-workspaces.md#15-live-acceptance-matrix) as
+A1-A14. As with the Phase E rules above, this section records only what
+happened when a check was run; it references scenario IDs rather than
+repeating their expected results.
+
+**No A-scenario has been executed.** This checkout has no Windows guest, no
+CIFS mount, no Obsidian, and no Apple device wired to it, so nothing here can
+read `pass` yet. Every row is `unverified`, and that is an honest zero rather
+than partial credit.
+
+### Environment baseline
+
+| Fact | Value | Recorded |
+|---|---|---|
+| Package version | 0.3.0 | 2026-07-29 |
+| Unison version available on this host | 2.53.8 (ocaml 5.3.0) | 2026-07-29 |
+
+### What is proven locally, and what is not
+
+Covered by integration tests that exercise the real Unison binary (2.53.8 on
+this host): the exact Unison invocation, conflict retention with both
+diverging versions left intact on their own replicas, ten retained central
+backups, deletion propagation, and metadata-only touches that replace no
+content. Covered separately by the unit and Qt-wiring suites: cycle gating,
+scheduling, the drain gate, health-status precedence, and diagnostics privacy.
+
+None of that is evidence about the live Windows guest, real CIFS behavior,
+Obsidian, or a second Apple device. Only running the rows below against those
+can turn them from `unverified` into anything else.
+
+### Results
+
+| Check | Disposition | Executing it requires |
+|---|---|---|
+| A1 | unverified | a disposable copy of the observed vault, Obsidian closed, and an empty local workspace root |
+| A2 | unverified | hash captures of both replicas, then a Windows/iCloud metadata-only change (no byte change) held across two cycles |
+| A3 | unverified | Obsidian open against the disposable local vault, with at least two minutes of continuous typing |
+| A4 | unverified | a single local note edit in the disposable local vault, observed through one stability window |
+| A5 | unverified | a second Apple device (Mac or iPhone) editing a different note in the disposable remote vault |
+| A6 | unverified | the same note edited differently on Linux and an Apple device before either side converges |
+| A7 | unverified | deliberate loss of the guest's external networking during a local edit, then reconnection |
+| A8 | unverified | triggering bridge power-off mid-cycle and observing the quiesce, drain, and unmount sequence |
+| A9 | unverified | quitting only the GUI, editing locally while it is closed, and restarting it |
+| A10 | unverified | killing the app mid-cycle and relaunching it |
+| A11 | unverified | an ordinary deletion followed by a restore from its central backup |
+| A12 | unverified | an endpoint made empty, and separately a burst of at least 20 paths and 20 percent of an endpoint deleted |
+| A13 | unverified | `make reinstall` run against the disposable workspace's configuration and state, then confirming survival |
+| A14 | unverified | only after A1-A13 pass: closing the raw vault in Obsidian, creating the real local workspace, validating counts and hashes, then reopening it as the vault |
+
+### Prerequisites and ordering for the operator's run
+
+1. Start from a **disposable copy** of the observed vault, not the real one,
+   and keep an **independent backup** of that copy before touching it.
+2. Run A1 through A13 against the disposable copy only. Do not open the real
+   vault through `/mnt/icloud` while initializing or testing a workspace.
+3. Do not cut the real vault over (A14) until every disposable-vault scenario
+   (A1-A13) has an actual `pass` recorded, not merely an attempt.
+4. Refresh the installed host package with `make reinstall` before starting,
+   so the code under test matches this record's package version.
+5. Record results in this table by appending the run's date and changing the
+   affected row's disposition; do not overwrite this baseline entry — add
+   beneath it, the same way the Phase E rows above are appended.

@@ -837,6 +837,11 @@ incomplete; its expected result is never weakened to make it pass.
 | A13 | Package reinstall (`make reinstall`) | configuration, replicas, state, archives, and backups all survive; cycles resume | unverified |
 | A14 | Real-vault cutover, only after A1-A13 pass | raw vault closed in Obsidian, real local workspace created, file counts and hashes validated, local path opened as the vault | unverified |
 
+The environment baseline, what execution requires per row, and the recorded
+result of any run live in
+[`acceptance-results.md`](acceptance-results.md#safe-workspaces-acceptance-matrix-a1-a14),
+following the same append-only convention as the Phase E rows in that file.
+
 ---
 
 ## 16. Out of scope
