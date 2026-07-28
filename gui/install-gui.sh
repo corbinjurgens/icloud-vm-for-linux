@@ -107,6 +107,23 @@ if [ "$PYTHON" = "python3" ]; then
   PYTHON="$(command -v python3)"
 fi
 
+# --- 2b. Unison for Safe Workspaces (plan section 13) -------------------------
+# Never download an unverified binary: the only source is the distro package.
+echo "==> Checking for Unison (Safe Workspaces local sync needs >= 2.52)"
+if command -v unison >/dev/null 2>&1; then
+  echo "==> unison already available at $(command -v unison)"
+elif command -v apt-get >/dev/null 2>&1; then
+  echo "==> Installing the distro unison package (sudo required)"
+  if ! sudo apt-get install -y unison; then
+    echo "==> Could not install unison; Safe Workspaces is unavailable until"
+    echo "    Unison 2.52 or newer is installed."
+  fi
+else
+  echo "==> No apt-get on this system; Safe Workspaces is unavailable until"
+  echo "    Unison 2.52 or newer is installed through your distro's package"
+  echo "    manager."
+fi
+
 # --- 3. launcher --------------------------------------------------------------
 echo "==> Writing $LAUNCHER"
 cat > "$LAUNCHER" <<EOF

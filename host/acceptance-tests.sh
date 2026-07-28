@@ -235,6 +235,26 @@ for arg in on off; do
   fi
 done
 
+echo "== 10. Unison installed and at least 2.52 (Safe Workspaces, plan section 13) =="
+if command -v unison >/dev/null 2>&1; then
+  UNISON_VERSION_LINE=$(unison -version 2>&1 || true)
+  UNISON_MAJOR_MINOR=$(echo "$UNISON_VERSION_LINE" \
+    | grep -ioE 'version [0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' | head -1)
+  if [ -n "$UNISON_MAJOR_MINOR" ]; then
+    UMAJOR=${UNISON_MAJOR_MINOR%.*}
+    UMINOR=${UNISON_MAJOR_MINOR#*.}
+    if [ "$UMAJOR" -gt 2 ] || { [ "$UMAJOR" -eq 2 ] && [ "$UMINOR" -ge 52 ]; }; then
+      ok "unison $UNISON_MAJOR_MINOR meets the >= 2.52 requirement"
+    else
+      bad "unison $UNISON_MAJOR_MINOR is older than the 2.52 Safe Workspaces requires"
+    fi
+  else
+    bad "unison -version did not report a version this check can read: $UNISON_VERSION_LINE"
+  fi
+else
+  bad "unison is not installed (Safe Workspaces needs >= 2.52; see host/setup-prereqs.sh)"
+fi
+
 echo
 echo "== MANUAL tests (cannot be automated from the host) =="
 cat <<'EOF'

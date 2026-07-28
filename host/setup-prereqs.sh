@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # setup-prereqs.sh — host prerequisites for the iCloud VM (plan section 1).
 #
-# Debian/Ubuntu. Installs Docker Engine + cifs-utils, verifies KVM, and creates
-# the VM storage dir. Idempotent. Re-login (or newgrp docker) after first run so
-# the docker group membership takes effect.
+# Debian/Ubuntu. Installs Docker Engine + cifs-utils + unison, verifies KVM, and
+# creates the VM storage dir. Idempotent. Re-login (or newgrp docker) after
+# first run so the docker group membership takes effect.
 #
 #   sudo ./host/setup-prereqs.sh
 set -euo pipefail
@@ -67,6 +67,9 @@ fi
 
 echo "==> Installing cifs-utils (host-side SMB mount)"
 apt-get install -y -qq cifs-utils
+
+echo "==> Installing Unison (Safe Workspaces local-replica sync, plan section 13)"
+apt-get install -y -qq unison
 
 echo "==> Creating VM storage dir on the fastest disk available (NVMe preferred)"
 mkdir -p /srv/icloud-vm/storage
