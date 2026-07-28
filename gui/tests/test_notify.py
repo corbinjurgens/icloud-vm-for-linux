@@ -126,3 +126,28 @@ def test_no_grace_means_a_first_red_snapshot_notifies():
     """An already-running bridge (e.g. a minimized launch) is not in grace."""
     tracker = notify.IncidentTracker()
     assert observe(tracker, health.RED, health.RED, now=1000.0).kind == notify.FAILURE
+
+
+def test_provisioning_moments_notify_once_per_run():
+    tracker = notify.ProvisioningTracker()
+    run = "a" * 32
+
+    waiting = tracker.observe(run, "waiting-for-signin")
+    assert waiting.kind == notify.PROVISIONING
+    assert "sign in to iCloud" in waiting.body
+    assert tracker.observe(run, "waiting-for-signin") is None
+
+    failure = tracker.observe(run, "inspecting", failed=True)
+    assert failure.kind == notify.FAILURE
+    assert tracker.observe(run, "inspecting", failed=True) is None
+
+    done = tracker.observe(run, "done")
+    assert done.kind == notify.PROVISIONING
+    assert "complete" in done.body
+    assert tracker.observe(run, "done") is None
+
+
+def test_provisioning_moments_are_independent_between_runs():
+    tracker = notify.ProvisioningTracker()
+    assert tracker.observe("first", "done") is not None
+    assert tracker.observe("second", "done") is not None

@@ -269,6 +269,23 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-28 — Create Windows VM flows straight into the first provisioning run
+
+todo/lifecycle-dead-ends.md item 8: after **Create Windows VM** the app sat
+silent — the operator polled the VM screen by hand and then clicked **Set up
+Windows automatically** themselves, although both halves were already built.
+The `VM_CREATED` continuation now begins the first run automatically through
+the same `_start_first_provisioning_run()` core the manual action uses (the
+Create Windows VM confirmation already described the whole end-to-end
+sequence; the click remains for re-entry after an interruption), and the
+existing guest-ready probe waits through the Windows install as before. The
+complement: `notify.ProvisioningTracker` sends one desktop notification per
+run for each moment that needs the operator — waiting for the iCloud sign-in,
+a failure (including a guest-reported error status), and completion — because
+provisioning is exactly when the operator has tabbed away, and health-incident
+notifications are deliberately paused there. D31's assistant prose records the
+auto-start.
+
 ### 2026-07-28 — The app creates its own configuration; choosing a .env is now the advanced path
 
 todo/lifecycle-dead-ends.md item 7: the Setup tab used to block on "choose the

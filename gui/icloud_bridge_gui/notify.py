@@ -26,6 +26,11 @@ from .health import GREEN, RED
 FAILURE = "failure"
 RECOVERY = "recovery"
 
+#: Informational provisioning moments use the same tray icon as a recovered
+#: health incident.  ``TrayIcon`` deliberately has only warning/information
+#: presentation, and these moments need the latter without adding Qt here.
+PROVISIONING = RECOVERY
+
 TITLE = "iCloud bridge"
 
 #: After a successful power-on the canary is legitimately as old as the bridge
@@ -108,3 +113,37 @@ class IncidentTracker:
 
         # Yellow, or green with no incident open: nothing to say.
         return None
+
+
+class ProvisioningTracker:
+    """Remember the operator-relevant moments already announced for each run."""
+
+    def __init__(self) -> None:
+        self._announced: dict[str, set[str]] = {}
+
+    def observe(self, run_id: str, phase: str, *, failed: bool = False) -> Notification | None:
+        """Return one notification for a new provisioning moment in ``run_id``."""
+        if not run_id:
+            return None
+        if failed:
+            moment = FAILURE
+            message = Notification(
+                FAILURE, TITLE,
+                "Windows provisioning needs attention. Open the status window for details.")
+        elif phase == "waiting-for-signin":
+            moment = "waiting-for-signin"
+            message = Notification(
+                PROVISIONING, TITLE,
+                "Windows provisioning is waiting for you to sign in to iCloud in the VM.")
+        elif phase == "done":
+            moment = "done"
+            message = Notification(
+                PROVISIONING, TITLE,
+                "Windows provisioning is complete. Open the status window to connect the shares.")
+        else:
+            return None
+        announced = self._announced.setdefault(run_id, set())
+        if moment in announced:
+            return None
+        announced.add(moment)
+        return message

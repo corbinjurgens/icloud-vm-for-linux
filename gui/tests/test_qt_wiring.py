@@ -493,6 +493,50 @@ def test_setup_advanced_existing_env_path_remains_selectable(controller, fakes, 
     assert app._window._env_button.text() == "Use an existing .env..."
 
 
+def test_create_vm_starts_the_first_provisioning_run(controller, fakes, monkeypatch):
+    """Create VM's confirmation covers the first-run request as well."""
+    fakes.inspect.result = power.DockerStatus("absent", detail="no such object")
+    monkeypatch.setattr(firstrun, "create_vm", lambda *_args, **_kwargs: (True, "created"))
+    app = controller()
+    assert pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.SETUP
+                and not app._setup_busy)
+    app._window.configuration_requested.emit("120G", "3G", "2")
+    assert pump(2.0, until=lambda: bool(app._env_path) and not app._setup_busy)
+    fakes.inspect.result = power.DockerStatus("running", raw="running")
+
+    app._on_create_vm_requested()
+
+    assert pump(3.0, until=lambda: fakes.stage.count == 1)
+    assert app._model.phase is lifecycle.Phase.PROVISIONING
+
+
+def test_provisioning_notifications_are_once_per_run(controller, fakes):
+    app, _window = provisioning_controller(controller, fakes)
+    start_first_run(app, fakes)
+    tray = app._tray
+    assert tray is not None
+
+    deliver_status(app, fakes, provision_status(guestprov.PHASE_WAITING_FOR_SIGNIN))
+    deliver_status(app, fakes, provision_status(guestprov.PHASE_WAITING_FOR_SIGNIN))
+    deliver_status(app, fakes, provision_status(guestprov.PHASE_DONE))
+
+    bodies = [body for _title, body in tray.notifications]
+    assert sum("sign in to iCloud" in body for body in bodies) == 1
+    assert sum("provisioning is complete" in body for body in bodies) == 1
+
+
+def test_guest_reported_provisioning_failure_notifies(controller, fakes):
+    app, _window = provisioning_controller(controller, fakes)
+    start_first_run(app, fakes)
+    tray = app._tray
+    assert tray is not None
+
+    deliver_status(app, fakes, provision_status(guestprov.PHASE_INSPECTING,
+                                                error="guest setup failed"))
+
+    assert sum("needs attention" in body for _title, body in tray.notifications) == 1
+
+
 def test_inspection_failure_routes_into_setup_without_mutating(controller, fakes):
     fakes.inspect.result = power.DockerStatus("error", detail="daemon down")
     app = controller()

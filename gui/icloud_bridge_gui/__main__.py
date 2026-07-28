@@ -306,6 +306,9 @@ class Application(QObject):
         #: monitoring state feeds it; every transitional and intentional state
         #: resets it so an expected red never announces itself as a fault.
         self._incidents = notify.IncidentTracker()
+        #: Per-run provisioning notifications remain active while health
+        #: incident announcements are intentionally paused.
+        self._provisioning_notifications = notify.ProvisioningTracker()
         self._notify_enabled = False
 
         self._window = MainWindow(self.run_async)
@@ -832,6 +835,7 @@ class Application(QObject):
                 self._record_state = firstrun.RECORD_MATCHES
                 self._setup_detail = output
                 self._dispatch(lifecycle.Event.VM_CREATED)
+                self._start_first_provisioning_run()
             else:
                 self._end_busy()
                 self._setup_detail = f"docker compose up -d failed:\n{output}"
@@ -949,6 +953,10 @@ class Application(QObject):
             return
         if not self._confirm_provision():
             return
+        self._start_first_provisioning_run()
+
+    def _start_first_provisioning_run(self) -> None:
+        """Enter and start the first run after its confirmation has happened."""
         self._dispatch(lifecycle.Event.PROVISION_BEGIN_FIRST_RUN)
         # A first run establishes the selected credential even when a partly
         # configured VM already has an account: this app has no way to learn the
@@ -1059,6 +1067,7 @@ class Application(QObject):
             if not lifecycle.accepts(self._model, token):
                 return
             self._prov_error = f"Could not record this provisioning run: {message}"
+            self._announce_provisioning(self._prov_run_id, failed=True)
             self._dispatch(lifecycle.Event.PROVISION_FAILED, token)
 
         self.run_async(work, done, failed)
@@ -1166,6 +1175,7 @@ class Application(QObject):
             if not lifecycle.accepts(self._model, token):
                 return
             self._prov_error = message
+            self._announce_provisioning(self._prov_run_id, failed=True)
             self._dispatch(lifecycle.Event.PROVISION_FAILED, token)
 
         self.run_async(work, done, failed)
@@ -1220,6 +1230,7 @@ class Application(QObject):
         if previous is None or previous.phase != status.phase:
             self._prov_phase_since = now
         self._update_record_from_status(status)
+        self._announce_provisioning(status.run_id, status.phase, failed=status.failed)
         self._prov_warning = guestprov.stall_reason(
             status.phase, phase_elapsed=now - self._prov_phase_since,
             since_update=max(0.0, time.time() - status.mtime) if status.mtime else 0.0)
@@ -1429,6 +1440,13 @@ class Application(QObject):
             return
         self.run_async(lambda: guestprov.cleanup(power.docker_runner, run_id),
                        lambda _ran: None, lambda _message: None)
+
+    def _announce_provisioning(self, run_id: str, phase: str = "", *,
+                               failed: bool = False) -> None:
+        """Show each operator-needed provisioning moment once per guest run."""
+        message = self._provisioning_notifications.observe(run_id, phase, failed=failed)
+        if message is not None and self._tray is not None:
+            self._tray.notify(message.title, message.body, level=message.kind)
 
     # -------------------------------------------- provisioning presentation --
 
