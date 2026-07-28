@@ -451,14 +451,14 @@ unison <local-root> <remote-root>
   -batch
   -auto
   -fastcheck false
-  -times true
+  -times=true
   -perms 0
-  -dontchmod true
-  -owner false
-  -group false
-  -xattrs false
-  -acl false
-  -confirmbigdel true
+  -dontchmod=true
+  -owner=false
+  -group=false
+  -xattrs=false
+  -acl=false
+  -confirmbigdel=true
   -backup "Name *"
   -backupcurr "Name *"
   -backuploc central
@@ -475,6 +475,14 @@ unison <local-root> <remote-root>
 Each quoted string above is **one** argv element (`Name *`,
 `Path .obsidian/cache`, and so on); the quotes are documentation, not shell
 syntax.
+
+The seven `-name=value` options are written that way because Unison's parser
+treats each of them as a flag taking no separate argument: given `-times true`
+it reads `true` as a third root and exits 1 with "unison was invoked incorrectly
+(too many roots)". Verified against 2.53.8. The options that do take a separate
+argument — `-fastcheck`, `-perms`, `-backup`, `-backupcurr`, `-backuploc`,
+`-backupdir`, `-maxbackups`, `-ignore`, `-logfile`, `-color` — are passed as two
+argv elements, as written. Do not "normalise" the two forms into one.
 
 Why each option, briefly: `-fastcheck false` makes update detection
 content-based rather than trusting a CIFS-reported mtime; `-times true` keeps
