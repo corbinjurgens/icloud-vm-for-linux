@@ -44,7 +44,10 @@ MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_LIST_LIMIT = 1000
 
 _REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
-_BAD_SEGMENT_CHARS = set('<>:"|?*')
+
+# Public because `workspaces.normalize_remote` validates the same mount-relative
+# namespace and must reject the same segments (D22d); one set, two readers.
+BAD_SEGMENT_CHARS = set('<>:"|?*')
 
 
 class BridgeError(Exception):
@@ -212,7 +215,7 @@ def validate_relpath(path: str, *, allow_root: bool = False) -> str:
             raise ValueError("empty path segment")
         if segment in (".", ".."):
             raise ValueError("relative path segment")
-        if _BAD_SEGMENT_CHARS & set(segment):
+        if BAD_SEGMENT_CHARS & set(segment):
             raise ValueError("invalid character in path segment")
         if segment.endswith(" ") or segment.endswith("."):
             raise ValueError("path segment ends with a space or dot")

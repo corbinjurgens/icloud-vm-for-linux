@@ -194,6 +194,30 @@ def test_remote_rejections(given):
         workspaces.normalize_remote(given)
 
 
+@pytest.mark.parametrize("given", [
+    # A character Windows cannot use in a folder name (bridge.BAD_SEGMENT_CHARS).
+    'Documents/Vault<x', 'Documents/Vault>x', 'Documents/Vault:x',
+    'Documents/Vault"x', "Documents/Vault|x", "Documents/Vault?x",
+    "Documents/Vault*x", "<Documents>/Vault",
+    # A segment Windows cannot name because it ends with a space or a dot.
+    "Documents /Vault", "Documents./Vault", "Documents/Vault ",
+    "Documents/Vault.", "Documents/Vault..", "Trailing dot./Vault",
+    # A segment that is only whitespace.
+    "Documents/   ", "   /Vault", "Documents/　",
+])
+def test_remote_rejects_windows_invalid_segments(given):
+    with pytest.raises(workspaces.WorkspaceError):
+        workspaces.normalize_remote(given)
+
+
+@pytest.mark.parametrize("given", [
+    "My Notes", "Documents/My Notes", "Café", "Documents/Café",
+    "Notes/My Vault/Daily notes", "a.b/c.d", "a b.c d",
+])
+def test_remote_accepts_legitimate_spaces_dots_and_unicode(given):
+    assert workspaces.normalize_remote(given) == given
+
+
 def test_a_multibyte_segment_is_measured_in_bytes_not_characters():
     # 128 two-byte characters is 256 bytes, one over the limit.
     with pytest.raises(workspaces.WorkspaceError):

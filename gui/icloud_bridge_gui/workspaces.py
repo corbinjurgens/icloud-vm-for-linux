@@ -327,6 +327,14 @@ def normalize_remote(remote: object) -> str:
 
     Storage keeps the operator's casing; :func:`remote_key` is the comparison
     form. Nothing here touches the mount — this is string work only.
+
+    The per-segment character and trailing-space-or-dot rules reuse
+    `bridge.BAD_SEGMENT_CHARS`, the same set `bridge.validate_relpath` rejects
+    with (v2 plan D22d): both validate the same mount-relative namespace, so a
+    folder this app would let an operator configure must be one Windows can
+    actually hold. Unlike `validate_relpath`, a backslash here is rejected
+    outright rather than translated, because this value is what a person
+    typed, not an agent-protocol path.
     """
     if not isinstance(remote, str):
         raise WorkspaceError("the iCloud folder is not a string")
@@ -351,7 +359,7 @@ def normalize_remote(remote: object) -> str:
         raise WorkspaceError(
             "the iCloud folder cannot be empty or the whole sync root")
     for segment in text.split("/"):
-        if not segment:
+        if not segment or not segment.strip():
             raise WorkspaceError("the iCloud folder has an empty path segment")
         if segment in (".", ".."):
             raise WorkspaceError(
@@ -359,6 +367,13 @@ def normalize_remote(remote: object) -> str:
         if len(segment.encode("utf-8")) > MAX_SEGMENT_BYTES:
             raise WorkspaceError(
                 f"an iCloud folder name exceeds {MAX_SEGMENT_BYTES} bytes")
+        if bridge.BAD_SEGMENT_CHARS & set(segment):
+            raise WorkspaceError(
+                "the iCloud folder contains a character Windows cannot use in a "
+                "folder name")
+        if segment.endswith(" ") or segment.endswith("."):
+            raise WorkspaceError(
+                "an iCloud folder name cannot end with a space or a dot")
     return text
 
 

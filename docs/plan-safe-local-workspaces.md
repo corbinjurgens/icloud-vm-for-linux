@@ -244,11 +244,16 @@ Rejected outright:
 
 - empty, or empty after normalization;
 - any segment equal to `.` or `..`;
-- an empty segment (`a//b` normalizes; a leading `/` is stripped, but a rooted
-  path such as `/mnt/icloud/x` given as `remote` is rejected because its first
-  segment would be `mnt` only after stripping a root the user did not mean —
-  reject any input whose original form starts with `/`);
+- an empty segment, or a segment that is only whitespace (`a//b` normalizes; a
+  leading `/` is stripped, but a rooted path such as `/mnt/icloud/x` given as
+  `remote` is rejected because its first segment would be `mnt` only after
+  stripping a root the user did not mean — reject any input whose original
+  form starts with `/`);
 - a NUL byte, a backslash, or any C0 control character;
+- a segment containing a character Windows cannot use in a folder name, or a
+  segment ending in a space or a dot — the same shapes `bridge.validate_relpath`
+  rejects for the same mount-relative namespace (D22d); `normalize_remote`
+  reuses that function's character set rather than a second copy of it;
 - a path whose resolution would escape the configured mount root;
 - the mount root itself (a workspace may not be the whole sync root);
 - anything longer than 1024 characters, or any segment longer than 255 bytes.
@@ -266,7 +271,9 @@ remote directory must already exist; a workspace never creates one.
 A local root must be:
 
 - **absolute**, and normalized without resolving symlinks in the stored value;
-- **not** inside the iCloud mount, `/mnt/icloud_bridge`, `$XDG_STATE_HOME`, or
+- **not** inside the iCloud mount (`ICLOUD_MOUNT_DIR`, default
+  `bridge.DEFAULT_MOUNT_DIR`), the bridge control share (`ICLOUD_BRIDGE_DIR`,
+  default `bridge.DEFAULT_BRIDGE_DIR`), `$XDG_STATE_HOME`, or
   `$XDG_CONFIG_HOME`, and not an ancestor of any of them;
 - **not** a symlink (the final component is checked with `lstat`), and no
   existing ancestor component may be a symlink;
