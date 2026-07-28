@@ -273,6 +273,30 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-28 — tools/*.ps1 made pure ASCII after a live parse failure on first run
+
+`tools/profile-windows-idle.ps1`, shipped 2026-07-27 and written and parsed but
+never run on Windows, failed to PARSE on the live guest under Windows
+PowerShell 5.1 on its first ever run: "The string is missing the terminator"
+at line 226 (the WARN catch block). The root cause was line 97: an em dash
+inside the double-quoted string
+`"==> Leave the guest idle for $Seconds s -- do not touch the desktop"`. PS 5.1
+reads BOM-less files as ANSI/CP1252, so the em dash's UTF-8 bytes `E2 80 94`
+decode as three CP1252 characters whose last, `0x94`, is a curly closing
+double quote — which terminated the string early and corrupted the rest of the
+parse. This is exactly the failure class `tools/hygiene-checks.sh` already
+documented from the OEM watcher registration, but its ASCII roster covered
+only `provision/*.ps1`, `provision/*.bat` and `guest-agent/*.ps1` — guest-run
+scripts under `tools/` slipped through, and `make lint-ps` (PowerShell 7)
+parses the same bytes as UTF-8 so it never caught the bug. Fixed by replacing
+every non-ASCII character across `tools/*.ps1`
+(`profile-windows-idle.ps1`, `icloud-status.ps1`, `icloud-folders.ps1`,
+`test-smb-hydration.ps1`) with ASCII equivalents — em dashes become `--`, no
+wording changed — and by widening the hygiene checker's guest-ASCII case
+pattern to include `tools/*.ps1`. The sampler script still has never completed
+a full run on the guest; only this parse failure and its fix are live-proven
+so far.
+
 ### 2026-07-28 — F3 executed on the guest: the PowerShell 5.1 proofs are recorded
 
 The I-009 completion gate's guest half ran on the live guest under Windows

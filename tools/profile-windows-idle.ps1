@@ -1,7 +1,7 @@
-# profile-windows-idle.ps1 — attribute the guest's idle CPU to named processes.
+# profile-windows-idle.ps1 -- attribute the guest's idle CPU to named processes.
 #
 # What:    takes two per-process counter samples around an idle interval and
-#          reports the DELTAS between them — CPU, working set, private bytes and
+#          reports the DELTAS between them -- CPU, working set, private bytes and
 #          disk read/write. A lifetime total says nothing about a current cost,
 #          which is why nothing here prints one. Read-only: it starts, stops,
 #          disables and configures nothing.
@@ -17,12 +17,12 @@
 #          -Top <5-200>        how many process rows to print (default 40)
 #          -OutDir <path>      where the report is written (default \\host.lan\Data)
 #          -OutFile <path>     an exact destination instead of OutDir/<stamp>
-# Idempotent: yes — it reads counters and writes one new timestamped report.
+# Idempotent: yes -- it reads counters and writes one new timestamped report.
 #
 # Privacy. The report holds process names, PIDs, Windows service names and
 # counter numbers, and nothing else. It never records command lines, environment
 # variables, file paths, window titles, user names, Apple account data or file
-# contents — the same boundary the host-side diagnostic report keeps (v2 plan
+# contents -- the same boundary the host-side diagnostic report keeps (v2 plan
 # D37).
 #
 # Reading the result. This measures *what the guest is doing*, not what should
@@ -94,7 +94,7 @@ try {
     exit 1
 }
 
-Write-Host "==> Leave the guest idle for $Seconds s — do not touch the desktop"
+Write-Host "==> Leave the guest idle for $Seconds s -- do not touch the desktop"
 Start-Sleep -Seconds $Seconds
 $second = Read-Sample
 

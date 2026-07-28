@@ -85,14 +85,19 @@ done
 # not UTF-8, so a multi-byte UTF-8 character parses as several CP1252 ones —
 # and an em dash's trailing 0x94 byte is a curly closing quote there, which
 # ends a double-quoted string early and breaks the whole parse (observed live:
-# the OEM watcher registration failed exactly this way). The repo is no-BOM by
-# hard rule 8, so everything the guest executes must stay plain ASCII.
+# the OEM watcher registration failed exactly this way, twice — first the OEM
+# watcher registration, later tools/profile-windows-idle.ps1 on its first run
+# on the guest). The repo is no-BOM by hard rule 8, so everything the guest
+# executes must stay plain ASCII. That includes tools/*.ps1: those scripts are
+# delivered to and run inside the guest the same way provision/ and
+# guest-agent/ are (see docs/automation-notes.md), so they carry the identical
+# failure mode and are covered here too.
 
 echo "==> guest scripts are ASCII-only"
 gascii=0 gcount=0
 for f in "${TEXT[@]}"; do
   case "$f" in
-    provision/*.ps1|provision/*.bat|guest-agent/*.ps1) ;;
+    provision/*.ps1|provision/*.bat|guest-agent/*.ps1|tools/*.ps1) ;;
     *) continue ;;
   esac
   gcount=$((gcount + 1))

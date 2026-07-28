@@ -1,4 +1,4 @@
-# icloud-status.ps1 — report iCloud Drive hydration state inside the guest.
+# icloud-status.ps1 -- report iCloud Drive hydration state inside the guest.
 #
 # Delivered to the guest via the container's Samba share (\\host.lan\Data) and
 # run with:

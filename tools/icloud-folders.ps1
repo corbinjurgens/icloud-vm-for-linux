@@ -1,4 +1,4 @@
-# icloud-folders.ps1 — per-folder size and hydration breakdown of iCloud Drive.
+# icloud-folders.ps1 -- per-folder size and hydration breakdown of iCloud Drive.
 #
 # Run in the guest via the container Samba share:
 #   powershell -ExecutionPolicy Bypass -File \\host.lan\Data\icloud-folders.ps1

@@ -1,4 +1,4 @@
-# test-smb-hydration.ps1 — does an SMB read hydrate a dataless placeholder?
+# test-smb-hydration.ps1 -- does an SMB read hydrate a dataless placeholder?
 #
 # HISTORICAL EVIDENCE, kept so the finding can be reproduced. This was the
 # empirical test of plan D5's core assumption. v1 asserted that dataless
@@ -7,7 +7,7 @@
 #
 # It ran on 2026-07-22/23 and the answer was YES: placeholders hydrate on
 # demand, with correct content and checksums. D5 is therefore disproven and
-# superseded by v2 D14/D25 — Files On-Demand stays on and nothing is pinned.
+# superseded by v2 D14/D25 -- Files On-Demand stays on and nothing is pinned.
 # The results are recorded in docs/plan-gui-selective-sync.md section 0.5.
 #
 # Note the scope limit that E0 exists to close: this test drives userland
