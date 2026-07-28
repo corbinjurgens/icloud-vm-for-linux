@@ -29,3 +29,21 @@ The item's manual first-run sequence (03/04 elevated, D29-D31 host path) was
 superseded by the app-driven path and is preserved in the original note text in
 git history; the four acceptance conditions above are the record of what F1
 required.
+
+## 2026-07-28 — F3: the remaining I-009 guest proof (done)
+
+All four required checks ran on the live guest under Windows PowerShell
+5.1.26100.7920, driven over the qemu-monitor keystroke channel with results
+written to the Data share (the F3 driver and its `results.txt` lived under
+`\\host.lan\Data\f3\`; the full numbers are in the 2026-07-28 "F3 executed on
+the guest" CHANGELOG entry):
+
+- `tools/test-agent-walk.ps1` passes in full under 5.1 (exit 0).
+- Join-Path vs concatenation over 2,000 real-library entries (55 spaced,
+  1,572 non-ASCII names, longest path 175 chars): equal on all 2,000 plain
+  paths; divergent on all 2,000 `\\?\`-prefixed forms — proving the long-path
+  ACL work must (and does) use concatenation, never `Join-Path`.
+- Zero-entry, one-entry and ordinary directories enumerate correctly (0/1/54).
+- Formal pass durations: 29 s at 60,154 entries (2026-07-27, build 6);
+  30.162 s and 52.228 s at 69,620 entries (2026-07-28, build 9),
+  `lastError: none` throughout.

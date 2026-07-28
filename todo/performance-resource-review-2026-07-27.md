@@ -124,29 +124,11 @@ gap to another service-disable list.
 guest-mode CPU in `docs/acceptance-results.md`, with each material share fixed
 or explicitly accepted.
 
-### F3 — Close the remaining I-009 guest proof
+### F3 — done 2026-07-28; archived
 
-**Priority: alongside F2.**
-
-**Status, 2026-07-27 (later the same day): partially satisfied.** A real-library
-pass has completed under the guest's Windows PowerShell 5.1 — the host the agent
-actually runs on — at 60,154 entries in 29 s with `lastError: none`. Still open,
-exactly as `I-009` records it: the `Join-Path`-versus-concatenation comparison
-on the guest, `tools/test-agent-walk.ps1` under PowerShell 5.1, and first/second
-scan durations written down as formal results rather than read out of a
-changelog entry.
-
-On Windows PowerShell 5.1:
-
-- run `tools/test-agent-walk.ps1`;
-- compare representative `Join-Path` results with `$Full + '\' + $Name` under
-  the actual `C:\Users\icloud\iCloudDrive` root, including spaces, non-ASCII,
-  and long paths;
-- verify zero-entry, one-entry, and ordinary directories;
-- record the first and second real full-scan durations and entry counts.
-
-The test must prove path equivalence and a completed real-library pass. A
-synthetic PowerShell 7 speed result is not enough.
+All four checks ran on the live guest under Windows PowerShell 5.1 — see
+[`archive/performance-resource-review-2026-07-27.md`](archive/performance-resource-review-2026-07-27.md)
+and the 2026-07-28 "F3 executed on the guest" CHANGELOG entry.
 
 ### F4 — Run the already-designed `halt_poll_ns=0` A/B test
 
@@ -368,8 +350,8 @@ mostly behind us, so steps 2 onward are unblocked rather than queued.
 1. F1: done and archived 2026-07-28 (second/third scans, share identity, GUI
    check all recorded).
 2. Run E0 and record the actual kernel-CIFS data-path baseline.
-3. F2/F3: attribute Windows idle CPU and finish the PowerShell 5.1 proof of the
-   agent rewrite.
+3. F2: attribute Windows idle CPU (F3's PowerShell 5.1 proof recorded
+   2026-07-28).
 4. P1: add the content-preview hydration warning.
 5. F4 and P5: controlled host A/B tests, one variable at a time.
 6. Use real scan/list/exclusion counts to decide P2–P6. P2 is safe regardless

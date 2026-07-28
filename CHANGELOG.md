@@ -145,7 +145,11 @@ How it ended, with the full record in
 
 ### I-009 — Reduce the guest agent's per-entry walk cost
 
-**Status:** Main item shipped 2026-07-26 (see the shipped entry); remainder below  
+**Status:** Main item shipped 2026-07-26 (see the shipped entry); the guest-side
+proofs the gate demanded were recorded 2026-07-28 (see "F3 executed on the
+guest" under Shipped improvements) — what remains open here is only the two
+excluded-subtree candidates below, which are P6 of the performance review and
+still need a D34 amendment plus an exclusion-cost numerator  
 **Evidence:** Follows the same review that produced the serializer work already
 shipped below, and is the remainder of it. The per-entry `Join-Path` calls and
 the per-directory scriptblock sorts are gone — measured 61.5 us -> 0.84 us of
@@ -268,6 +272,29 @@ Bumping the minor digit is a one-line change; `Makefile` and
 happens after that, never before.
 
 ## Shipped improvements
+
+### 2026-07-28 — F3 executed on the guest: the PowerShell 5.1 proofs are recorded
+
+The I-009 completion gate's guest half ran on the live guest under Windows
+PowerShell 5.1.26100.7920 (Desktop edition), driven from the host over the
+qemu-monitor keystroke channel with results written to the Data share.
+`tools/test-agent-walk.ps1` passes in full under 5.1 (exit 0): SortByName
+reproduces the retired scriptblock comparator's captured order, tolerates
+null/scalar/`Object[]` inputs, and the DFS-preorder emission agrees with
+`Compare-RelPathDfs` including the ancestors-before-descendants and
+flat-compare-disagrees guards. The `Join-Path`-equivalence question is settled
+with real-library data: over 2,000 entries of the operator's library (55 names
+with spaces, 1,572 with non-ASCII characters, longest full path 175 chars),
+concatenation matched `Join-Path` on **all 2,000** plain paths — and diverged
+on **all 2,000** `\\?\`-prefixed forms, which is the stronger finding: the
+long-path form the ACL reconciliation depends on must never go through
+`Join-Path`, and the agent's native helper indeed builds it by concatenation
+(`agent.ps1` `ToExtended`). Zero-entry, one-entry and ordinary directories
+enumerate correctly (0/1/54). The formal pass durations stand recorded: first
+real-library pass 29 s at 60,154 entries (2026-07-27, build 6); subsequent
+full passes 30.162 s and 52.228 s at 69,620 entries (2026-07-28, build 9),
+`lastError: none` throughout. F3's section in the performance todo note moves
+to `todo/archive/`.
 
 ### 2026-07-28 — The data mount stops vetoing writes the guest allows
 
