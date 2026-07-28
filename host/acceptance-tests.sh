@@ -19,6 +19,15 @@ here="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$here/.." && pwd)"
 BRIDGE="${ICLOUD_BRIDGE_DIR:-/mnt/icloud_bridge}"
 
+# The bridge container always runs on the native Engine (SETUP.md section 2), but
+# a shell whose Docker context points at Docker Desktop sends every `docker`
+# below to the wrong daemon, which false-fails the container checks on a healthy
+# host (seen live 2026-07-28). An explicit DOCKER_HOST still wins; otherwise
+# prefer the native socket over whatever context this shell happens to carry.
+if [ -z "${DOCKER_HOST:-}" ] && [ -S /var/run/docker.sock ]; then
+  export DOCKER_HOST=unix:///var/run/docker.sock
+fi
+
 echo "== 1. KVM acceleration usable =="
 if command -v kvm-ok >/dev/null 2>&1; then
   kvm-ok >/dev/null 2>&1 && ok "kvm-ok" || bad "kvm-ok reports KVM unusable"
@@ -90,7 +99,26 @@ if date -Is > "$CANARY" 2>/dev/null && [ -f "$CANARY" ]; then
   ok "wrote and read back $CANARY (verify it appears on an Apple device manually)"
   rm -f "$CANARY" 2>/dev/null
 else
-  bad "cannot write into /mnt/icloud"
+  # Two unrelated causes look identical from the failed write alone, and only one
+  # of them involves the guest at all. The sync root carries the DOS read-only
+  # attribute, which the cifs client maps to mode 0555 and then uses to veto the
+  # create locally while subdirectories keep dir_mode's 0775 -- the guest never
+  # sees the request, and the same create over smbclient succeeds (proved live
+  # 2026-07-28). v2 plan D50 answers that with `noperm` on the data mount, so a
+  # mount predating that decision still fails here. Anything else is a real
+  # refusal by the guest and needs a different investigation.
+  root_mode=$(stat -c %a /mnt/icloud 2>/dev/null)
+  subdir=$(find /mnt/icloud -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
+  if [ "${root_mode:-}" = "555" ] && [ -n "$subdir" ] && [ -w "$subdir" ]; then
+    bad "cannot create at the root of /mnt/icloud: it stats as 0555 while
+        $subdir is writable, so the host's cifs client is vetoing the create from
+        the sync root's read-only attribute; this mount lacks 'noperm'
+        (v2 plan D50); add it to Options= in
+        /etc/systemd/system/mnt-icloud.mount, daemon-reload, and remount"
+  else
+    bad "cannot write into /mnt/icloud (root mode ${root_mode:-unknown}; not the
+        D50 client-side veto: the guest or the share itself refused the write)"
+  fi
 fi
 
 echo "== 6. Health timer active and last run succeeded =="

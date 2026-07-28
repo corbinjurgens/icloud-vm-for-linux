@@ -269,6 +269,47 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-28 — The data mount stops vetoing writes the guest allows
+
+Creating a file or a directory at the **root** of `/mnt/icloud` failed with
+`EACCES` that never reached the guest. The iCloud sync root carries the DOS
+read-only attribute — normal for a Windows folder with a custom icon, and
+re-applied by the shell if cleared — and the host's cifs client maps that
+attribute onto mode `0555`, then refuses the create itself; subdirectories keep
+`dir_mode`'s `0775` and worked throughout. The server was always willing: the
+same create and delete at the share root succeed over `smbclient` with the same
+`syncshare` credential (live host, 2026-07-28). So the operator could not make a
+top-level item at all, and the section-5 acceptance canary — which writes exactly
+there — reported a bare `FAIL` for a client-side artifact.
+
+New decision **D50** (v2 plan register) makes the share's own ACLs the only
+permission authority on that mount: `host/mnt-icloud.mount` gains `noperm`, so
+every request is issued and the guest decides it. That removes no protection —
+the mount forces one `uid`/`gid` and constant `file_mode`/`dir_mode`, so the mode
+the client was testing is one the unit file invented rather than a report of the
+NTFS ACL, which the guest enforces on every request regardless (D15's deny ACEs
+and ABE are untouched, as is D8 authentication). Two consequences are stated
+rather than hidden: the root keeps *displaying* as `0555` while writes to it now
+succeed, and a DOS read-only file anywhere on the share is now refused by the
+guest instead of pre-refused by the host. `host/mnt-icloud_bridge.mount`
+deliberately does not get the option — its exported directory carries no
+read-only attribute and its root is writable today.
+
+`host/acceptance-tests.sh` section 5 keeps the root canary and now separates the
+two causes: a root that stats as `0555` while a subdirectory is writable names
+the client-side veto and the missing `noperm`; anything else is reported as a
+genuine refusal by the guest or the share. The same script now prefers
+`unix:///var/run/docker.sock` when `DOCKER_HOST` is unset, because a shell whose
+Docker context points at Docker Desktop false-failed the two container checks on
+a healthy host in the run that found all of this.
+
+Applying this live is the operator path, not an automatic one: reinstall the
+package (or copy the unit over `/etc/systemd/system/mnt-icloud.mount`),
+`systemctl daemon-reload`, and remount. `SETUP.md`'s troubleshooting table now
+carries the symptom and that fix. Nothing here is proven by the repository
+checks, which cannot mount CIFS; the live acceptance re-run that confirms the
+canary passes belongs to the operator.
+
 ### 2026-07-28 — F1 closed: the provisioned guest's recorded confirmations
 
 The three confirmations F1 of

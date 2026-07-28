@@ -28,6 +28,20 @@
 #   * No max_channels: the guest has one virtio NIC behind dockur's NAT and
 #     advertises an address the host cannot reach, so multichannel is
 #     structurally inapplicable here.
+#   * noperm turns off the *client-side* permission check (v2 plan D50). The
+#     iCloud sync root carries the DOS read-only attribute -- normal for a
+#     Windows folder that has a custom icon, and re-set by the shell if cleared
+#     -- and the cifs client maps that attribute to mode 0555, then vetoes a
+#     create at the mount root before the request ever leaves the host, while
+#     subdirectories keep dir_mode's 0775. The check it removes was never a
+#     security boundary: uid, gid, file_mode and dir_mode are forced constants
+#     here, so the mode being tested is one this file made up rather than
+#     anything the guest reported. The guest's SMB server still authenticates
+#     syncshare (D8) and still enforces the NTFS ACLs, including D15's deny ACEs
+#     on excluded roots plus ABE, so *what* may be written is unchanged. What
+#     changes is that a DOS read-only object anywhere on this share is now
+#     refused by the server rather than pre-refused by the host, and that
+#     `ls -l` keeps showing the root as 0555 while writes to it succeed.
 [Unit]
 Description=iCloud Drive via Windows VM (CIFS)
 Requires=docker.service
@@ -41,7 +55,7 @@ ConditionPathExists=!/var/lib/icloud-bridge/powered-off
 What=//127.0.0.1/icloud
 Where=/mnt/icloud
 Type=cifs
-Options=credentials=/etc/credentials-icloud,port=10445,vers=3.1.1,uid=1000,gid=1000,file_mode=0664,dir_mode=0775,actimeo=1,rasize=16777216,echo_interval=15,_netdev
+Options=credentials=/etc/credentials-icloud,port=10445,vers=3.1.1,uid=1000,gid=1000,file_mode=0664,dir_mode=0775,noperm,actimeo=1,rasize=16777216,echo_interval=15,_netdev
 TimeoutSec=30
 
 [Install]

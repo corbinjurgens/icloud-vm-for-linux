@@ -6,6 +6,11 @@
 # See mnt-icloud.mount for why cache=strict/actimeo=1 are load-bearing and why
 # there is no sign/seal/mfsymlinks (v2 plan D32/D33). No `rasize` here: this share
 # only ever carries small JSON documents, so readahead tuning buys nothing.
+# No `noperm` either (v2 plan D50): the exported directory is created by
+# 04-bridge-agent.ps1 and carries no DOS read-only attribute, so its root stats
+# as dir_mode's 0775 and the host already writes requests and exclusions.json
+# there. The client-side check is doing nothing here, and leaving it in place
+# keeps this mount's option list a statement about what it actually needs.
 [Unit]
 Description=iCloud bridge control share (CIFS)
 Requires=docker.service
