@@ -81,48 +81,12 @@ Upstream references checked during this pass:
 
 ## Follow up first
 
-### F1 — Provision this guest before drawing more conclusions
+### F1 — done 2026-07-28; archived
 
-**Priority: highest; operator and guest desktop required.**
-
-**Status, 2026-07-27 (later the same day): substantively achieved — the guest is
-provisioned and scanning.** It went through the app-driven path rather than the
-manual sequence below, and the agent (build 7) completed a first full pass of
-the real library: 60,154 entries, `lastError: none`, 29 s. What remains open is
-not the provisioning but the recorded confirmations listed below — a second
-completed scan, the identity of the mounted data share, and the GUI check. The
-sequence below stands as the manual route and as the record of what those
-conditions were.
-
-Run the existing first-run sequence rather than a special performance setup:
-
-1. Run `C:\OEM\03-create-share.ps1` elevated with the intended share password.
-2. Run `C:\OEM\04-bridge-agent.ps1` elevated. This installs the agent build this
-   checkout carries.
-3. Complete/reconcile the host setup and mounts through the documented D29–D31
-   path.
-4. Confirm the GUI sees protocol 1 / that agent build and no update banner.
-
-Do not record a performance result until all of the following are true:
-
-- `status.json` advances every 15 seconds with the checkout's `agentBuild`
-  — **done**, at build 7;
-- `scan.lastCompletedAt` becomes non-null, `scan.entries` is plausible for the
-  real library, and `lastError` does not report `tree`, `scan`, or ACL failure
-  — **done**, at 60,154 entries with `lastError: none`;
-- a *second* full scan completes, proving the result was not only startup luck
-  — **still open**. The ten-minute pass this note originally assumed was wrong
-  by more than an order of magnitude: the real first pass took 29 s, so a second
-  one costs nothing to obtain;
-- the mounted data share is the production `icloud` share, not the historical
-  `icloudtest` test share — **still open as a recorded confirmation**;
-- the GUI shows protocol 1 with no update banner — **still open as a recorded
-  confirmation**.
-
-This was the most important prior discovery: until it was done, neither the old
-agent nor either agent optimization had ever run against the real library. The
-2026-07-27 provisioning closed that gap, and the long-path ACL failure it
-immediately exposed is what a synthetic library would never have shown.
+Provisioning, the second/third completed scans, the production-share identity
+and the GUI protocol check are all recorded — see
+[`archive/performance-resource-review-2026-07-27.md`](archive/performance-resource-review-2026-07-27.md)
+and the 2026-07-28 "F1 closed" CHANGELOG entry.
 
 ### F2 — Attribute the Windows idle CPU before changing Windows
 
@@ -401,8 +365,8 @@ duration reduction.
 The order below is unchanged; what changed on 2026-07-27 is that step 1 is
 mostly behind us, so steps 2 onward are unblocked rather than queued.
 
-1. F1: provisioning is done (app-driven, 2026-07-27) and one real tree pass has
-   completed. Obtain the second, and record the share-identity and GUI checks.
+1. F1: done and archived 2026-07-28 (second/third scans, share identity, GUI
+   check all recorded).
 2. Run E0 and record the actual kernel-CIFS data-path baseline.
 3. F2/F3: attribute Windows idle CPU and finish the PowerShell 5.1 proof of the
    agent rewrite.

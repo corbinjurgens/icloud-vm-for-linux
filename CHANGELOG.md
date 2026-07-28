@@ -269,6 +269,22 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-28 — F1 closed: the provisioned guest's recorded confirmations
+
+The three confirmations F1 of
+`todo/performance-resource-review-2026-07-27.md` still owed are recorded, so
+performance results may now be trusted against this guest. A second and third
+full scan completed on 2026-07-28 (01:42:31Z in 30,162 ms and 01:59:08Z in
+52,228 ms; 69,620 entries each, `lastError: none` — the library grew from
+60,154 entries since the 2026-07-27 first pass). The mounted data share is the
+production one: `/proc/mounts` shows `//127.0.0.1/icloud` at `/mnt/icloud`
+(`vers=3.1.1`, `rasize=16777216`), and no `icloudtest` mount exists. And the
+GUI agrees with the guest: the D37 diagnostic export at 02:14Z reports protocol
+compatibility "current", agent build 9, no update banner, every health row
+green, and 11 exclusions at revision 1 — which is also the first live exercise
+of the diagnostic export in the healthy state (one of E14's four states). F1's
+section in the todo note moves to `todo/archive/`.
+
 ### 2026-07-28 — M5 live remainder: the share-boundary proof and the host acceptance run
 
 Two of the operator-only M5 sub-steps from
