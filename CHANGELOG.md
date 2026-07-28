@@ -273,6 +273,20 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-28 — `make reinstall` can no longer install a stale package
+
+`install:` and `reinstall:` depended on the built `.deb` as a *file*, and the
+`$(DEB):` rule had no source prerequisites — so whenever `dist/` already held a
+package, `make reinstall` silently installed it as-is. Seen live the same day:
+a watcher change (D51) was committed, `make reinstall` ran, and the guest
+re-provision staged the pre-change watcher because the installed payload was
+the stale build; the failure was only visible as a beacon timestamp that never
+moved. Both targets now depend on the phony `deb` target, so the package is
+rebuilt on every install; the rebuild costs seconds. The operator's local
+agent-instruction file (untracked) also now tells assistants to name
+`make reinstall` rather than spelling raw `dpkg`/`apt`/unit-copy lines for
+anything a Makefile target owns.
+
 ### 2026-07-28 — D51: the watcher's console is hidden for real, not nominally
 
 The scheduled task has always passed `-WindowStyle Hidden`, and Windows 11 has

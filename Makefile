@@ -162,17 +162,18 @@ check: lint test ## Everything verifiable without a VM: lint + tests
 deb: ## Build dist/icloud-bridge_<version>_all.deb
 	./packaging/build-deb.sh
 
-install: $(DEB) ## HOST: install the built .deb (then run 'make configure')
+# install/reinstall depend on the phony `deb` target, not on the file: a
+# file-only prerequisite made an existing dist/ package look up to date and
+# installed stale payloads (seen live 2026-07-28, a watcher change silently
+# not deployed). The rebuild is cheap; correctness is not optional.
+install: deb ## HOST: install the built .deb (then run 'make configure')
 	sudo apt install -y ./$(DEB)
 
 # The version string is a build stamp, not a release counter (pre-release), so
 # a rebuilt .deb usually carries the same version and `apt install` refuses it
 # with "already the newest version". This is the refresh path.
-reinstall: $(DEB) ## HOST: reinstall the built .deb even when the version is unchanged
+reinstall: deb ## HOST: reinstall the built .deb even when the version is unchanged
 	sudo apt reinstall -y ./$(DEB)
-
-$(DEB):
-	$(MAKE) deb
 
 uninstall: ## HOST: remove the package, keeping credentials and config
 	sudo apt remove -y icloud-bridge
