@@ -15,6 +15,7 @@ import os
 import socket
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -24,7 +25,7 @@ from PySide6.QtWidgets import QApplication, QCheckBox, QMessageBox, QSystemTrayI
 from . import (autostart, backup, bridge, cli, diagnostics, firstrun, guestprov,
                health, lifecycle, notify, power, workspace_sync, workspaces)
 from .tray import OFF, STARTING, TrayIcon, load_icon
-from .window import MainWindow
+from .window import WORKSPACE_STATE_LABELS, MainWindow, WorkspaceRow
 
 #: Abstract Unix socket (leading NUL): no filesystem path, no stale lock file.
 SINGLE_INSTANCE_ADDRESS = "\0icloud-bridge-gui"
@@ -159,6 +160,58 @@ DRAIN_POLL_MS = 250
 #: uses, and for the same reason: a cycle is cheap when nothing moved, and the
 #: expensive parts guard themselves before they touch anything.
 WORKSPACE_SYNC_INTERVAL_MS = 5000
+
+#: Plan §11.6, character for character. Quitting only the GUI stops the cycles
+#: — there is no daemon — and the honest thing to say is that this costs
+#: propagation, not safety: the local replica is ordinary local files.
+WORKSPACE_QUIT_NOTE = (
+    "Safe Workspace synchronization pauses while this app is closed. Your "
+    "local workspace files stay on this computer and remain safe to edit; "
+    "changes propagate after the next start."
+)
+
+
+def workspace_row(workspace: workspaces.Workspace,
+                  result: workspace_sync.CycleResult | None,
+                  status: dict | None) -> WorkspaceRow:
+    """Classify one workspace for the tab, the health row and the counts.
+
+    Precedence: a paused workspace reads `paused` whatever it last did, because
+    nothing is synchronizing it and saying otherwise would describe work that is
+    not happening. Otherwise this session's own cycle result wins, and the
+    persisted `status.json` is the fallback — which is what paints the tab and
+    the health row at startup without one byte of CIFS access (§7.9).
+
+    The status document is a local file an operator can edit, so its state token
+    is checked against the roster and its `detail` and `paths` are re-bounded
+    here rather than trusted.
+    """
+    state = workspace_sync.STATE_WAITING
+    detail = ""
+    paths: tuple[str, ...] = ()
+    last_success = ""
+    if result is not None:
+        state, detail, paths = result.state, result.detail, result.paths
+        last_success = result.last_success_at
+    elif isinstance(status, dict):
+        token = status.get("state")
+        if isinstance(token, str) and token in WORKSPACE_STATE_LABELS:
+            state = token
+        raw_detail = status.get("detail")
+        if isinstance(raw_detail, str):
+            detail = raw_detail[:workspace_sync.MAX_DETAIL_CHARS]
+        raw_paths = status.get("paths")
+        if isinstance(raw_paths, list):
+            paths = workspace_sync.sanitize_paths(
+                [item for item in raw_paths if isinstance(item, str)])
+        raw_success = status.get("lastSuccessAt")
+        if isinstance(raw_success, str):
+            last_success = raw_success
+    if not workspace.enabled:
+        state = workspace_sync.STATE_PAUSED
+    return WorkspaceRow(workspace=workspace, state=state,
+                        last_success_at=last_success, detail=detail,
+                        paths=paths)
 
 
 class _TaskSignals(QObject):
@@ -332,6 +385,8 @@ class Application(QObject):
         self._window.provision_retry_requested.connect(self._on_provision_retry)
         self._window.provision_env_selected.connect(self._on_provision_env_selected)
         self._window.reprovision_requested.connect(self._on_reprovision_requested)
+        self._window.workspaces_changed.connect(self.reload_workspaces)
+        self._window.workspace_sync_requested.connect(self._tick_workspaces)
         self._window.diagnostics_facts = self._diagnostic_facts
 
         self._tray: TrayIcon | None = None
@@ -373,9 +428,17 @@ class Application(QObject):
         self._workspace_active = False
         self._workspace_pending = False
         self._workspace_results: dict[str, workspace_sync.CycleResult] = {}
+        #: The persisted `status.json` of a workspace that has not run in this
+        #: session, read once per id. It is what the tab and the health row are
+        #: painted from before any cycle, and it never involves the mount.
+        self._workspace_statuses: dict[str, dict | None] = {}
         self._workspace_timer = QTimer(self)
         self._workspace_timer.setInterval(WORKSPACE_SYNC_INTERVAL_MS)
         self._workspace_timer.timeout.connect(self._tick_workspaces)
+        # Read the configuration once now, before the lifecycle decides
+        # anything: the tab must be populated in the powered-off and setup
+        # states too, and `workspaces.load` touches local disk only.
+        self.reload_workspaces()
 
         # Startup must precede any CIFS access: pause bridge I/O until the power
         # inspection (and, if needed, the power-on transition) completes.
@@ -518,6 +581,10 @@ class Application(QObject):
         compatibility = (snapshot.compatibility if snapshot is not None
                          else bridge.Compatibility())
         revision, paths = self._window.selection_facts()
+        # Safe Workspaces contribute counts and one timestamp, and nothing else
+        # (§12.2): no name, no folder, no relative path, no engine output.
+        workspace_rows = self.workspace_rows()
+        states = [row.state for row in workspace_rows]
         try:
             autostart_enabled = autostart.is_enabled()
         except OSError:                     # pragma: no cover - defensive
@@ -551,6 +618,15 @@ class Application(QObject):
             last_helper_ok=self._last_helper_ok,
             last_helper_detail=self._last_helper_detail,
             exclusion_paths=paths,
+            workspaces_configured=len(workspace_rows),
+            workspaces_enabled=sum(1 for row in workspace_rows
+                                   if row.workspace.enabled),
+            workspaces_conflicted=states.count(workspace_sync.STATE_CONFLICT),
+            workspaces_guarded=states.count(workspace_sync.STATE_GUARDED),
+            workspaces_failed=states.count(workspace_sync.STATE_ERROR),
+            workspaces_last_success=max(
+                (row.last_success_at for row in workspace_rows
+                 if row.last_success_at), default=""),
         )
 
     # --------------------------------------------------------- startup flow --
@@ -2130,7 +2206,8 @@ class Application(QObject):
             "Quitting stops syncing and disconnects /mnt/icloud and "
             "/mnt/icloud_bridge. Changes not yet uploaded to iCloud will resume "
             "the next time the bridge starts — this cannot confirm the upload "
-            "queue is empty. Starting the app again powers the VM back on.")
+            "queue is empty. Starting the app again powers the VM back on.\n\n"
+            + WORKSPACE_QUIT_NOTE)
         off_btn = box.addButton("Quit and power off VM", QMessageBox.ButtonRole.AcceptRole)
         gui_btn = box.addButton("Quit GUI only (leave bridge running)",
                                 QMessageBox.ButtonRole.ActionRole)
@@ -2252,8 +2329,23 @@ class Application(QObject):
             self._on_snapshot_failed,
         )
 
+    def _with_workspace_health(self, snapshot: health.Snapshot) -> health.Snapshot:
+        """Append the one synthetic Safe Workspaces row (plan §12.1).
+
+        Appended before anything consumes the snapshot, so the window, the tray
+        and a D37 report all describe the same severity. The row is never red
+        and joins the existing worst-of computation, which is what leaves a
+        disconnected bridge's red precedence untouched.
+        """
+        check = health.workspace_check(row.state for row in self.workspace_rows())
+        if check is None:
+            return snapshot
+        checks = [*snapshot.checks, check]
+        return replace(snapshot, checks=checks, overall=health.overall(checks))
+
     def _on_snapshot(self, snapshot: health.Snapshot) -> None:
         self._refreshing = False
+        snapshot = self._with_workspace_health(snapshot)
         # Retained for D37: a report in a no-CIFS state renders these plus the
         # timestamp that says how old they are.
         self._last_snapshot = snapshot
@@ -2349,6 +2441,8 @@ class Application(QObject):
         except workspaces.WorkspaceError as exc:
             self._workspace_config = workspaces.WorkspaceConfig()
             self._workspace_config_error = str(exc)
+            self._workspace_queue = []
+            self._render_workspaces()
             return
         self._workspace_config_error = ""
         # A workspace the operator removed can no longer be shown, so keeping
@@ -2358,6 +2452,18 @@ class Application(QObject):
         self._workspace_results = {key: value for key, value
                                    in self._workspace_results.items()
                                    if key in known}
+        self._workspace_statuses = {key: value for key, value
+                                    in self._workspace_statuses.items()
+                                    if key in known}
+        # The queue of the pass currently in flight is filtered too. §10's rule
+        # is that a removed or disabled workspace never gets another cycle from
+        # a stale queue, and a GUI edit lands mid-pass: the queue is exactly
+        # where a workspace the operator just paused would otherwise survive.
+        scheduled = {item.id: item for item in self._workspace_config.scheduled()}
+        self._workspace_queue = [scheduled[item.id]
+                                 for item in self._workspace_queue
+                                 if item.id in scheduled]
+        self._render_workspaces()
 
     def workspace_config(self) -> workspaces.WorkspaceConfig:
         """The configuration cycles are currently scheduled from."""
@@ -2370,6 +2476,36 @@ class Application(QObject):
     def workspace_results(self) -> dict[str, workspace_sync.CycleResult]:
         """The last cycle result per workspace id, newest wins. GUI only."""
         return dict(self._workspace_results)
+
+    def _workspace_status(self, workspace_id: str) -> dict | None:
+        """The persisted status document, read once per workspace and cached.
+
+        `read_status` reads only this app's own state directory, never the
+        mount. A workspace that has produced a result in this session is
+        described by that result instead, so this is consulted only for one that
+        has not run yet — a paused one, or any of them before the first pass.
+        """
+        if workspace_id not in self._workspace_statuses:
+            try:
+                self._workspace_statuses[workspace_id] = \
+                    workspace_sync.read_status(workspace_id)
+            except workspaces.WorkspaceError:      # a hand-edited id
+                self._workspace_statuses[workspace_id] = None
+        return self._workspace_statuses[workspace_id]
+
+    def workspace_rows(self) -> list[WorkspaceRow]:
+        """One classified row per configured workspace, in the file's order."""
+        rows = []
+        for item in self._workspace_config.workspaces:
+            result = self._workspace_results.get(item.id)
+            status = None if result is not None else self._workspace_status(item.id)
+            rows.append(workspace_row(item, result, status))
+        return rows
+
+    def _render_workspaces(self) -> None:
+        """Repaint the tab. Called after every reload and every cycle result."""
+        self._window.update_workspaces(self.workspace_rows(),
+                                       error=self._workspace_config_error)
 
     def _stop_workspace_sync(self) -> None:
         """Schedule no further cycles.
@@ -2450,6 +2586,7 @@ class Application(QObject):
             workspace_id=workspace_id, outcome=workspace_sync.ERROR,
             state=workspace_sync.STATE_ERROR,
             detail=message[:workspace_sync.MAX_DETAIL_CHARS])
+        self._render_workspaces()
         self._advance_workspaces()
 
     def _record_workspace_result(self, workspace_id: str,
@@ -2459,6 +2596,7 @@ class Application(QObject):
             # this result knows nothing, so it must not overwrite what is shown.
             return
         self._workspace_results[workspace_id] = result
+        self._render_workspaces()
 
     #: Effect token to handler. Every member of `lifecycle.Effect` must appear
     #: here; `test_qt_wiring` asserts the two stay in step, so adding an effect

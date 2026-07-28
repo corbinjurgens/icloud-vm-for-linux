@@ -1,29 +1,36 @@
-"""The status window: health rows plus the selective-sync UI (v2 plan 6.2).
+"""The status window: health rows, selective sync, and Safe Workspaces.
+
+V2 plan 6.2 for the first two; `docs/plan-safe-local-workspaces.md` §11 for the
+third.
 
 Nothing here touches the CIFS mounts on the GUI thread.  Every read, write and
 request/response poll is handed to ``run_async`` (a ``QThreadPool`` helper
 supplied by ``__main__``) and comes back through a signal, because a sick CIFS
-mount can block even a ``stat``.
+mount can block even a ``stat``.  A file dialog is never pointed at CIFS at all.
 """
 
 from __future__ import annotations
 
 import os
 import stat
+import urllib.parse
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QPalette
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QFileDialog, QHBoxLayout, QLabel,
+    QAbstractItemView, QApplication, QCheckBox, QDialog, QDialogButtonBox,
+    QFileDialog, QFormLayout, QHBoxLayout, QLabel,
     QLineEdit, QMainWindow,
     QMessageBox, QPushButton, QSizePolicy, QTabWidget, QTreeWidget,
     QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget,
 )
 
 from . import (__version__, backup, bridge, diagnostics, filtering, firstrun,
-               guestprov, health, listing, power, sizes)
+               guestprov, health, listing, power, sizes, workspace_sync,
+               workspaces)
 from .tray import VM_VIEWER_URL, open_externally
 
 ROLE_PATH = Qt.ItemDataRole.UserRole
@@ -198,6 +205,257 @@ INCLUDE_WARNING = (
 )
 
 
+# --------------------------------------------- Safe Workspaces (plan §11) --
+# The tab is persistent and stays readable while the bridge is powered off:
+# local folders and the last status are exactly what an operator wants then.
+# Only the actions that would touch /mnt/icloud are disabled in that state.
+
+WS_COL_NAME, WS_COL_LOCAL, WS_COL_REMOTE, WS_COL_ENABLED, WS_COL_SYNCED, \
+    WS_COL_STATE = range(6)
+
+#: §11.1: the machine tokens `workspace_sync` persists, and the words they are
+#: rendered as. This is also the roster that says whether a state read back from
+#: a hand-editable `status.json` is one this app knows.
+WORKSPACE_STATE_LABELS = {
+    workspace_sync.STATE_WAITING: "waiting",
+    workspace_sync.STATE_STABILIZING: "stabilizing",
+    workspace_sync.STATE_SYNCING: "syncing",
+    workspace_sync.STATE_UP_TO_DATE: "up to date",
+    workspace_sync.STATE_PAUSED: "paused",
+    workspace_sync.STATE_CONFLICT: "conflict",
+    workspace_sync.STATE_GUARDED: "guarded",
+    workspace_sync.STATE_ERROR: "error",
+}
+
+#: The states that colour a row and make the health row yellow (§12.1).
+WORKSPACE_ATTENTION_STATES = health.WORKSPACE_ATTENTION_STATES
+
+#: §5.2: the default parent the GUI offers. Nothing enforces it, and no real
+#: vault path or note name is ever a default anywhere in this feature.
+WORKSPACE_PARENT_NAME = "iCloud Workspaces"
+
+WORKSPACE_INTRO = (
+    "A Safe Workspace keeps an ordinary folder on this computer in step with a "
+    "folder in iCloud, so an editor never opens a file whose metadata the cloud "
+    "client rewrites underneath it. Edit the local folder; this app propagates "
+    "changes both ways once both sides have been still for a moment. Nothing is "
+    "ever merged automatically, and nothing is deleted when you forget a "
+    "workspace."
+)
+
+#: §11.3, character for character. Do not reword: it is the one instruction that
+#: keeps two Obsidian windows off the same vault.
+WORKSPACE_ADD_WARNING = (
+    "Close the iCloud copy of this vault in Obsidian before continuing. After "
+    "the first sync, open only the local workspace in Obsidian."
+)
+
+WORKSPACE_FIRST_COPY = (
+    "The first sync copies the iCloud folder into the local folder. Nothing is "
+    "deleted on either side, and nothing is copied back to iCloud until both "
+    "folders have been unchanged from one poll to the next."
+)
+
+#: §11.5, character for character in everything but the four locations, which
+#: are this workspace's own.
+WORKSPACE_FORGET_TEXT = (
+    "Forgetting a workspace removes only its entry in this app.\n"
+    "\n"
+    "These are kept, exactly as they are:\n"
+    "  Local workspace: {local}\n"
+    "  iCloud folder:   {remote}\n"
+    "  Sync state:      {state}\n"
+    "  Backups:         {backups}\n"
+    "\n"
+    "Nothing is deleted from this computer or from iCloud."
+)
+
+WORKSPACE_OBSIDIAN_SCHEME = "obsidian://open?path="
+
+
+def obsidian_url(path: str) -> str:
+    """`obsidian://open?path=<absolute path>`, percent-encoded whole (§11.4).
+
+    ``safe=""`` so the separators are encoded too: the value is one query
+    parameter, not a path, and a folder name containing `&`, `#` or `?` would
+    otherwise change the URL's meaning.
+    """
+    return WORKSPACE_OBSIDIAN_SCHEME + urllib.parse.quote(path, safe="")
+
+
+def default_workspace_parent() -> str:
+    """`~/iCloud Workspaces` — offered, never enforced (§5.2)."""
+    return os.path.join(os.path.expanduser("~"), WORKSPACE_PARENT_NAME)
+
+
+def workspace_remote_display(workspace: workspaces.Workspace) -> str:
+    """The absolute iCloud path of a workspace, for display and for opening.
+
+    A stored `remote` has already been normalized, so this cannot normally
+    fail; the fallback keeps a hand-edited configuration displayable rather than
+    breaking the whole tab.
+    """
+    try:
+        return workspaces.remote_root(workspace.remote)
+    except workspaces.WorkspaceError:
+        return os.path.join(workspaces.mount_root(), workspace.remote)
+
+
+@dataclass(frozen=True)
+class WorkspaceRow:
+    """One classified row of the tab, built by the controller.
+
+    Everything here is already bounded and free of file content: `detail` is the
+    engine's own single line and `paths` at most 20 relative names (§7.9). The
+    window renders these and never reaches for anything else.
+    """
+
+    workspace: workspaces.Workspace
+    state: str
+    last_success_at: str = ""
+    detail: str = ""
+    paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class WorkspaceProbe:
+    """What the add dialog's worker found out, off the GUI thread (§11.3)."""
+
+    remote_root: str
+    remote_entries: int = 0
+    remote_bytes: int = 0
+    free_bytes: int = 0
+    local_exists: bool = False
+
+
+class AddWorkspaceDialog(QDialog):
+    """Collect one new workspace, validating every string rule as it is typed.
+
+    Only `workspaces.validate_fields` runs here. It is side-effect-free by
+    design (§4.3), which is what makes it safe on the GUI thread on every
+    keystroke; everything that stats the filesystem or reads the mount happens
+    in the worker the caller starts once this dialog is accepted.
+
+    The iCloud folder is **typed**, never browsed: a file dialog in this app is
+    never pointed at CIFS, and the local browser starts under the local default
+    parent (§11.2).
+    """
+
+    def __init__(self, parent=None, *,
+                 existing: Sequence[workspaces.Workspace] = ()) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Add Safe Workspace")
+        self._existing = tuple(existing)
+        self._candidate: workspaces.Workspace | None = None
+        #: Once the operator types a local folder themselves, the name field
+        #: stops proposing one for them.
+        self._local_chosen = False
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "The iCloud folder is written as a path inside the iCloud mount, "
+            "such as Documents/Vault. The local folder must be an empty or "
+            "not-yet-created folder on a local disk.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+        self._name = QLineEdit()
+        self._name.setPlaceholderText("Vault")
+        self._name.textChanged.connect(self._on_name_changed)
+        form.addRow("Name:", self._name)
+
+        self._remote = QLineEdit()
+        self._remote.setPlaceholderText("Documents/Vault")
+        self._remote.textChanged.connect(self._validate)
+        form.addRow("iCloud folder:", self._remote)
+
+        local_row = QHBoxLayout()
+        self._local = QLineEdit()
+        self._local.setPlaceholderText(
+            os.path.join(default_workspace_parent(), "Vault"))
+        self._local.textEdited.connect(self._on_local_edited)
+        self._local.textChanged.connect(self._validate)
+        local_row.addWidget(self._local, 1)
+        self._browse = QPushButton("Browse…")
+        self._browse.clicked.connect(self._choose_local)
+        local_row.addWidget(self._browse)
+        form.addRow("Local folder:", local_row)
+        layout.addLayout(form)
+
+        self._message = QLabel("")
+        self._message.setWordWrap(True)
+        self._message.setStyleSheet(f"color: {DOT_COLORS[health.YELLOW]};")
+        layout.addWidget(self._message)
+
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+        layout.addWidget(self._buttons)
+        self._validate()
+
+    def candidate(self) -> workspaces.Workspace | None:
+        """The validated, normalized workspace, or ``None`` if the fields fail."""
+        return self._candidate
+
+    def set_fields(self, name: str, remote: str, local: str) -> None:
+        """Fill the three fields at once. For the tests and for a retry."""
+        self._name.setText(name)
+        self._remote.setText(remote)
+        self._local_chosen = True
+        self._local.setText(local)
+
+    def message(self) -> str:
+        return self._message.text()
+
+    def _on_name_changed(self, text: str) -> None:
+        if not self._local_chosen:
+            name = text.strip()
+            self._local.setText(
+                os.path.join(default_workspace_parent(), name) if name else "")
+        self._validate()
+
+    def _on_local_edited(self, _text: str) -> None:
+        self._local_chosen = True
+
+    def _choose_local(self) -> None:
+        """Pick the local folder from a **local-only** dialog (§11.2).
+
+        The starting directory is the local default parent's nearest existing
+        ancestor, never the iCloud mount, so no CIFS directory is ever
+        enumerated on the GUI thread.
+        """
+        start = self._local.text().strip() or default_workspace_parent()
+        while start and not os.path.isdir(start):
+            parent = os.path.dirname(start)
+            if parent == start:
+                break
+            start = parent
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Choose the local workspace folder", start,
+            QFileDialog.Option.ShowDirsOnly
+            | QFileDialog.Option.DontResolveSymlinks)
+        if chosen:
+            self._local_chosen = True
+            self._local.setText(chosen)
+
+    def _validate(self, _text: str | None = None) -> None:
+        self._candidate = None
+        message = ""
+        try:
+            self._candidate = workspaces.validate_fields(
+                self._name.text(), self._remote.text(), self._local.text(),
+                existing=self._existing)
+        except workspaces.WorkspaceError as exc:
+            message = str(exc)
+        self._message.setText(message)
+        ok = self._buttons.button(QDialogButtonBox.StandardButton.Ok)
+        if ok is not None:
+            ok.setEnabled(self._candidate is not None)
+
+
 def _fmt_count(value: Any) -> str:
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return f"{value:,}"
@@ -286,6 +544,12 @@ class MainWindow(QMainWindow):
     provision_retry_requested = Signal()
     provision_env_selected = Signal(str)
     reprovision_requested = Signal()
+    #: Safe Workspaces (plan §11). The window owns the configuration edits —
+    #: they are local-disk JSON, not bridge I/O — and tells the controller to
+    #: re-read the file afterwards (§10). Sync now asks for one pass through the
+    #: controller's single-flight path, never a second execution route.
+    workspaces_changed = Signal()
+    workspace_sync_requested = Signal()
 
     def __init__(self, run_async: Callable[..., None]) -> None:
         super().__init__()
@@ -352,6 +616,17 @@ class MainWindow(QMainWindow):
         #: column must be rendered. See ``_refresh_state_column``.
         self._state_column_key: tuple | None = None
 
+        # Safe Workspaces model (plan §11). `_workspace_rows` is whatever the
+        # controller last classified, `_workspace_busy` an add probe in flight,
+        # and `_awaiting_seed` the ids added in this session whose first
+        # successful sync should offer to open Obsidian (§11.4).
+        self._workspace_rows: list[WorkspaceRow] = []
+        #: What the tree currently shows, so an unchanged pass does not rebuild
+        #: it under the operator. See ``update_workspaces``.
+        self._workspace_painted: tuple = ()
+        self._workspace_busy = False
+        self._awaiting_seed: set[str] = set()
+
         central = QWidget()
         central_layout = QVBoxLayout(central)
         central_layout.setContentsMargins(0, 0, 0, 0)
@@ -405,6 +680,11 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._build_status_tab(), "Status")
         self._sync_page = self._build_sync_tab()
         self._tabs.addTab(self._sync_page, "Selective Sync")
+        # Persistent, and deliberately still readable while the bridge is off:
+        # local folders and the last status are what an operator wants then
+        # (§11.1). Only the mount-touching actions are disabled in that state.
+        self._workspaces_page = self._build_workspaces_tab()
+        self._tabs.addTab(self._workspaces_page, "Safe Workspaces")
         # The Setup tab exists only while the bridge is not provisioned; it is
         # inserted in front of the others so it cannot be missed, and removed
         # again once the bridge is running (D31).
@@ -1207,6 +1487,373 @@ class MainWindow(QMainWindow):
         layout.addLayout(buttons)
         return page
 
+    # -------------------------------------------------------- safe workspaces --
+    # Plan §11. The controller owns the configuration this renders, the timer
+    # that syncs it, and the classification of every row; this tab shows those
+    # rows, edits the configuration file, and asks for a pass. It never runs a
+    # cycle itself and never reads the mount on the GUI thread.
+
+    def _build_workspaces_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        intro = QLabel(WORKSPACE_INTRO)
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        # A configuration this app refuses to read stops every cycle, so it is
+        # said plainly rather than left as an empty list (§4.1).
+        self._workspace_error_label = QLabel("")
+        self._workspace_error_label.setWordWrap(True)
+        self._workspace_error_label.setStyleSheet(
+            f"color: {DOT_COLORS[health.RED]};")
+        self._workspace_error_label.hide()
+        layout.addWidget(self._workspace_error_label)
+
+        self._workspace_tree = QTreeWidget()
+        self._workspace_tree.setColumnCount(6)
+        self._workspace_tree.setHeaderLabels(
+            ["Name", "Local folder", "iCloud folder", "Enabled",
+             "Last successful sync", "Status"])
+        self._workspace_tree.setRootIsDecorated(False)
+        self._workspace_tree.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection)
+        self._workspace_tree.setUniformRowHeights(True)
+        self._workspace_tree.itemSelectionChanged.connect(
+            self._on_workspace_selection_changed)
+        layout.addWidget(self._workspace_tree, 1)
+
+        # The selected workspace's own message: the engine's bounded line, the
+        # relative paths it named, and where to look. Never file content (§9).
+        self._workspace_detail = QLabel("")
+        self._workspace_detail.setWordWrap(True)
+        self._workspace_detail.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self._workspace_detail)
+
+        buttons = QHBoxLayout()
+        self._workspace_add = QPushButton("Add workspace…")
+        self._workspace_add.clicked.connect(self._add_workspace)
+        self._workspace_sync = QPushButton("Sync now")
+        self._workspace_sync.setToolTip(
+            "Ask for one pass now. It runs through the same single-flight path "
+            "as the timer, so it never starts a second cycle.")
+        self._workspace_sync.clicked.connect(self.workspace_sync_requested.emit)
+        self._workspace_pause = QPushButton("Pause")
+        self._workspace_pause.setToolTip(
+            "Stop scheduling this workspace. A cycle already running finishes "
+            "on its own; nothing is interrupted and nothing is deleted.")
+        self._workspace_pause.clicked.connect(lambda: self._set_workspace_enabled(False))
+        self._workspace_resume = QPushButton("Resume")
+        self._workspace_resume.clicked.connect(lambda: self._set_workspace_enabled(True))
+        self._workspace_open_local = QPushButton("Open local folder")
+        self._workspace_open_local.clicked.connect(self._open_workspace_local)
+        self._workspace_open_remote = QPushButton("Open iCloud folder")
+        self._workspace_open_remote.clicked.connect(self._open_workspace_remote)
+        self._workspace_forget = QPushButton("Forget workspace…")
+        self._workspace_forget.setToolTip(
+            "Remove this workspace's entry from this app. The local folder, the "
+            "iCloud folder, the sync state and the backups are all kept.")
+        self._workspace_forget.clicked.connect(self._forget_workspace)
+        for button in (self._workspace_add, self._workspace_sync,
+                       self._workspace_pause, self._workspace_resume,
+                       self._workspace_open_local, self._workspace_open_remote):
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        buttons.addWidget(self._workspace_forget)
+        layout.addLayout(buttons)
+        self._update_workspace_buttons()
+        return page
+
+    def update_workspaces(self, rows, *, error: str = "") -> None:
+        """Render the tab from the controller's classified rows (§11.1).
+
+        Presentation only, and no I/O of any kind: every row was classified from
+        a cycle result or from the persisted status document, both of which the
+        controller reads without touching the mount.
+        """
+        self._workspace_rows = list(rows)
+        # A pass completes every five seconds, and most of them change nothing
+        # a column shows. Rebuilding the tree anyway would reset the operator's
+        # scroll position and selection while they are reading it, so the rows
+        # are rebuilt only when their rendered content actually moved.
+        painted = tuple((row.workspace.id, self._workspace_columns(row))
+                        for row in self._workspace_rows)
+        if painted != self._workspace_painted:
+            self._workspace_painted = painted
+            self._rebuild_workspace_rows()
+        if error:
+            self._workspace_error_label.setText(
+                f"Cannot read the workspace configuration: {error}. No "
+                "workspace is being synchronized until it is readable again; "
+                "the file has not been changed.")
+            self._workspace_error_label.show()
+        else:
+            self._workspace_error_label.hide()
+        self._update_workspace_buttons()
+        self._render_workspace_detail()
+        self._offer_obsidian()
+
+    @staticmethod
+    def _workspace_columns(row: WorkspaceRow) -> tuple[str, ...]:
+        """One row's six columns, in the order §11.1 fixes."""
+        return (row.workspace.name, row.workspace.local, row.workspace.remote,
+                "yes" if row.workspace.enabled else "no",
+                row.last_success_at or "never",
+                WORKSPACE_STATE_LABELS.get(row.state, row.state))
+
+    def _rebuild_workspace_rows(self) -> None:
+        selected = self._selected_workspace_id()
+        self._workspace_tree.clear()
+        for row in self._workspace_rows:
+            item = QTreeWidgetItem(self._workspace_tree,
+                                   list(self._workspace_columns(row)))
+            item.setData(0, ROLE_PATH, row.workspace.id)
+            if row.state in WORKSPACE_ATTENTION_STATES:
+                brush = QBrush(QColor(DOT_COLORS[health.YELLOW]))
+                for column in range(self._workspace_tree.columnCount()):
+                    item.setForeground(column, brush)
+            if row.workspace.id == selected:
+                item.setSelected(True)
+                self._workspace_tree.setCurrentItem(item)
+
+    def _selected_workspace_id(self) -> str:
+        items = self._workspace_tree.selectedItems()
+        if not items:
+            return ""
+        value = items[0].data(0, ROLE_PATH)
+        return value if isinstance(value, str) else ""
+
+    def _selected_workspace(self) -> WorkspaceRow | None:
+        identifier = self._selected_workspace_id()
+        for row in self._workspace_rows:
+            if row.workspace.id == identifier:
+                return row
+        return None
+
+    def _on_workspace_selection_changed(self) -> None:
+        self._update_workspace_buttons()
+        self._render_workspace_detail()
+
+    def _update_workspace_buttons(self) -> None:
+        """Everything that would touch /mnt/icloud is off while I/O is paused.
+
+        Pause, Resume and Forget stay available: they only rewrite this app's
+        own configuration file, which is exactly what an operator may still want
+        to do with the bridge powered off (§11.1).
+        """
+        row = self._selected_workspace()
+        mount_ready = not self._io_paused
+        self._workspace_add.setEnabled(mount_ready and not self._workspace_busy)
+        self._workspace_sync.setEnabled(
+            mount_ready and any(item.workspace.enabled
+                                for item in self._workspace_rows))
+        self._workspace_pause.setEnabled(row is not None and row.workspace.enabled)
+        self._workspace_resume.setEnabled(row is not None
+                                          and not row.workspace.enabled)
+        self._workspace_open_local.setEnabled(row is not None)
+        self._workspace_open_remote.setEnabled(row is not None and mount_ready)
+        self._workspace_forget.setEnabled(row is not None)
+
+    def _render_workspace_detail(self) -> None:
+        row = self._selected_workspace()
+        if row is None:
+            self._workspace_detail.setText(
+                "" if self._workspace_rows else
+                "No workspaces yet. Add one to keep a local folder in step with "
+                "a folder in iCloud.")
+            return
+        label = WORKSPACE_STATE_LABELS.get(row.state, row.state)
+        parts = [f"{row.workspace.name}: {label}"
+                 + (f" — {row.detail}" if row.detail else "")]
+        if row.paths:
+            # Names only, bounded by `workspace_sync` before they ever get here.
+            parts.append(f"Affected paths ({len(row.paths)} shown):\n"
+                         + "\n".join(f"  {path}" for path in row.paths))
+        if row.state in WORKSPACE_ATTENTION_STATES:
+            parts.append(
+                "Both folders keep their own version; nothing was merged.\n"
+                f"  Local workspace: {row.workspace.local}\n"
+                f"  iCloud folder:   {workspace_remote_display(row.workspace)}\n"
+                f"  Backups:         {workspaces.backups_dir(row.workspace.id)}")
+        self._workspace_detail.setText("\n".join(parts))
+
+    def _open_workspace_local(self) -> None:
+        row = self._selected_workspace()
+        if row is not None:
+            open_externally(row.workspace.local)
+
+    def _open_workspace_remote(self) -> None:
+        row = self._selected_workspace()
+        if row is None or self._io_paused:
+            return
+        open_externally(workspace_remote_display(row.workspace))
+
+    def _offer_obsidian(self) -> None:
+        """After a first seed, offer Obsidian — and keep the plain folder action.
+
+        An `obsidian://` handler is not guaranteed to be registered, so this is
+        an offer rather than the only way in: **Open local folder** is always
+        there as well (§11.4).
+        """
+        for row in self._workspace_rows:
+            if row.workspace.id not in self._awaiting_seed:
+                continue
+            if row.state != workspace_sync.STATE_UP_TO_DATE or not row.last_success_at:
+                continue
+            self._awaiting_seed.discard(row.workspace.id)
+            answer = QMessageBox.question(
+                self, "Open the local workspace?",
+                f"“{row.workspace.name}” finished its first sync into\n"
+                f"{row.workspace.local}\n\n"
+                "Open the local workspace in Obsidian now? This needs Obsidian "
+                "installed and registered for obsidian:// links; “Open local "
+                "folder” always works.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            if answer == QMessageBox.StandardButton.Yes:
+                open_externally(obsidian_url(row.workspace.local))
+
+    # ------------------------------------------- workspace configuration edits --
+
+    def _edit_workspace_config(self, change) -> bool:
+        """Read-modify-write `workspaces.json`, then tell the controller.
+
+        The file is re-read first, so an edit never writes back a copy that was
+        stale before it started, and `workspaces.save` re-applies the collision
+        rules — a configuration this app would refuse to read is never one it
+        writes. Local disk only; no CIFS is involved in any of it.
+        """
+        try:
+            workspaces.save(change(workspaces.load()))
+        except workspaces.WorkspaceError as exc:
+            QMessageBox.warning(self, "Could not change the workspace",
+                                f"{exc}\n\nNothing was changed.")
+            return False
+        self.workspaces_changed.emit()
+        return True
+
+    def _set_workspace_enabled(self, enabled: bool) -> None:
+        """Pause or resume: the `enabled` flag and nothing else (§11.2).
+
+        A cycle already running is deliberately left alone. It is bounded by its
+        own subprocess timeout, and killing a running Unison is precisely the
+        thing this feature never does.
+        """
+        row = self._selected_workspace()
+        if row is None:
+            return
+        identifier = row.workspace.id
+        self._edit_workspace_config(
+            lambda config: workspaces.with_enabled(config, identifier, enabled))
+
+    def _forget_workspace(self) -> None:
+        row = self._selected_workspace()
+        if row is None:
+            return
+        identifier = row.workspace.id
+        answer = QMessageBox.question(
+            self, "Forget this workspace?",
+            WORKSPACE_FORGET_TEXT.format(
+                local=row.workspace.local,
+                remote=workspace_remote_display(row.workspace),
+                state=workspaces.state_dir(identifier),
+                backups=workspaces.backups_dir(identifier)),
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if answer != QMessageBox.StandardButton.Ok:
+            return
+        self._awaiting_seed.discard(identifier)
+        self._edit_workspace_config(
+            lambda config: workspaces.without_workspace(config, identifier))
+
+    # ------------------------------------------------------ adding a workspace --
+
+    def _add_workspace(self) -> None:
+        if self._io_paused or self._workspace_busy:
+            return
+        dialog = AddWorkspaceDialog(
+            self, existing=tuple(row.workspace for row in self._workspace_rows))
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        candidate = dialog.candidate()
+        if candidate is not None:
+            self._probe_new_workspace(candidate)
+
+    def _probe_new_workspace(self, candidate: workspaces.Workspace) -> None:
+        """The filesystem half of the validation, on a worker (§4.3, §11.3).
+
+        `check_local_state` stats ancestors and parses `/proc/self/mountinfo`;
+        the remote scan reads CIFS. Neither may run on the GUI thread, and
+        nothing here creates anything: the local root is created by the first
+        cycle, after the operator has confirmed.
+        """
+        def work() -> WorkspaceProbe:
+            workspaces.check_local_state(candidate.local)
+            workspaces.check_local_occupancy(candidate.local)
+            mount = os.path.normpath(workspaces.mount_root())
+            if not os.path.ismount(mount):
+                raise workspaces.WorkspaceError(
+                    f"{mount} is not mounted, so the iCloud folder cannot be "
+                    "checked yet.")
+            remote_root = workspaces.remote_root(candidate.remote)
+            snapshot = workspace_sync.scan(remote_root)
+            if not snapshot:
+                raise workspaces.WorkspaceError(
+                    f"{remote_root} is empty, so there is nothing to copy into "
+                    "a new workspace yet.")
+            return WorkspaceProbe(
+                remote_root=remote_root,
+                remote_entries=len(snapshot),
+                remote_bytes=workspace_sync.logical_size(snapshot),
+                free_bytes=workspace_sync.free_bytes(candidate.local),
+                local_exists=os.path.isdir(candidate.local))
+
+        def done(probe: WorkspaceProbe) -> None:
+            self._workspace_busy = False
+            self._update_workspace_buttons()
+            self._confirm_new_workspace(candidate, probe)
+
+        def failed(message: str) -> None:
+            self._workspace_busy = False
+            self._update_workspace_buttons()
+            QMessageBox.warning(self, "Cannot add this workspace",
+                                f"{message}\n\nNothing was created.")
+
+        self._workspace_busy = True
+        self._update_workspace_buttons()
+        self._run_async(work, done, failed)
+
+    def _confirm_new_workspace(self, candidate: workspaces.Workspace,
+                               probe: WorkspaceProbe) -> None:
+        """State what the first copy will do, then ask (§11.3)."""
+        needed = probe.remote_bytes + workspace_sync.FREE_SPACE_MARGIN_BYTES
+        space = (""
+                 if probe.free_bytes > needed else
+                 "\n\nThere is not enough free space for the first copy "
+                 f"({health.human_bytes(needed)} is needed, including the 1 GiB "
+                 "margin), so it will refuse to start until there is.")
+        answer = QMessageBox.question(
+            self, "Add this Safe Workspace?",
+            f"Name: {candidate.name}\n"
+            f"iCloud folder: {probe.remote_root}\n"
+            f"  {probe.remote_entries} item(s), "
+            f"{health.human_bytes(probe.remote_bytes)}\n"
+            f"Local folder: {candidate.local}\n"
+            f"  {'empty' if probe.local_exists else 'will be created'}, "
+            f"{health.human_bytes(probe.free_bytes)} free"
+            f"{space}\n\n"
+            f"{WORKSPACE_FIRST_COPY}\n\n{WORKSPACE_ADD_WARNING}",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if answer != QMessageBox.StandardButton.Ok:
+            return
+        if self._edit_workspace_config(
+                lambda config: workspaces.with_workspace(config, candidate)):
+            # §11.4: this is the seeding whose success offers Obsidian.
+            self._awaiting_seed.add(candidate.id)
+            self.workspace_sync_requested.emit()
+
     # ------------------------------------------------------------- refreshing --
 
     def closeEvent(self, event) -> None:   # noqa: N802 (Qt naming)
@@ -1364,6 +2011,10 @@ class MainWindow(QMainWindow):
         """Gate new bridge I/O; also reflect it in the controls."""
         self._io_paused = paused
         self.set_bridge_controls_enabled(not paused)
+        # The Safe Workspaces tab itself stays enabled — local folders and the
+        # last status remain inspectable — but every action that would touch
+        # /mnt/icloud follows the same gate (§11.1).
+        self._update_workspace_buttons()
         self._sync_poll_timer()
 
     def apply_in_flight(self) -> bool:

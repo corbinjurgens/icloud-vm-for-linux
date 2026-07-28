@@ -16,7 +16,11 @@ explicitly copy in **cannot** reach the report:
   of those can be reliably scanned for filenames after the fact. Only the
   *classified* result is rendered;
 * real paths are replaced by stable `<path-N>` placeholders unless the operator
-  explicitly asks for **Include folder names**.
+  explicitly asks for **Include folder names**;
+* no Safe Workspace name, local folder, iCloud folder, relative file path,
+  Unison output, log excerpt or `status.json` field. That feature contributes
+  **counts and one timestamp** and nothing else, excluded at the dataclass
+  rather than scrubbed downstream (`docs/plan-safe-local-workspaces.md` §12.2).
 
 It is Qt-free and performs no mount I/O. The only subprocesses it may run are
 `systemctl is-active` on the bridge's own units and the two argument-exact
@@ -144,6 +148,15 @@ class Facts:
     #: Operator paths, supplied explicitly. Rendered as placeholders unless
     #: `include_paths` is set on the report request.
     exclusion_paths: tuple[str, ...] = ()
+    #: Safe Workspaces, as counts and one UTC ISO-8601 timestamp (§12.2). There
+    #: is deliberately no field for a name, a folder, a relative path, a status
+    #: `detail` or any Unison output, with or without an opt-in.
+    workspaces_configured: int = 0
+    workspaces_enabled: int = 0
+    workspaces_conflicted: int = 0
+    workspaces_guarded: int = 0
+    workspaces_failed: int = 0
+    workspaces_last_success: str = ""
 
 
 @dataclass(frozen=True)
@@ -289,6 +302,15 @@ def collect(facts: Facts, runner: Runner = default_runner, *,
     if not path_rows:
         path_rows = (("Exclusions", "none configured"),)
 
+    workspace_rows = (
+        ("Configured", _bounded(facts.workspaces_configured)),
+        ("Enabled", _bounded(facts.workspaces_enabled)),
+        ("In conflict", _bounded(facts.workspaces_conflicted)),
+        ("Guarded", _bounded(facts.workspaces_guarded)),
+        ("Failed", _bounded(facts.workspaces_failed)),
+        ("Last successful sync", _bounded(facts.workspaces_last_success or "never")),
+    )
+
     return Report(
         sections=(
             ("Application", app),
@@ -298,6 +320,7 @@ def collect(facts: Facts, runner: Runner = default_runner, *,
             ("Host units", unit_rows),
             ("Helper authorization", sudo_rows),
             ("Selective sync", path_rows),
+            ("Safe workspaces", workspace_rows),
         ),
         include_paths=include_paths,
     )

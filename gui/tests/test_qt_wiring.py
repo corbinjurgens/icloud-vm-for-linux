@@ -39,6 +39,9 @@ from icloud_bridge_gui import window as window_module             # noqa: E402
 
 _RealMessageBox = window_module.QMessageBox
 _confirm_create_vm = app_module.Application._confirm_create_vm
+#: Captured before the `fakes` fixture replaces it, so the real three-way quit
+#: confirmation's own wording stays assertable.
+_ask_quit = app_module.Application._ask_quit
 from icloud_bridge_gui import (backup, bridge, diagnostics, firstrun,  # noqa: E402
                                guestprov, health, lifecycle, listing, power,
                                workspace_sync, workspaces)
@@ -2649,3 +2652,670 @@ def test_a_malformed_configuration_schedules_nothing_and_is_remembered(
     app._tick_workspaces()
     pump(0.4)
     assert cycles.count == 0
+
+
+# ------------------------------------ the Safe Workspaces tab (plan §11/§12) --
+
+class FakeAddDialog:
+    """Stands in for the modal add dialog: no event loop, a fixed answer.
+
+    The real dialog is exercised directly further down — constructed, typed
+    into, and asked what it validated — which is everything except `exec`.
+    """
+
+    accepted = True
+    result = None
+    instances: list["FakeAddDialog"] = []
+
+    @classmethod
+    def reset(cls):
+        cls.accepted = True
+        cls.result = None
+        cls.instances = []
+
+    def __init__(self, parent=None, *, existing=()):
+        self.existing = tuple(existing)
+        type(self).instances.append(self)
+
+    def exec(self):
+        code = window_module.QDialog.DialogCode
+        return code.Accepted if type(self).accepted else code.Rejected
+
+    def candidate(self):
+        return type(self).result
+
+
+def write_workspace_status(number: int, **fields) -> str:
+    """Persist a `status.json` exactly as a finished cycle would have (§7.9)."""
+    identifier = workspace_id(number)
+    workspaces.ensure_state_dir(identifier)
+    document = workspace_sync.status_document(
+        state=fields.pop("state", workspace_sync.STATE_UP_TO_DATE),
+        updated_at=fields.pop("updated_at", "2026-07-28T10:00:00Z"),
+        last_success_at=fields.pop("last_success_at", "2026-07-28T09:59:00Z"),
+        last_exit=fields.pop("last_exit", 0),
+        local_paths=fields.pop("local_paths", 3),
+        remote_paths=fields.pop("remote_paths", 3),
+        conflicts=fields.pop("conflicts", 0), missing_from_baseline=0,
+        paths=fields.pop("paths", ()), detail=fields.pop("detail", ""))
+    path = workspaces.status_path(identifier)
+    workspaces.write_json_atomic(path, document)
+    return path
+
+
+def workspace_rows_shown(window) -> list[tuple[str, ...]]:
+    """Every rendered row, as its column texts."""
+    tree = window._workspace_tree
+    return [tuple(tree.topLevelItem(index).text(column)
+                  for column in range(tree.columnCount()))
+            for index in range(tree.topLevelItemCount())]
+
+
+def select_workspace(window, number: int) -> None:
+    tree = window._workspace_tree
+    for index in range(tree.topLevelItemCount()):
+        item = tree.topLevelItem(index)
+        if item.data(0, window_module.ROLE_PATH) == workspace_id(number):
+            tree.setCurrentItem(item)
+            item.setSelected(True)
+            return
+    raise AssertionError(f"workspace {number} is not in the tab")
+
+
+def read_workspace_config() -> dict:
+    with open(workspaces.config_path(), encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def test_the_safe_workspaces_tab_follows_selective_sync_and_is_persistent(
+        controller, fakes, tmp_path):
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1)])
+    window = app._window
+    tabs = window._tabs
+    titles = [tabs.tabText(index) for index in range(tabs.count())]
+    assert titles == ["Status", "Selective Sync", "Safe Workspaces"]
+    assert tabs.indexOf(window._workspaces_page) == \
+        tabs.indexOf(window._sync_page) + 1
+
+
+def test_the_tab_is_painted_from_status_json_with_no_mount_access(
+        controller, fakes, monkeypatch, tmp_path):
+    """§7.9/§11.1: the last status is readable before, and without, any cycle."""
+    write_workspace_config([workspace_entry(tmp_path, 1)])
+    write_workspace_status(1, state=workspace_sync.STATE_CONFLICT,
+                           last_success_at="2026-07-28T08:00:00Z",
+                           paths=["notes/Weekly review.md"],
+                           detail="Both folders kept their own version.")
+    # Nothing may scan the mount to paint the tab. `no_real_cycle` already makes
+    # a cycle unreachable; this makes a bare scan unreachable too.
+    monkeypatch.setattr(workspace_sync, "scan", Recorder(error=AssertionError(
+        "the tab must never scan the mount")))
+    # A container that does not exist means no mount at all — the strictest
+    # state in which the tab still has to be readable.
+    fakes.inspect.result = power.DockerStatus("absent", detail="no such object")
+    app = controller()
+    assert pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.SETUP
+                and not app._setup_busy)
+    window = app._window
+
+    rows = workspace_rows_shown(window)
+    assert len(rows) == 1
+    assert rows[0][window_module.WS_COL_NAME] == "Workspace 1"
+    assert rows[0][window_module.WS_COL_LOCAL] == str(tmp_path / "ws-1")
+    assert rows[0][window_module.WS_COL_REMOTE] == "Docs/W1"
+    assert rows[0][window_module.WS_COL_ENABLED] == "yes"
+    assert rows[0][window_module.WS_COL_SYNCED] == "2026-07-28T08:00:00Z"
+    assert rows[0][window_module.WS_COL_STATE] == "conflict"
+    assert app._workspace_timer.isActive() is False
+
+
+def test_the_machine_token_up_to_date_is_rendered_as_words(controller, fakes,
+                                                           tmp_path):
+    write_workspace_config([workspace_entry(tmp_path, 1)])
+    write_workspace_status(1, state=workspace_sync.STATE_UP_TO_DATE)
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1)])
+    rows = workspace_rows_shown(app._window)
+    assert rows[0][window_module.WS_COL_STATE] == "up to date"
+    # Every persisted state has a rendering, and no extra ones were invented.
+    assert set(window_module.WORKSPACE_STATE_LABELS) == {
+        workspace_sync.STATE_WAITING, workspace_sync.STATE_STABILIZING,
+        workspace_sync.STATE_SYNCING, workspace_sync.STATE_UP_TO_DATE,
+        workspace_sync.STATE_PAUSED, workspace_sync.STATE_CONFLICT,
+        workspace_sync.STATE_GUARDED, workspace_sync.STATE_ERROR}
+
+
+def test_a_paused_workspace_reads_paused_whatever_it_last_did(controller, fakes,
+                                                              tmp_path):
+    write_workspace_status(1, state=workspace_sync.STATE_CONFLICT)
+    app = workspace_controller(controller, fakes,
+                               [workspace_entry(tmp_path, 1, enabled=False)])
+    rows = workspace_rows_shown(app._window)
+    assert rows[0][window_module.WS_COL_ENABLED] == "no"
+    assert rows[0][window_module.WS_COL_STATE] == "paused"
+    # And it cannot make the health row yellow while nothing is syncing it.
+    assert health.workspace_check(row.state for row in app.workspace_rows()) \
+        .severity == health.GREEN
+
+
+def test_a_cycle_result_supersedes_the_persisted_status(controller, fakes,
+                                                        cycles, tmp_path):
+    write_workspace_status(1, state=workspace_sync.STATE_UP_TO_DATE)
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1)])
+    cycles.outcome = workspace_sync.CONFLICT
+    cycles.state = workspace_sync.STATE_CONFLICT
+
+    app._tick_workspaces()
+    assert pump(3.0, until=lambda: cycles.count == 1)
+    assert pump(2.0, until=lambda: workspace_rows_shown(app._window)[0][
+        window_module.WS_COL_STATE] == "conflict")
+
+
+def test_a_conflict_names_paths_and_locations_but_never_content(
+        controller, fakes, tmp_path):
+    write_workspace_status(
+        1, state=workspace_sync.STATE_CONFLICT,
+        detail="Both folders kept their own version of the paths below.",
+        paths=["notes/Weekly review.md", "notes/Ideas.md"])
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1)])
+    window = app._window
+    select_workspace(window, 1)
+
+    text = window._workspace_detail.text()
+    assert "notes/Weekly review.md" in text and "notes/Ideas.md" in text
+    assert "(2 shown)" in text
+    assert str(tmp_path / "ws-1") in text
+    assert workspaces.backups_dir(workspace_id(1)) in text
+    assert "Docs/W1" in text                 # the iCloud folder, under the mount
+    # The tab shows names and counts. It has no access to content and no code
+    # path that would render any: the status document carries none either.
+    assert "kept their own version" in text
+
+
+def test_a_pass_that_changes_nothing_leaves_the_selection_alone(controller, fakes,
+                                                                tmp_path):
+    """A pass lands every five seconds; it must not rebuild the tab underneath."""
+    write_workspace_status(1, state=workspace_sync.STATE_UP_TO_DATE)
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1),
+                                                   workspace_entry(tmp_path, 2)])
+    window = app._window
+    select_workspace(window, 2)
+
+    for _ in range(3):
+        app._render_workspaces()
+    assert window._selected_workspace_id() == workspace_id(2)
+
+    app._record_workspace_result(workspace_id(2), workspace_sync.CycleResult(
+        workspace_id=workspace_id(2), outcome=workspace_sync.CONFLICT,
+        state=workspace_sync.STATE_CONFLICT))
+    assert workspace_rows_shown(window)[1][window_module.WS_COL_STATE] == "conflict"
+    assert window._selected_workspace_id() == workspace_id(2)
+
+
+def test_a_malformed_configuration_is_said_plainly_in_the_tab(controller, fakes,
+                                                              cycles, tmp_path):
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1)])
+    window = app._window
+    assert window._workspace_error_label.isHidden()
+    with open(workspaces.config_path(), "w", encoding="utf-8") as handle:
+        handle.write("{ not json")
+
+    app.reload_workspaces()
+
+    assert workspace_rows_shown(window) == []
+    assert not window._workspace_error_label.isHidden()
+    assert "No workspace is being synchronized" in \
+        window._workspace_error_label.text()
+
+
+def test_powered_off_disables_only_the_mount_touching_actions(controller, fakes,
+                                                              tmp_path):
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1)])
+    window = app._window
+    select_workspace(window, 1)
+    assert window._workspace_add.isEnabled()
+
+    app._on_power_off_requested()
+    assert pump(3.0, until=lambda: app._model.phase is lifecycle.Phase.POWERED_OFF)
+    select_workspace(window, 1)
+
+    # Still visible and still readable, which is the point of the tab.
+    tabs = window._tabs
+    assert tabs.isTabEnabled(tabs.indexOf(window._workspaces_page))
+    assert workspace_rows_shown(window)
+    assert not window._workspace_add.isEnabled()
+    assert not window._workspace_sync.isEnabled()
+    assert not window._workspace_open_remote.isEnabled()
+    # Configuration-only actions stay available with the bridge off.
+    assert window._workspace_pause.isEnabled()
+    assert window._workspace_open_local.isEnabled()
+    assert window._workspace_forget.isEnabled()
+
+
+def test_sync_now_requests_one_pass_through_the_single_flight_path(
+        controller, fakes, cycles, tmp_path):
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1)])
+    cycles.release.clear()
+
+    app._window._workspace_sync.click()
+    assert pump(2.0, until=lambda: cycles.count == 1)
+    for _ in range(3):
+        app._window._workspace_sync.click()
+    assert cycles.count == 1                 # not a second execution route
+    assert app._workspace_pending
+
+    cycles.release.set()
+    assert pump(3.0, until=lambda: cycles.count == 2)
+    pump(0.3)
+    assert cycles.count == 2
+
+
+def test_pause_changes_only_the_enabled_flag_and_stops_scheduling(
+        controller, fakes, cycles, tmp_path):
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1),
+                                                   workspace_entry(tmp_path, 2)])
+    window = app._window
+    select_workspace(window, 1)
+
+    window._workspace_pause.click()
+
+    document = read_workspace_config()
+    assert document["workspaces"][0]["enabled"] is False
+    assert document["workspaces"][1]["enabled"] is True
+    assert document["workspaces"][0]["local"] == str(tmp_path / "ws-1")
+    assert [item.id for item in app.workspace_config().scheduled()] == \
+        [workspace_id(2)]
+
+    app._tick_workspaces()
+    assert pump(3.0, until=lambda: cycles.count == 1)
+    pump(0.3)
+    assert cycles.ids == [workspace_id(2)]
+
+
+def test_pausing_mid_pass_removes_it_from_the_queue_that_pass_is_working_through(
+        controller, fakes, cycles, tmp_path):
+    """§10: a disabled workspace never gets another cycle from a stale queue."""
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1),
+                                                   workspace_entry(tmp_path, 2)])
+    window = app._window
+    cycles.release.clear()
+    app._tick_workspaces()
+    assert pump(2.0, until=lambda: cycles.count == 1)
+
+    select_workspace(window, 2)
+    window._workspace_pause.click()
+
+    cycles.release.set()
+    pump(0.6)
+    assert cycles.ids == [workspace_id(1)]
+
+
+def test_resume_puts_it_back_in_the_schedule(controller, fakes, cycles, tmp_path):
+    app = workspace_controller(controller, fakes,
+                               [workspace_entry(tmp_path, 1, enabled=False)])
+    window = app._window
+    select_workspace(window, 1)
+    assert not window._workspace_pause.isEnabled()
+    assert window._workspace_resume.isEnabled()
+
+    window._workspace_resume.click()
+
+    assert read_workspace_config()["workspaces"][0]["enabled"] is True
+    app._tick_workspaces()
+    assert pump(3.0, until=lambda: cycles.count == 1)
+
+
+def test_forget_states_every_retained_location_and_deletes_none_of_them(
+        controller, fakes, cycles, dialogs, tmp_path):
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1),
+                                                   workspace_entry(tmp_path, 2)])
+    window = app._window
+    identifier = workspace_id(1)
+    local = tmp_path / "ws-1"
+    local.mkdir()
+    (local / "note.md").write_text("kept", encoding="utf-8")
+    state = workspaces.ensure_state_dir(identifier)
+    write_workspace_status(1)
+    select_workspace(window, 1)
+    dialogs.answer = _RealMessageBox.StandardButton.Ok
+
+    window._workspace_forget.click()
+
+    message = [args[2] for name, args in dialogs.calls if name == "question"][-1]
+    assert message == (
+        "Forgetting a workspace removes only its entry in this app.\n"
+        "\n"
+        "These are kept, exactly as they are:\n"
+        f"  Local workspace: {local}\n"
+        f"  iCloud folder:   {workspaces.remote_root('Docs/W1')}\n"
+        f"  Sync state:      {state}\n"
+        f"  Backups:         {workspaces.backups_dir(identifier)}\n"
+        "\n"
+        "Nothing is deleted from this computer or from iCloud.")
+
+    # Only the configuration entry went.
+    assert [item["id"] for item in read_workspace_config()["workspaces"]] == \
+        [workspace_id(2)]
+    assert (local / "note.md").read_text(encoding="utf-8") == "kept"
+    assert os.path.isdir(state)
+    assert os.path.exists(workspaces.status_path(identifier))
+    assert os.path.isdir(workspaces.backups_dir(identifier))
+    assert len(workspace_rows_shown(window)) == 1
+
+
+def test_cancelling_forget_changes_nothing(controller, fakes, dialogs, tmp_path):
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1)])
+    window = app._window
+    select_workspace(window, 1)
+    dialogs.answer = _RealMessageBox.StandardButton.Cancel
+
+    window._workspace_forget.click()
+
+    assert [item["id"] for item in read_workspace_config()["workspaces"]] == \
+        [workspace_id(1)]
+
+
+def test_open_local_and_open_icloud_use_the_external_helper(controller, fakes,
+                                                            monkeypatch, tmp_path):
+    opened: list[str] = []
+    monkeypatch.setattr(window_module, "open_externally", opened.append)
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1)])
+    window = app._window
+    select_workspace(window, 1)
+
+    window._workspace_open_local.click()
+    window._workspace_open_remote.click()
+
+    assert opened == [str(tmp_path / "ws-1"), workspaces.remote_root("Docs/W1")]
+
+
+# ------------------------------------------------ the add dialog (§11.3) --
+
+def test_the_add_dialog_validates_strings_as_they_are_typed(qapp, fakes, tmp_path):
+    dialog = window_module.AddWorkspaceDialog()
+    ok = dialog._buttons.button(
+        window_module.QDialogButtonBox.StandardButton.Ok)
+    assert not ok.isEnabled()
+
+    dialog.set_fields("Vault", "/Docs/Vault", str(tmp_path / "vault"))
+    assert not ok.isEnabled()
+    assert "cannot start with /" in dialog.message()
+    assert dialog.candidate() is None
+
+    dialog.set_fields("Vault", "Docs//Vault/", str(tmp_path / "vault"))
+    assert ok.isEnabled()
+    candidate = dialog.candidate()
+    assert candidate.name == "Vault"
+    assert candidate.remote == "Docs/Vault"          # normalized on the way in
+    assert candidate.local == str(tmp_path / "vault")
+    dialog.deleteLater()
+
+
+def test_the_add_dialog_refuses_a_folder_that_collides_with_a_configured_one(
+        qapp, fakes, tmp_path):
+    existing = workspaces.Workspace(id=workspace_id(1), name="Workspace 1",
+                                    remote="Docs/W1",
+                                    local=str(tmp_path / "ws-1"))
+    dialog = window_module.AddWorkspaceDialog(existing=[existing])
+    dialog.set_fields("Another", "docs/w1", str(tmp_path / "other"))
+    assert dialog.candidate() is None
+    assert "overlapping iCloud folders" in dialog.message()
+
+    dialog.set_fields("Another", "Docs/Other", str(tmp_path / "ws-1" / "inner"))
+    assert dialog.candidate() is None
+    assert "overlapping local folders" in dialog.message()
+    dialog.deleteLater()
+
+
+def test_the_local_browser_is_never_pointed_at_the_icloud_mount(qapp, fakes,
+                                                                monkeypatch):
+    starts: list[str] = []
+
+    def fake_dialog(_parent, _title, start, _options):
+        starts.append(start)
+        return ""
+
+    monkeypatch.setattr(window_module.QFileDialog, "getExistingDirectory",
+                        staticmethod(fake_dialog))
+    dialog = window_module.AddWorkspaceDialog()
+    dialog._choose_local()
+    dialog.set_fields("Vault", "Docs/Vault", "")
+    dialog._choose_local()
+
+    assert starts
+    mount = os.path.normpath(workspaces.mount_root())
+    for start in starts:
+        assert not os.path.normpath(start).startswith(mount)
+        assert os.path.isdir(start)
+    dialog.deleteLater()
+
+
+def add_flow(app, fakes, monkeypatch, tmp_path, *, entries=(), remote="Docs/New",
+             local=None, snapshot=(("note.md", "file", 2048, 1),)):
+    """Drive Add up to the confirmation, with every filesystem check faked."""
+    window = app._window
+    mount = str(tmp_path / "mount")
+    monkeypatch.setenv("ICLOUD_MOUNT_DIR", mount)
+    monkeypatch.setattr(os.path, "ismount",
+                        lambda path: os.path.normpath(path) == mount)
+    checked: list[tuple[str, str]] = []
+
+    def local_state(path, **_kwargs):
+        # tmpfs is not an allowlisted workspace filesystem, so the real check
+        # cannot run here; what matters is that it runs *off* the GUI thread.
+        checked.append(("state", threading.current_thread().name))
+        return "ext4"
+
+    monkeypatch.setattr(workspaces, "check_local_state", local_state)
+    monkeypatch.setattr(workspace_sync, "scan",
+                        lambda root: (checked.append(("scan", root)),
+                                      tuple(snapshot))[1])
+    monkeypatch.setattr(workspace_sync, "free_bytes",
+                        lambda path: 50 * 1024 ** 3)
+    candidate = workspaces.validate_fields(
+        "New vault", remote, local or str(tmp_path / "new-vault"))
+    FakeAddDialog.reset()
+    FakeAddDialog.result = candidate
+    monkeypatch.setattr(window_module, "AddWorkspaceDialog", FakeAddDialog)
+    return window, candidate, checked
+
+
+def test_adding_a_workspace_validates_the_filesystem_off_the_gui_thread(
+        controller, fakes, dialogs, monkeypatch, tmp_path):
+    app = workspace_controller(controller, fakes, [])
+    window, candidate, checked = add_flow(app, fakes, monkeypatch, tmp_path)
+    dialogs.answer = _RealMessageBox.StandardButton.Cancel
+
+    window._workspace_add.click()
+
+    assert pump(3.0, until=lambda: dialogs.count("question") == 1)
+    kinds = dict(checked)
+    assert "state" in kinds and kinds["state"] != "MainThread"
+    assert kinds["scan"] == os.path.join(str(tmp_path / "mount"), "Docs/New")
+    # Cancelled: nothing was written and nothing was created.
+    assert app.workspace_config().workspaces == ()
+    assert not os.path.exists(candidate.local)
+
+
+def test_the_add_confirmation_carries_the_pinned_warning_verbatim(
+        controller, fakes, dialogs, monkeypatch, tmp_path):
+    app = workspace_controller(controller, fakes, [])
+    window, _candidate, _checked = add_flow(app, fakes, monkeypatch, tmp_path)
+    dialogs.answer = _RealMessageBox.StandardButton.Cancel
+
+    window._workspace_add.click()
+    assert pump(3.0, until=lambda: dialogs.count("question") == 1)
+
+    message = [args[2] for name, args in dialogs.calls if name == "question"][-1]
+    assert ("Close the iCloud copy of this vault in Obsidian before continuing. "
+            "After the first sync, open only the local workspace in Obsidian."
+            ) in message
+    assert "1 item(s)" in message                  # the remote logical size
+    assert "2.0 KB" in message
+    assert "50.0 GB free" in message               # the local free space
+    assert "The first sync copies the iCloud folder into the local folder" in message
+
+
+def test_confirming_the_add_writes_the_entry_and_asks_for_a_pass(
+        controller, fakes, cycles, dialogs, monkeypatch, tmp_path):
+    app = workspace_controller(controller, fakes, [])
+    window, candidate, _checked = add_flow(app, fakes, monkeypatch, tmp_path)
+    dialogs.answer = _RealMessageBox.StandardButton.Ok
+
+    window._workspace_add.click()
+    assert pump(3.0, until=lambda: bool(app.workspace_config().workspaces))
+
+    entry = read_workspace_config()["workspaces"][0]
+    assert entry["name"] == "New vault"
+    assert entry["remote"] == "Docs/New"
+    assert entry["enabled"] is True
+    assert [row.workspace.id for row in app.workspace_rows()] == [candidate.id]
+    # Added workspaces are synchronized through the ordinary single-flight path.
+    assert pump(3.0, until=lambda: cycles.ids == [candidate.id])
+
+
+def test_a_failed_probe_creates_nothing(controller, fakes, dialogs, monkeypatch,
+                                        tmp_path):
+    app = workspace_controller(controller, fakes, [])
+    window, candidate, _checked = add_flow(app, fakes, monkeypatch, tmp_path)
+    monkeypatch.setattr(workspaces, "check_local_occupancy", Recorder(
+        error=workspaces.WorkspaceError("it already holds 4 item(s)")))
+
+    window._workspace_add.click()
+
+    assert pump(3.0, until=lambda: dialogs.count("warning") == 1)
+    assert dialogs.count("question") == 0
+    assert app.workspace_config().workspaces == ()
+    assert read_workspace_config()["workspaces"] == []
+    assert not os.path.exists(candidate.local)
+
+
+def test_the_first_seed_offers_obsidian_with_a_percent_encoded_url(
+        controller, fakes, cycles, dialogs, monkeypatch, tmp_path):
+    opened: list[str] = []
+    monkeypatch.setattr(window_module, "open_externally", opened.append)
+    app = workspace_controller(controller, fakes, [])
+    window, candidate, _checked = add_flow(
+        app, fakes, monkeypatch, tmp_path, local=str(tmp_path / "New vault"))
+    dialogs.answer = _RealMessageBox.StandardButton.Ok
+
+    window._workspace_add.click()
+    assert pump(3.0, until=lambda: bool(app.workspace_config().workspaces))
+    dialogs.answer = _RealMessageBox.StandardButton.Yes
+    # The seeding cycle lands, with a first success timestamp.
+    app._on_workspace_cycle(candidate.id, workspace_sync.CycleResult(
+        workspace_id=candidate.id, outcome=workspace_sync.SYNCHRONIZED,
+        state=workspace_sync.STATE_UP_TO_DATE,
+        last_success_at="2026-07-29T10:00:00Z"))
+
+    assert opened == ["obsidian://open?path="
+                      + f"{tmp_path}/New vault".replace("/", "%2F").replace(" ", "%20")]
+    # Offered once, not on every later result.
+    app._on_workspace_cycle(candidate.id, workspace_sync.CycleResult(
+        workspace_id=candidate.id, outcome=workspace_sync.SYNCHRONIZED,
+        state=workspace_sync.STATE_UP_TO_DATE,
+        last_success_at="2026-07-29T10:00:05Z"))
+    assert len(opened) == 1
+    # And the plain folder action is retained alongside it, because an
+    # obsidian:// handler is not guaranteed to be registered (§11.4).
+    tree = window._workspace_tree
+    tree.setCurrentItem(tree.topLevelItem(0))
+    tree.topLevelItem(0).setSelected(True)
+    assert window._workspace_open_local.isEnabled()
+    window._workspace_open_local.click()
+    assert opened[-1] == candidate.local
+
+
+def test_obsidian_urls_are_percent_encoded_whole():
+    assert window_module.obsidian_url("/home/u/iCloud Workspaces/A&B?x") == \
+        "obsidian://open?path=%2Fhome%2Fu%2FiCloud%20Workspaces%2FA%26B%3Fx"
+
+
+# ------------------------------------- health and diagnostics (§12.1/§12.2) --
+
+def test_a_conflicted_workspace_makes_the_synthetic_row_yellow(controller, fakes,
+                                                               tmp_path):
+    write_workspace_status(1, state=workspace_sync.STATE_CONFLICT)
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1)])
+    tray = app._tray
+    assert tray is not None
+
+    app._on_snapshot(green_snapshot())
+
+    overall, checks = tray.states[-1]
+    names = [check.name for check in checks]
+    assert "Safe workspaces" in names
+    row = [check for check in checks if check.name == "Safe workspaces"][0]
+    assert row.severity == health.YELLOW
+    assert overall == health.YELLOW
+    # The row says how many, never which.
+    assert "Workspace 1" not in row.detail
+    assert str(tmp_path) not in row.detail
+
+
+def test_a_healthy_workspace_never_lowers_a_red_bridge(controller, fakes, tmp_path):
+    write_workspace_status(1, state=workspace_sync.STATE_UP_TO_DATE)
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1)])
+    tray = app._tray
+    red = health.Snapshot(
+        checks=[health.Check("iCloud mount", health.RED, "not mounted")],
+        overall=health.RED, status=None, tree=None)
+
+    app._on_snapshot(red)
+
+    overall, checks = tray.states[-1]
+    assert overall == health.RED
+    assert [check.severity for check in checks
+            if check.name == "Safe workspaces"] == [health.GREEN]
+
+
+def test_no_workspaces_configured_adds_no_health_row(controller, fakes):
+    app = workspace_controller(controller, fakes, [])
+    tray = app._tray
+
+    app._on_snapshot(green_snapshot())
+
+    overall, checks = tray.states[-1]
+    assert overall == health.GREEN
+    assert "Safe workspaces" not in [check.name for check in checks]
+
+
+def test_the_report_counts_workspaces_and_names_none_of_them(controller, fakes,
+                                                             tmp_path):
+    write_workspace_status(1, state=workspace_sync.STATE_CONFLICT,
+                           last_success_at="2026-07-28T08:00:00Z",
+                           paths=["notes/Weekly review.md"],
+                           detail="both folders kept their own version")
+    write_workspace_status(2, state=workspace_sync.STATE_ERROR,
+                           last_success_at="2026-07-28T09:00:00Z")
+    app = workspace_controller(controller, fakes, [
+        workspace_entry(tmp_path, 1),
+        workspace_entry(tmp_path, 2),
+        workspace_entry(tmp_path, 3, enabled=False),
+    ])
+
+    facts = app._diagnostic_facts()
+    assert facts.workspaces_configured == 3
+    assert facts.workspaces_enabled == 2
+    assert facts.workspaces_conflicted == 1
+    assert facts.workspaces_failed == 1
+    assert facts.workspaces_guarded == 0
+    assert facts.workspaces_last_success == "2026-07-28T09:00:00Z"
+
+    text = diagnostics.report_text(facts, FakeRunner())
+    for leak in ("Workspace 1", "Docs/W1", str(tmp_path), "Weekly review",
+                 "both folders kept their own version"):
+        assert leak not in text
+
+
+def test_quit_gui_only_states_what_happens_to_the_workspaces(controller, fakes):
+    app = controller()
+    assert pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.RUNNING)
+
+    _ask_quit(app)
+
+    dialog = FakeMessageBox.last_dialog
+    assert dialog is not None
+    assert dialog._informative_text.endswith(
+        "Safe Workspace synchronization pauses while this app is closed. Your "
+        "local workspace files stay on this computer and remain safe to edit; "
+        "changes propagate after the next start.")

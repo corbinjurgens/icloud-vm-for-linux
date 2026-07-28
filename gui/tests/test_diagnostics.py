@@ -257,7 +257,8 @@ def test_the_report_states_its_own_redaction_policy():
 def test_every_section_appears():
     text = report_of()
     for title in ("Application", "Lifecycle", "Bridge documents", "Health",
-                  "Host units", "Helper authorization", "Selective sync"):
+                  "Host units", "Helper authorization", "Selective sync",
+                  "Safe workspaces"):
         assert title in text
 
 
@@ -274,3 +275,63 @@ def test_the_default_filename_is_safe():
     # A hostile stamp cannot introduce a path separator or a traversal.
     name = diagnostics.default_filename("../../etc/passwd")
     assert "/" not in name and ".." not in name
+
+
+# ------------------------------------- Safe Workspaces: counts only (§12.2) --
+
+WORKSPACE_FIELDS = {
+    "workspaces_configured", "workspaces_enabled", "workspaces_conflicted",
+    "workspaces_guarded", "workspaces_failed", "workspaces_last_success",
+}
+
+
+def test_facts_admits_exactly_the_six_workspace_fields():
+    """Structural, not a filter: a field nobody declared cannot leak (D37)."""
+    declared = {name for name in diagnostics.Facts.__dataclass_fields__
+                if "workspace" in name}
+    assert declared == WORKSPACE_FIELDS
+
+
+def test_the_workspace_counts_are_reported():
+    text = report_of(workspaces_configured=3, workspaces_enabled=2,
+                     workspaces_conflicted=1, workspaces_guarded=0,
+                     workspaces_failed=1,
+                     workspaces_last_success="2026-07-26T11:00:00Z")
+    assert "Safe workspaces" in text
+    section = text.split("Safe workspaces")[1]
+    assert "Configured            3" in section
+    assert "Enabled               2" in section
+    assert "In conflict           1" in section
+    assert "Guarded               0" in section
+    assert "Failed                1" in section
+    assert "2026-07-26T11:00:00Z" in section
+
+
+def test_a_workspace_that_never_succeeded_says_so():
+    assert "never" in report_of(workspaces_configured=1).split("Safe workspaces")[1]
+
+
+def test_no_workspace_name_folder_or_relative_path_can_be_supplied():
+    """There is no field for any of them, with or without an opt-in."""
+    for name in ("workspace_name", "workspace_local", "workspace_remote",
+                 "workspace_paths", "workspace_detail", "workspace_log"):
+        assert name not in diagnostics.Facts.__dataclass_fields__
+    with pytest.raises(TypeError):
+        diagnostics.Facts(workspace_name="Vault")
+
+
+def test_the_workspace_section_renders_nothing_path_shaped():
+    text = report_of(workspaces_configured=2, workspaces_enabled=2,
+                     workspaces_conflicted=2,
+                     workspaces_last_success="2026-07-26T11:00:00Z")
+    section = text.split("Safe workspaces")[1]
+    for leak in ("/", "\\", ".md", SECRET, REAL_PATH):
+        assert leak not in section
+
+
+def test_the_workspace_section_ignores_the_folder_name_opt_in():
+    """The opt-in covers exclusion paths; workspaces have nothing to disclose."""
+    without = report_of(workspaces_configured=1).split("Safe workspaces")[1]
+    with_names = report_of(workspaces_configured=1,
+                           include_paths=True).split("Safe workspaces")[1]
+    assert without == with_names

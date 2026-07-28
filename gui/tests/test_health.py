@@ -6,6 +6,8 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from icloud_bridge_gui import health  # noqa: E402
@@ -392,3 +394,61 @@ def test_gather_without_caches_probes_every_time(monkeypatch, tmp_path):
     health.gather()
     health.gather()
     assert len(calls) == 2
+
+
+# ------------------------------- the synthetic Safe Workspaces row (§12.1) --
+
+def test_no_workspaces_configured_means_no_row():
+    """The row exists only when there is something for it to describe."""
+    assert health.workspace_check(()) is None
+    assert health.workspace_check(iter([])) is None
+
+
+def test_healthy_workspaces_are_green_and_counted():
+    check = health.workspace_check(["up-to-date", "waiting", "stabilizing",
+                                    "syncing", "paused"])
+    assert check is not None
+    assert check.name == "Safe workspaces"
+    assert check.severity == health.GREEN
+    assert "5 workspace(s)" in check.detail
+
+
+@pytest.mark.parametrize("state", ["conflict", "guarded", "error"])
+def test_any_workspace_needing_attention_is_yellow(state):
+    check = health.workspace_check(["up-to-date", state])
+    assert check.severity == health.YELLOW
+    assert f"1 {state}" in check.detail
+
+
+def test_the_workspace_row_is_never_red():
+    for states in (["error", "conflict", "guarded"], ["error"] * 32):
+        assert health.workspace_check(states).severity != health.RED
+
+
+def test_a_workspace_condition_never_turns_a_connected_bridge_red():
+    rows = checks() + [health.workspace_check(["conflict"])]
+    assert health.overall(checks()) == health.GREEN
+    assert health.overall(rows) == health.YELLOW
+
+
+def test_a_healthy_workspace_cannot_lower_an_existing_yellow_or_red():
+    """The row joins the worst-of computation and does nothing else (D23)."""
+    green_workspaces = health.workspace_check(["up-to-date"])
+    yellow_bridge = checks(status=good_status(icloudClientRunning=False))
+    assert health.overall(yellow_bridge) == health.YELLOW
+    assert health.overall(yellow_bridge + [green_workspaces]) == health.YELLOW
+
+    red_bridge = checks(icloud_mounted=False)
+    assert health.overall(red_bridge) == health.RED
+    assert health.overall(red_bridge + [green_workspaces]) == health.RED
+    # And a disconnected raw bridge keeps its red precedence over a sick one.
+    assert health.overall(red_bridge + [health.workspace_check(["error"])]) \
+        == health.RED
+
+
+def test_the_workspace_row_carries_counts_and_no_names_or_paths():
+    """§12.2's rule applies to the row too: it is rendered in a support report."""
+    check = health.workspace_check(["conflict", "error", "up-to-date"])
+    assert "conflict" in check.detail and "error" in check.detail
+    for leak in ("/", "\\", "Vault", ".md"):
+        assert leak not in check.detail

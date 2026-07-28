@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable
 
-from . import bridge, power
+from . import bridge, power, workspace_sync
 
 GREEN = "green"
 YELLOW = "yellow"
@@ -42,6 +42,15 @@ REVISION_LAG_GRACE_SECONDS = 300
 DISK_FLOOR_BYTES = 20 * 1024 ** 3
 
 PENDING_EXCLUSION_STATES = ("applying", "pending-dehydrate", "not-found")
+
+#: The synthetic Safe Workspaces row (`docs/plan-safe-local-workspaces.md`
+#: §12.1). Its name is this app's own, and the states it counts are the tokens
+#: `workspace_sync` persists — imported rather than copied, so the two rosters
+#: cannot drift apart.
+WORKSPACE_CHECK_NAME = "Safe workspaces"
+WORKSPACE_ATTENTION_STATES = (workspace_sync.STATE_CONFLICT,
+                              workspace_sync.STATE_GUARDED,
+                              workspace_sync.STATE_ERROR)
 
 
 @dataclass(frozen=True)
@@ -213,6 +222,32 @@ def _check_disk(status: dict | None) -> Check:
                      f"{summary} — below the {human_bytes(DISK_FLOOR_BYTES)} floor and nothing is eligible to reclaim"
                      f"{tail}; grow the disk or wait for uploads to finish")
     return Check("Guest disk", GREEN, summary)
+
+
+def workspace_check(states: Iterable[str]) -> Check | None:
+    """The one Safe Workspaces row, or ``None`` when none is configured (§12.1).
+
+    Counts only: a workspace's name, folders and affected paths belong to the
+    tab, never to a row the tray tooltip and a support report both render.
+
+    The row is yellow when any workspace is in `conflict`, `guarded` or `error`,
+    green otherwise, and **never red**. It then joins :func:`overall`'s existing
+    worst-of computation and nothing else, which is exactly what makes a healthy
+    workspace unable to lower a yellow or red bridge, and a sick one unable to
+    turn a connected bridge red (D23).
+    """
+    tokens = list(states)
+    if not tokens:
+        return None
+    counts = [(state, tokens.count(state)) for state in WORKSPACE_ATTENTION_STATES]
+    needing = sum(count for _state, count in counts)
+    if not needing:
+        return Check(WORKSPACE_CHECK_NAME, GREEN,
+                     f"{len(tokens)} workspace(s), none needing attention")
+    summary = ", ".join(f"{count} {state}" for state, count in counts if count)
+    return Check(WORKSPACE_CHECK_NAME, YELLOW,
+                 f"{needing} of {len(tokens)} workspace(s) need attention: "
+                 f"{summary} — see the Safe Workspaces tab")
 
 
 def build_checks(*, container_running: Any, container_detail: str = "",
