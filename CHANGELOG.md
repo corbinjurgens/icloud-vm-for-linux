@@ -337,6 +337,14 @@ carries the symptom and that fix. Nothing here is proven by the repository
 checks, which cannot mount CIFS; the live acceptance re-run that confirms the
 canary passes belongs to the operator.
 
+**Live pass, same day.** The operator installed the unit copy, reloaded and
+remounted; `/proc/mounts` shows `noperm` active on `/mnt/icloud`, a root-level
+create and delete succeed from the host, and `./host/acceptance-tests.sh`
+reports **29 passed, 0 failed** — the first fully green run of the script on
+record, closing M5 sub-step (e) without the earlier caveat. The
+`DOCKER_HOST`-unset default was exercised in the same run from a shell whose
+context pointed at Docker Desktop.
+
 ### 2026-07-28 — F1 closed: the provisioned guest's recorded confirmations
 
 The three confirmations F1 of
