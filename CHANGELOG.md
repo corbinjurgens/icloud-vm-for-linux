@@ -16,10 +16,12 @@ The repository has no release tags yet. The entries below therefore use dates an
 commit IDs rather than inventing release boundaries after the fact. The GUI
 reported `2.0.0` for most of its short history — a number that read like a
 second stable major release of something people were running, which was never
-true of anything here. It is now **`0.2.0`**: pre-1.0, with the minor digit
-tracking the design line the code implements (`0.2.x` is the v2 plan). The
-entries below are unchanged by that renumbering; where an older entry named a
-`2.x` number, it means the `0.x` one with the same minor digit.
+true of anything here. It is now **`0.3.0`**: pre-1.0, with the minor digit
+tracking the design line the code implements (`0.2.x` was the v2 plan, `0.3.x`
+is Safe Workspaces). The entries below are unchanged by that renumbering; where
+an older entry named a `2.x` number, it means the `0.x` one with the same minor
+digit. The stamp records which design line the code implements and is not a
+claim that I-007's live-acceptance gate has been met.
 
 Because nothing has shipped, **no entry here is a compatibility promise**. Until
 the first tag, a change is free to break any format, protocol or interface
@@ -256,8 +258,12 @@ the decision — every row in
 [`docs/acceptance-results.md`](docs/acceptance-results.md) is still
 `not yet run`, and a development checkout is structurally unable to change that.
 
-The numbering itself is now settled: `__version__` reads **`0.2.0`**, and the
-release that names the shipped backlog is **`0.3.0`**. Pre-1.0 is the accurate
+The numbering has moved since this item was written: `__version__` now reads
+**`0.3.0`**, claimed by the Safe Workspaces design line (D52), so `0.3.0` is no
+longer free to name the release this item was reserving it for. The stamp tracks
+the design line the code implements and asserts nothing about the gate below,
+which is unchanged and still unmet. **Open: which number this release takes.**
+Pre-1.0 is the accurate
 statement of where this stands — no tags, no installed copies but the author's,
 and hard rule 9 explicitly disclaiming compatibility. `1.0.0` is reserved for the
 first build that has passed live acceptance on hardware other than the author's.
