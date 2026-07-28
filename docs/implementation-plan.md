@@ -382,8 +382,11 @@ is. There is no `sign`/`seal` (the guest turns both off, D32), no `mfsymlinks`
 (it would create files iCloud syncs as junk) and no `max_channels` (one NATed
 virtio NIC). `rasize` needs a kernel whose cifs module knows it (5.15+ assumed);
 on an older one the mount fails with *bad option* and the option can be dropped.
-The bridge share uses the same options minus `rasize`: it only ever carries
-small JSON documents.
+The data mount also carries `noperm` (v2 plan D50): the sync root's DOS
+read-only attribute otherwise maps to a client-side `0555` veto on root-level
+creates that the guest's own ACL check would have allowed.
+The bridge share uses the same options minus `rasize` and `noperm`: it only
+ever carries small JSON documents and its root has no read-only attribute.
 
 `uid`/`gid` are the primary desktop user's. The files ship with `1000`;
 `icloud-bridge-configure` patches them from `MOUNT_UID`/`MOUNT_GID`, so do not
