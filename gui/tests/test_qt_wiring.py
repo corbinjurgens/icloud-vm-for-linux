@@ -14,6 +14,7 @@ keeps `CONTRIBUTING.md`'s with-and-without-Qt rule satisfiable.
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import sys
@@ -39,7 +40,8 @@ from icloud_bridge_gui import window as window_module             # noqa: E402
 _RealMessageBox = window_module.QMessageBox
 _confirm_create_vm = app_module.Application._confirm_create_vm
 from icloud_bridge_gui import (backup, bridge, diagnostics, firstrun,  # noqa: E402
-                               guestprov, health, lifecycle, listing, power)
+                               guestprov, health, lifecycle, listing, power,
+                               workspace_sync, workspaces)
 
 
 # ------------------------------------------------------------------ fakes --
@@ -219,6 +221,40 @@ def dialogs(monkeypatch):
     return FakeMessageBox
 
 
+#: The shipped Safe Workspace cadence, captured at import — before the fixture
+#: below neutralizes it — so a test can still assert the real value.
+REAL_WORKSPACE_SYNC_INTERVAL_MS = app_module.WORKSPACE_SYNC_INTERVAL_MS
+
+
+@pytest.fixture(autouse=True)
+def slow_workspace_timer(monkeypatch):
+    """No workspace pass in this file may be started by the wall clock.
+
+    The scheduler tests drive the tick themselves, and the timer is *started*
+    the moment monitoring is reached — so it has to be long before it is
+    constructed, not lengthened afterwards: the window a later `setInterval`
+    leaves open is exactly the one that decides whether a pass happened. The
+    controller reads this constant when it builds the timer, which is why
+    patching it here is enough, and why a test can prove the wiring by
+    comparing the timer against it.
+    """
+    monkeypatch.setattr(app_module, "WORKSPACE_SYNC_INTERVAL_MS", 600000)
+
+
+@pytest.fixture(autouse=True)
+def no_real_cycle(monkeypatch):
+    """No test in this file may reach a real Unison cycle or a real mount.
+
+    The scheduler tests replace this with their own recorder; every other test
+    gets a `run_cycle` that cannot do anything, so an accidentally scheduled
+    cycle is impossible rather than merely unlikely.
+    """
+    def refuse(_workspace, **_kwargs):
+        raise AssertionError("workspace_sync.run_cycle must never really run here")
+
+    monkeypatch.setattr(workspace_sync, "run_cycle", refuse)
+
+
 # --------------------------------------------------------------- fixtures --
 
 @pytest.fixture(scope="module")
@@ -385,6 +421,7 @@ def controller(qapp, fakes, request):
         instance._timer.stop()
         instance._prov_timer.stop()
         instance._prov_probe_timer.stop()
+        instance._workspace_timer.stop()
         if instance._drain_timer is not None:
             instance._drain_timer.stop()
         instance._window.quiesce()
@@ -2251,3 +2288,364 @@ def test_the_password_row_reports_intent_until_it_has_been_inspected(controller,
     glyph, text = provision_rows(window)["Share password"]
     assert glyph == window_module.PROVISION_GLYPHS[window_module.PROVISION_CREDENTIAL]
     assert text == "will be set from the .env file you choose"
+
+
+# ------------------------------------- Safe Workspace scheduling (plan §10) --
+
+class FakeCycles:
+    """Stands in for `workspace_sync.run_cycle`: records, never runs anything.
+
+    `release` is what lets a test hold a cycle open on its worker thread, which
+    is how single-flight, the drain and the pending pass are observable at all.
+    """
+
+    def __init__(self):
+        self.ids: list[str] = []
+        self.overlapped = False
+        self.raise_for: set[str] = set()
+        self.outcome = workspace_sync.SYNCHRONIZED
+        self.state = workspace_sync.STATE_UP_TO_DATE
+        self.release = threading.Event()
+        self.release.set()
+        self._lock = threading.Lock()
+        self._in_flight = 0
+
+    def __call__(self, workspace, **_kwargs):
+        with self._lock:
+            self.ids.append(workspace.id)
+            self._in_flight += 1
+            self.overlapped = self.overlapped or self._in_flight > 1
+        try:
+            self.release.wait(timeout=10)
+            if workspace.id in self.raise_for:
+                raise RuntimeError("the worker itself failed")
+            return workspace_sync.CycleResult(
+                workspace_id=workspace.id, outcome=self.outcome,
+                state=self.state, wrote_status=True)
+        finally:
+            with self._lock:
+                self._in_flight -= 1
+
+    @property
+    def count(self) -> int:
+        return len(self.ids)
+
+
+def workspace_id(number: int) -> str:
+    return f"{number:016x}"
+
+
+def workspace_entry(tmp_path, number: int, *, enabled: bool = True) -> dict:
+    """One valid `workspaces.json` entry, on a local path no rule rejects."""
+    return {"id": workspace_id(number), "name": f"Workspace {number}",
+            "remote": f"Docs/W{number}", "local": str(tmp_path / f"ws-{number}"),
+            "enabled": enabled}
+
+
+def write_workspace_config(entries) -> str:
+    """Write the configuration the controller will read. No mount involved."""
+    path = workspaces.config_path()             # under the fixture's XDG config
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump({"version": workspaces.CONFIG_VERSION,
+                   "workspaces": list(entries)}, handle)
+    return path
+
+
+@pytest.fixture
+def cycles(monkeypatch):
+    recorder = FakeCycles()
+    monkeypatch.setattr(workspace_sync, "run_cycle", recorder)
+    yield recorder
+    recorder.release.set()
+
+
+def workspace_controller(controller, fakes, entries):
+    """A monitoring controller whose configuration is already `entries`.
+
+    The startup work is drained first: entering `running` reloads the
+    configuration and starts the workspace timer, and a test that ticked while
+    that was still in flight would be racing its own fixture. The timer stays
+    *active* — that is what says monitoring is live — but cannot fire on its
+    own, because `slow_workspace_timer` gave it its interval before it existed.
+    """
+    write_workspace_config(entries)
+    app = controller()
+    assert pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.RUNNING)
+    assert pump(2.0, until=lambda: app._active == 0)
+    return app
+
+
+def test_no_workspace_cycle_runs_before_power_on_completes(controller, fakes,
+                                                           cycles, tmp_path):
+    """The §6 rule for workspaces: monitoring first, only then a cycle."""
+    write_workspace_config([workspace_entry(tmp_path, 1)])
+    fakes.inspect.result = power.DockerStatus("stopped", raw="exited")
+    release = threading.Event()
+
+    def slow_power_on(*args, **kwargs):
+        fakes.power_on.calls.append((args, kwargs))
+        release.wait(timeout=10)
+        return power.HelperResult(True, 0, "bridge on")
+
+    power.power_on = slow_power_on
+    try:
+        app = controller()
+        assert pump(2.0, until=lambda: fakes.power_on.count == 1)
+        assert app._model.phase is lifecycle.Phase.STARTING
+        assert not app._workspace_timer.isActive()
+        app._tick_workspaces()               # even a stray tick starts nothing
+        pump(0.3)
+        assert cycles.count == 0
+        release.set()
+        assert pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.RUNNING)
+    finally:
+        release.set()
+        power.power_on = fakes.power_on
+    assert app._workspace_timer.isActive()
+    assert app._workspace_timer.interval() == app_module.WORKSPACE_SYNC_INTERVAL_MS
+
+
+def test_the_workspace_timer_is_what_starts_a_pass(controller, fakes, cycles,
+                                                   tmp_path):
+    """The shipped cadence, the wiring, and the timeout that drives a pass.
+
+    Three separate claims, because no single assertion can carry them here:
+    the constant is what ships, the timer is built from that constant whatever
+    it holds, and its timeout really does start a pass. Only the last needs the
+    clock, and it is given ten milliseconds rather than five seconds.
+    """
+    assert REAL_WORKSPACE_SYNC_INTERVAL_MS == 5000
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1)])
+    assert app._workspace_timer.interval() == app_module.WORKSPACE_SYNC_INTERVAL_MS
+    app._workspace_timer.setInterval(10)
+    assert pump(2.0, until=lambda: cycles.count >= 1)
+    assert cycles.ids[0] == workspace_id(1)
+
+
+def test_setup_never_starts_a_workspace_cycle(controller, fakes, cycles, tmp_path):
+    """No container means no mount, so nothing may be scanned or synchronized."""
+    write_workspace_config([workspace_entry(tmp_path, 1)])
+    fakes.inspect.result = power.DockerStatus("absent", detail="no such object")
+    app = controller()
+    assert pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.SETUP
+                and not app._setup_busy)
+    assert not app._workspace_timer.isActive()
+    app._tick_workspaces()
+    pump(0.3)
+    assert cycles.count == 0
+
+
+def test_powering_off_stops_the_workspace_timer(controller, fakes, cycles, tmp_path):
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1)])
+    app._on_power_off_requested()
+    assert pump(3.0, until=lambda: app._model.phase is lifecycle.Phase.POWERED_OFF)
+    assert not app._workspace_timer.isActive()
+    app._tick_workspaces()
+    pump(0.3)
+    assert cycles.count == 0
+
+
+def test_an_unknown_transition_stops_the_workspace_timer(controller, fakes,
+                                                         cycles, tmp_path):
+    """The helper may still be reconciling mounts; nothing may touch them."""
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1)])
+    fakes.power_off.result = power.HelperResult(
+        False, None, "Timed out after 600s...", timed_out=True)
+    app._on_power_off_requested()
+    assert pump(3.0,
+                until=lambda: app._model.phase is lifecycle.Phase.TRANSITION_UNKNOWN)
+    assert not app._workspace_timer.isActive()
+    app._tick_workspaces()
+    pump(0.3)
+    assert cycles.count == 0
+
+
+def test_quiescing_stops_the_workspace_timer(controller, fakes, cycles, tmp_path):
+    """A workspace cycle is bridge I/O, so a quiesce must stop scheduling it."""
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1)])
+    assert app._workspace_timer.isActive()
+
+    app._fx_quiesce_io()
+
+    assert not app._workspace_timer.isActive()
+    app._tick_workspaces()
+    pump(0.3)
+    assert cycles.count == 0
+
+
+def test_a_paused_workspace_is_never_queued(controller, fakes, cycles, tmp_path):
+    app = workspace_controller(controller, fakes,
+                               [workspace_entry(tmp_path, 1, enabled=False)])
+    app._tick_workspaces()
+    pump(0.4)
+    assert cycles.count == 0
+
+
+def test_one_pass_runs_the_enabled_workspaces_in_id_order_one_at_a_time(
+        controller, fakes, cycles, tmp_path):
+    """Deterministic order, and at most one cycle globally (§10)."""
+    app = workspace_controller(controller, fakes, [
+        workspace_entry(tmp_path, 3),
+        workspace_entry(tmp_path, 1),
+        workspace_entry(tmp_path, 2, enabled=False),
+        workspace_entry(tmp_path, 4),
+    ])
+    app._tick_workspaces()
+    assert pump(3.0, until=lambda: cycles.count == 3)
+    pump(0.3)
+    assert cycles.ids == [workspace_id(1), workspace_id(3), workspace_id(4)]
+    assert not cycles.overlapped
+    assert cycles.count == 3                     # the paused one, never
+    assert app.workspace_results()[workspace_id(1)].state == \
+        workspace_sync.STATE_UP_TO_DATE
+    assert workspace_id(2) not in app.workspace_results()
+
+
+def test_ticks_during_a_cycle_record_one_pending_pass(controller, fakes, cycles,
+                                                      tmp_path):
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1)])
+    cycles.release.clear()
+    app._tick_workspaces()
+    assert pump(2.0, until=lambda: cycles.count == 1)
+
+    for _ in range(3):
+        app._tick_workspaces()
+    assert app._workspace_pending
+    assert cycles.count == 1                     # nothing queued behind it
+
+    cycles.release.set()
+    assert pump(3.0, until=lambda: cycles.count == 2)
+    pump(0.4)
+    assert cycles.count == 2                     # one pending pass, not three
+    assert not app._workspace_pending
+
+
+def test_a_pending_pass_is_dropped_when_monitoring_stops(controller, fakes,
+                                                         cycles, tmp_path):
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1),
+                                                   workspace_entry(tmp_path, 2)])
+    cycles.release.clear()
+    app._tick_workspaces()
+    assert pump(2.0, until=lambda: cycles.count == 1)
+    app._tick_workspaces()
+    assert app._workspace_pending
+
+    app._on_power_off_requested()
+    assert not app._workspace_timer.isActive()
+    assert not app._workspace_pending
+    assert app._workspace_queue == []
+
+    cycles.release.set()
+    assert pump(5.0, until=lambda: app._model.phase is lifecycle.Phase.POWERED_OFF)
+    pump(0.3)
+    assert cycles.count == 1          # not the queued second, not the pending pass
+
+
+def test_the_shutdown_drain_waits_for_a_workspace_cycle(controller, fakes, cycles,
+                                                        tmp_path):
+    """A cycle is counted in `_active`, so no cycle can outlive the unmount."""
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1)])
+    cycles.release.clear()
+    app._tick_workspaces()
+    assert pump(2.0, until=lambda: cycles.count == 1)
+    assert app._active >= 1
+
+    app._on_power_off_requested()
+    pump(0.5)
+    assert app._model.phase is lifecycle.Phase.SHUTTING_DOWN
+    assert fakes.power_off.count == 0            # the drain is still waiting
+
+    cycles.release.set()
+    assert pump(5.0, until=lambda: fakes.power_off.count == 1)
+    assert pump(3.0, until=lambda: app._model.phase is lifecycle.Phase.POWERED_OFF)
+
+
+def test_a_worker_exception_is_recorded_and_the_pass_continues(controller, fakes,
+                                                               cycles, tmp_path):
+    """`run_cycle` never raises, so this is the case that must not stall us."""
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1),
+                                                   workspace_entry(tmp_path, 2)])
+    cycles.raise_for.add(workspace_id(1))
+    app._tick_workspaces()
+    assert pump(3.0, until=lambda: cycles.count == 2)
+    pump(0.3)
+
+    failed = app.workspace_results()[workspace_id(1)]
+    assert failed.state == workspace_sync.STATE_ERROR
+    assert "the worker itself failed" in failed.detail
+    assert app.workspace_results()[workspace_id(2)].state == \
+        workspace_sync.STATE_UP_TO_DATE
+    assert not app._workspace_active
+
+    app._tick_workspaces()                       # and the scheduler still runs
+    assert pump(3.0, until=lambda: cycles.count == 4)
+
+
+def test_an_already_running_result_never_overwrites_the_shown_state(
+        controller, fakes, cycles, tmp_path):
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1)])
+    app._tick_workspaces()
+    assert pump(3.0, until=lambda: cycles.count == 1)
+    pump(0.3)
+    assert app.workspace_results()[workspace_id(1)].outcome == \
+        workspace_sync.SYNCHRONIZED
+
+    cycles.outcome = workspace_sync.ALREADY_RUNNING
+    cycles.state = workspace_sync.STATE_SYNCING
+    app._tick_workspaces()
+    assert pump(3.0, until=lambda: cycles.count == 2)
+    pump(0.3)
+    assert app.workspace_results()[workspace_id(1)].outcome == \
+        workspace_sync.SYNCHRONIZED
+
+
+def test_the_configuration_is_reloaded_after_each_pass(controller, fakes, cycles,
+                                                       tmp_path):
+    """A removed or paused workspace never gets a cycle from a stale queue."""
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1),
+                                                   workspace_entry(tmp_path, 2)])
+    # Edited while the app runs, before the pass that reloads it ends.
+    write_workspace_config([workspace_entry(tmp_path, 2, enabled=False)])
+
+    app._tick_workspaces()
+    assert pump(3.0, until=lambda: cycles.count == 2)
+    pump(0.3)
+    assert [item.id for item in app.workspace_config().workspaces] == [workspace_id(2)]
+    # The removed one cannot be shown any more, so its result is dropped; the
+    # paused one keeps the state it reached.
+    assert workspace_id(1) not in app.workspace_results()
+    assert workspace_id(2) in app.workspace_results()
+
+    app._tick_workspaces()
+    pump(0.5)
+    # Removed: no cycle. Paused: no cycle.
+    assert cycles.ids == [workspace_id(1), workspace_id(2)]
+
+
+def test_reload_workspaces_is_the_hook_a_configuration_edit_uses(controller, fakes,
+                                                                 cycles, tmp_path):
+    app = workspace_controller(controller, fakes, [])
+    write_workspace_config([workspace_entry(tmp_path, 1)])
+    assert app.workspace_config().scheduled() == ()
+
+    app.reload_workspaces()
+
+    assert [item.id for item in app.workspace_config().scheduled()] == [workspace_id(1)]
+    app._tick_workspaces()
+    assert pump(3.0, until=lambda: cycles.count == 1)
+
+
+def test_a_malformed_configuration_schedules_nothing_and_is_remembered(
+        controller, fakes, cycles, tmp_path):
+    app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1)])
+    with open(workspaces.config_path(), "w", encoding="utf-8") as handle:
+        handle.write("{ not json")
+
+    app.reload_workspaces()
+
+    assert app.workspace_config_error()
+    assert app.workspace_config().workspaces == ()
+    app._tick_workspaces()
+    pump(0.4)
+    assert cycles.count == 0

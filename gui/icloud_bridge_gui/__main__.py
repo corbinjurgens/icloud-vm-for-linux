@@ -22,7 +22,7 @@ from PySide6.QtCore import QObject, QRunnable, QSocketNotifier, QThreadPool, QTi
 from PySide6.QtWidgets import QApplication, QCheckBox, QMessageBox, QSystemTrayIcon
 
 from . import (autostart, backup, bridge, cli, diagnostics, firstrun, guestprov,
-               health, lifecycle, notify, power)
+               health, lifecycle, notify, power, workspace_sync, workspaces)
 from .tray import OFF, STARTING, TrayIcon, load_icon
 from .window import MainWindow
 
@@ -154,6 +154,11 @@ BUSY_BANNER_KIND = {
 #: for in-flight mount-touching tasks before it gives up and refuses to unmount.
 SHUTDOWN_DRAIN_TIMEOUT_MS = 40000
 DRAIN_POLL_MS = 250
+
+#: Safe Workspace cadence (plan §10). The same five seconds the health poll
+#: uses, and for the same reason: a cycle is cheap when nothing moved, and the
+#: expensive parts guard themselves before they touch anything.
+WORKSPACE_SYNC_INTERVAL_MS = 5000
 
 
 class _TaskSignals(QObject):
@@ -352,6 +357,25 @@ class Application(QObject):
         self._timer = QTimer(self)
         self._timer.setInterval(REFRESH_INTERVAL_MS)
         self._timer.timeout.connect(self._refresh)
+
+        #: Safe Workspaces (plan §6/§10). `_workspace_config` is the last
+        #: configuration read from disk — no CIFS access is involved — and
+        #: `_workspace_config_error` why the last read failed, if it did.
+        #: `_workspace_queue` is what is left of the current pass in the
+        #: deterministic id order `scheduled()` gives, `_workspace_active` the
+        #: single cycle allowed in flight globally, and `_workspace_pending` the
+        #: one coalesced tick that arrived while it ran. `_workspace_results`
+        #: caches the last result per workspace for the GUI; none of it is ever
+        #: admitted to the bridge health documents.
+        self._workspace_config = workspaces.WorkspaceConfig()
+        self._workspace_config_error = ""
+        self._workspace_queue: list[workspaces.Workspace] = []
+        self._workspace_active = False
+        self._workspace_pending = False
+        self._workspace_results: dict[str, workspace_sync.CycleResult] = {}
+        self._workspace_timer = QTimer(self)
+        self._workspace_timer.setInterval(WORKSPACE_SYNC_INTERVAL_MS)
+        self._workspace_timer.timeout.connect(self._tick_workspaces)
 
         # Startup must precede any CIFS access: pause bridge I/O until the power
         # inspection (and, if needed, the power-on transition) completes.
@@ -1602,9 +1626,17 @@ class Application(QObject):
 
     def _fx_stop_polling(self) -> None:
         self._timer.stop()
+        # Every non-monitoring phase reaches this effect, so this one line is
+        # the whole "no cycle outside normal monitoring" rule (plan §6).
+        self._stop_workspace_sync()
 
     def _fx_start_polling(self) -> None:
         self._timer.start()
+        # Safe Workspace cycles run only alongside normal health polling, and
+        # only from a configuration re-read now rather than one loaded before
+        # the bridge came up.
+        self.reload_workspaces()
+        self._workspace_timer.start()
 
     def _fx_force_refresh(self) -> None:
         self._refresh(force=True)
@@ -1614,6 +1646,10 @@ class Application(QObject):
         # request/response poller and drops queued list requests, which matters
         # when Start is pressed from the powered-off state.
         self._window.quiesce()
+        # Quiescing means "schedule no more bridge I/O", and a workspace cycle
+        # is bridge I/O. Every reducer path that quiesces also stops polling, so
+        # this is belt and braces rather than a second mechanism.
+        self._stop_workspace_sync()
 
     def _fx_pause_io(self) -> None:
         self._window.set_io_paused(True)
@@ -2290,6 +2326,139 @@ class Application(QObject):
             self._window.show_notice(message.body)
         else:
             self._window.hide_notice()
+
+    # --------------------------------------------- Safe Workspace scheduling --
+    # Plan §10. The timer is the only thing that starts a pass, `run_async` the
+    # only thing that runs one, and `_active` therefore counts every cycle: the
+    # shutdown drain already waits for it, so no workspace process can outlive
+    # an unmount. Nothing here decides whether a cycle may touch the mount —
+    # `workspace_sync.run_cycle` re-checks every §6 precondition itself, on the
+    # worker, before the first CIFS access.
+
+    def reload_workspaces(self) -> None:
+        """Re-read ``workspaces.json``. No CIFS access, and never raises.
+
+        Called when monitoring starts, after every completed pass, and by the
+        Safe Workspaces tab after an edit, so a removed or paused workspace
+        never gets another cycle from a stale queue. A configuration that
+        cannot be validated schedules nothing and is remembered as an error:
+        the file on disk is left exactly as it is (`workspaces.load`).
+        """
+        try:
+            self._workspace_config = workspaces.load()
+        except workspaces.WorkspaceError as exc:
+            self._workspace_config = workspaces.WorkspaceConfig()
+            self._workspace_config_error = str(exc)
+            return
+        self._workspace_config_error = ""
+        # A workspace the operator removed can no longer be shown, so keeping
+        # its last result would only leak. A *paused* one stays configured, and
+        # keeps its result: the tab still shows where it got to.
+        known = {item.id for item in self._workspace_config.workspaces}
+        self._workspace_results = {key: value for key, value
+                                   in self._workspace_results.items()
+                                   if key in known}
+
+    def workspace_config(self) -> workspaces.WorkspaceConfig:
+        """The configuration cycles are currently scheduled from."""
+        return self._workspace_config
+
+    def workspace_config_error(self) -> str:
+        """Why the last :meth:`reload_workspaces` failed, or an empty string."""
+        return self._workspace_config_error
+
+    def workspace_results(self) -> dict[str, workspace_sync.CycleResult]:
+        """The last cycle result per workspace id, newest wins. GUI only."""
+        return dict(self._workspace_results)
+
+    def _stop_workspace_sync(self) -> None:
+        """Schedule no further cycles.
+
+        A cycle already in flight is deliberately left alone: it is counted in
+        `_active`, it is bounded by the 120-second subprocess timeout, and the
+        drain gate is what waits for it. Cancelling it here would be a second
+        mechanism for something the drain already does correctly.
+        """
+        self._workspace_timer.stop()
+        self._workspace_queue = []
+        self._workspace_pending = False
+
+    def _workspace_sync_allowed(self) -> bool:
+        """The §6 preconditions this process can answer without any I/O.
+
+        The timer being active is exactly "startup reached normal monitoring
+        and nothing has stopped polling since"; the phase test is the same one
+        `_refresh` uses, and is what says bridge I/O is not paused.
+        """
+        return (self._workspace_timer.isActive()
+                and not lifecycle.is_no_cifs(self._model.phase))
+
+    def _tick_workspaces(self) -> None:
+        if self._workspace_active or self._workspace_queue:
+            # One pending pass, never a queue of them: a slow cycle must not
+            # accumulate a backlog of ticks to work through afterwards.
+            self._workspace_pending = True
+            return
+        self._begin_workspace_pass()
+
+    def _begin_workspace_pass(self) -> None:
+        self._workspace_queue = list(self._workspace_config.scheduled())
+        self._advance_workspaces()
+
+    def _advance_workspaces(self) -> None:
+        """Start the next queued cycle, or close the pass."""
+        if self._workspace_active:
+            return
+        if not self._workspace_sync_allowed():
+            self._workspace_queue = []
+            self._workspace_pending = False
+            return
+        if not self._workspace_queue:
+            self._finish_workspace_pass()
+            return
+        workspace = self._workspace_queue.pop(0)
+        self._workspace_active = True
+        self.run_async(
+            lambda: workspace_sync.run_cycle(workspace),
+            lambda result: self._on_workspace_cycle(workspace.id, result),
+            lambda message: self._on_workspace_cycle_error(workspace.id, message),
+        )
+
+    def _finish_workspace_pass(self) -> None:
+        # Re-read before the next pass, so a workspace the operator removed or
+        # paused during this one is gone from the queue that follows it.
+        self.reload_workspaces()
+        if self._workspace_pending:
+            self._workspace_pending = False
+            self._begin_workspace_pass()
+
+    def _on_workspace_cycle(self, workspace_id: str,
+                            result: workspace_sync.CycleResult) -> None:
+        self._workspace_active = False
+        self._record_workspace_result(workspace_id, result)
+        self._advance_workspaces()
+
+    def _on_workspace_cycle_error(self, workspace_id: str, message: str) -> None:
+        """A worker that failed rather than returned.
+
+        `run_cycle` turns every error of its own into a result, so this is the
+        unexpected case. It is recorded like any other failure and the pass
+        continues: one broken workspace must not stall the scheduler.
+        """
+        self._workspace_active = False
+        self._workspace_results[workspace_id] = workspace_sync.CycleResult(
+            workspace_id=workspace_id, outcome=workspace_sync.ERROR,
+            state=workspace_sync.STATE_ERROR,
+            detail=message[:workspace_sync.MAX_DETAIL_CHARS])
+        self._advance_workspaces()
+
+    def _record_workspace_result(self, workspace_id: str,
+                                 result: workspace_sync.CycleResult) -> None:
+        if result.outcome == workspace_sync.ALREADY_RUNNING:
+            # Another invocation holds the lock and is the one that will report;
+            # this result knows nothing, so it must not overwrite what is shown.
+            return
+        self._workspace_results[workspace_id] = result
 
     #: Effect token to handler. Every member of `lifecycle.Effect` must appear
     #: here; `test_qt_wiring` asserts the two stay in step, so adding an effect
