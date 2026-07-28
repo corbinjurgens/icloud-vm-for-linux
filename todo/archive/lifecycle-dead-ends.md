@@ -1,7 +1,7 @@
 # Archive: remove the lifecycle dead ends
 
 Records items completed from `todo/lifecycle-dead-ends.md`. The live note keeps
-only what is still outstanding (items 3 and 10 as of 2026-07-28).
+only what is still outstanding (item 3 as of 2026-07-28).
 
 ## 2026-07-28 — items 1, 2, 4, 5, 6, 7, 8 and 9 (checkout-executable work)
 
@@ -61,3 +61,25 @@ Corrections the run turned up, worth remembering:
   could schedule one more worker (a pending forced refresh does), which then
   ran into the next test's fakes — seen as an intermittent failure of the
   no-CIFS-resume test in combined runs. Fixed in `eabe756` by draining twice.
+
+## 2026-07-28 — item 10 (decided: rejected)
+
+The operator rejected adding a host->guest execution channel (QEMU guest
+agent virtio-serial plus guest-side `qemu-ga` giving SYSTEM-level
+`guest-exec`, or WinRM/SSH with a stored admin credential). Recorded as R-040
+under "Visited ideas: closed" -> "Architecture, data safety and lifecycle" in
+`CHANGELOG.md`; no code or plan-register change, since rejecting needs only
+the Closed entry the item itself specified.
+
+Rejection rationale, as recorded in `CHANGELOG.md`: every such channel widens
+the host's power over a guest holding a live Apple session, converting the
+deliberately pull-only surface into one where the host can execute code, or
+holds an admin credential, inside that session. The 2026-07-27 fix chain was
+diagnosed and shipped entirely over the pull-only surface, which is direct
+ROI evidence against adding a channel. The 2026-07-28 watcher-presence beacon
+(`2214697`) further narrows the gap a channel would close, by detecting a
+missing watcher before staging instead of discovering it by timeout. And a
+channel installed at OEM time can only be relied on by VMs whose OEM step
+already worked — the same class whose watcher registration already works —
+so its marginal value is repairing broken watchers on established VMs, not
+first bootstrap.

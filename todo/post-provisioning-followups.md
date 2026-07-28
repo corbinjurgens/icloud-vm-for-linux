@@ -7,8 +7,9 @@ shared-session etiquette, verification, and the plans-own-decisions rule).
 
 **Items 2, 3 and 4 landed on 2026-07-27** (`4bd83e1`, `56c2c32`, `d4caba3`); see
 `todo/archive/post-provisioning-followups.md` for what each one did and for two
-corrections it turned up. What remains here is the operator-only work, plus one
-unanswered question.
+corrections it turned up. Item 4's push question was answered 2026-07-28 (not
+pushed) and is archived alongside it. What remains here is the operator-only
+work in item 1.
 
 ## Context you need before starting
 
@@ -132,8 +133,3 @@ This checkout sits on the author's live host, which also runs the
 
    Record results in `CHANGELOG.md` (append, do not reflow) and the
    `docs/automation-notes.md` scoreboard.
-
-4. **Housekeeping — one question left.** `master` is 64 commits ahead of
-   `origin/master` (counted 2026-07-27). Never push without the operator's
-   explicit request — ask whether they want it pushed. (Asked 2026-07-27;
-   unanswered.)

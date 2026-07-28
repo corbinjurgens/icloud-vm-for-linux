@@ -80,3 +80,10 @@ true of 01/02 and of a VM the app has never provisioned, but it is imprecise for
 `dist/icloud-bridge_0.2.0_all.deb` carries the updated helper. `make lint-ps` was
 not re-run: no PowerShell file changed. Nothing Windows-side executed, and the
 excerpt's behaviour against a live journal is still operator-verified only.
+
+## 2026-07-28 — item 4's push question (answered: not pushed)
+
+The push question the 2026-07-27 housekeeping commit (`4bd83e1`) left open was
+put to the operator and answered 2026-07-28: do not push. `master` stays local,
+89 commits ahead of `origin/master` at the time of the answer. No code, plan,
+or `CHANGELOG.md` change — this is housekeeping, not a design decision.
