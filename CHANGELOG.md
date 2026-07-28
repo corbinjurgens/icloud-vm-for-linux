@@ -269,6 +269,45 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-28 — M5 live remainder: the share-boundary proof and the host acceptance run
+
+Two of the operator-only M5 sub-steps from
+`todo/post-provisioning-followups.md` ran against the live host and guest.
+
+Sub-step (a), the `Provision` share read-only proof: `testparm` reports
+`read only = Yes` for `[Provision]` and `read only = No` for `[Data]`, and the
+behavioral check from the guest's own network position (an smbclient in the
+container's network namespace against the internal Samba on 20.20.20.1)
+confirmed it — `ls` on `Provision` succeeds, while both a new-file `put` and an
+overwrite of `trigger.json` fail with `NT_STATUS_ACCESS_DENIED`; the same
+client's write-then-delete through `Data\.provision` succeeds, and the agent's
+15-second `status.json` cadence through `Data` is continuous live evidence of
+the writable half.
+
+Sub-step (e), `./host/acceptance-tests.sh`: 28 of 29 automated checks pass
+(with `DOCKER_HOST=unix:///var/run/docker.sock`; a shell whose Docker context
+points at Docker Desktop false-fails the two container checks). The one real
+failure is the section-5 round-trip canary: creating a file at the root of
+`/mnt/icloud` is refused by the *host kernel's* CIFS client, because the sync
+root carries the DOS read-only attribute (normal for a customized Windows
+folder) and the client maps it to mode `0555` and rejects the create locally.
+The guest itself allows it — the same create and delete at the share root
+succeed over smbclient with the same credential — and subdirectory writes work
+throughout, so the data path is healthy and the failure is a client-side
+mode-mapping artifact. Follow-up: either the canary moves off the root or the
+mount options get a considered `noperm`-style decision; recorded in the run
+notes, not silently patched.
+
+The same session also found that the app-generated configuration at
+`~/.config/icloud-bridge/env` holds a `SHARE_PASS` the guest does not accept
+(the repo `.env` one authenticates; today's re-provision preserved the existing
+password and delivered no secret, so nothing misbehaved live). Because
+`_default_env_path` prefers that file when it exists, a future secret delivery
+would default to the wrong credential. Left open deliberately: the M5 (g)
+password-reset exercise later the same day is the natural place to converge the
+guest onto the app-managed credential, and its record should say which way it
+was resolved.
+
 ### 2026-07-28 — The Create-VM dialog is honest when the installer is cached
 
 todo/lifecycle-dead-ends.md item 6: the confirmation always warned "several
