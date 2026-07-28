@@ -273,6 +273,36 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-28 — D51: the watcher's console is hidden for real, not nominally
+
+The scheduled task has always passed `-WindowStyle Hidden`, and Windows 11 has
+always ignored it: new consoles are delegated to Windows Terminal, which does
+not honor the requested show state. F2 measured what that cost — a permanent
+elevated `WindowsTerminal` window rendering `==> Watching ...` at a constant
+6.1-6.5% of one core, the guest's largest single idle consumer, behind a close
+button that would have killed the watcher. `provision/watcher.ps1` now points
+the `icloud` account's console delegation back at `conhost.exe`
+(`DelegationConsole`/`DelegationTerminal` under `Console\%%Startup`), which
+does honor the hidden style. The poll loop owns the setting rather than
+`-Install` alone, because it is per-user and the loop is the only part of the
+file that provably runs as `icloud`; the write is idempotent, read back by
+re-applying, and when it changes anything the loop exits once so D42's
+one-minute keep-alive starts the new process with a conhost console — the same
+delivery path a refreshed watcher already uses, which is what makes this
+reach an existing VM through an ordinary re-provision. `-Install` also applies
+it when that profile's hive is loaded. Rejected: a `wscript`/VBS shim and
+`conhost.exe --headless`, which only restate the show state the delegation
+layer is discarding and would need a task-definition rewrite the re-provision
+path cannot deliver; and a non-interactive S4U principal, which D40 forbids
+outright (the watcher must run in the auto-logged-on interactive session, and
+an S4U token has no network identity for `\\host.lan\Provision`). No OEM half
+was added to `01-debloat.ps1`: it would duplicate the conhost GUID in a second
+file to save one minute on a path that already restarts, and could never reach
+a VM that already exists. **The live proof is the operator's, not this
+checkout's** — nothing here can start a Windows guest; the claim is confirmed
+only when the window is gone and a re-measure shows the WindowsTerminal share
+gone with it, which is also F2's completion gate.
+
 ### 2026-07-28 — F2 executed: the guest's idle CPU has names now
 
 The three-sample idle attribution the 2026-07-27 performance review asked for

@@ -16,7 +16,9 @@
 #
 # Idempotent. -Install re-registers with -Force and re-hardens the directory;
 # the loop consumes each run ID exactly once through a local accepted-run marker
-# and re-triggering an already-converged VM is a no-op reconciliation.
+# and re-triggering an already-converged VM is a no-op reconciliation. The loop
+# also reconciles the account's console delegation (D51) and exits once, so the
+# keep-alive brings it back with a console that is genuinely hidden.
 #
 # Two rules this file exists to enforce, neither of which may be relaxed:
 #
@@ -72,6 +74,12 @@ $CheckIds = @('icloudPackage', 'syncRoot', 'shareAccount', 'shareCredential',
 $PollSeconds    = 30
 $MaxTriggerSize = 65536
 $MaxLine        = 500
+
+# Console delegation (D51). Windows 11 hands every new console to Windows
+# Terminal, which does not honor the task action's -WindowStyle Hidden; conhost
+# does. Both values are REG_SZ under the per-user Console\%%Startup key.
+$ConhostGuid   = '{B23D10C0-E52E-411E-9D5B-C09FDF709C7D}'
+$DelegationKey = 'Console\%%Startup'
 
 function Step { param([string]$Message) Write-Host "==> $Message" -ForegroundColor Cyan }
 
@@ -212,6 +220,64 @@ function Remove-SupersededRun {
     }
 }
 
+# --------------------------------------------------------- hidden console ---
+
+function Set-ConsoleDelegation {
+    # Point one user's console delegation at conhost.exe, which honors
+    # -WindowStyle Hidden (D51). Windows Terminal does not, so the watcher's
+    # console rendered forever and measured a constant ~6.3% of one core in a
+    # GPU-less VM - the largest single idle consumer, and a window a user could
+    # close to kill the watcher.
+    #
+    # $RootPath is a registry provider path for the hive to write ('...\CURRENT_USER'
+    # for this process's own, '...\USERS\<sid>' for another loaded profile).
+    # Returns $true when it actually changed something, so a caller can read
+    # back by calling again.
+    param([string]$RootPath)
+    # Plain concatenation, not Join-Path: this is a provider path, not a
+    # filesystem one, and the key does not exist yet on a fresh profile.
+    $key = $RootPath + '\' + $DelegationKey
+    $changed = $false
+    if (-not (Test-Path -LiteralPath $key)) {
+        New-Item -Path $key -Force | Out-Null
+        $changed = $true
+    }
+    foreach ($name in @('DelegationConsole', 'DelegationTerminal')) {
+        $current = $null
+        try { $current = (Get-ItemProperty -LiteralPath $key -Name $name -ErrorAction Stop).$name }
+        catch { $current = $null }
+        if ("$current" -ne $ConhostGuid) {
+            Set-ItemProperty -LiteralPath $key -Name $name -Value $ConhostGuid -Type String
+            $changed = $true
+        }
+    }
+    return $changed
+}
+
+function Confirm-HiddenConsole {
+    # Applied by the loop, not only by -Install: the delegation is a per-user
+    # setting and the loop is the only part of this file that provably runs as
+    # $AgentUser, so this is what reaches a guest built before D51 and a fresh
+    # guest whose profile did not exist at OEM time. Delegation is read at
+    # console creation, so the fix lands on the NEXT start - reported here as
+    # $true so the caller can exit into the keep-alive, exactly as a refreshed
+    # watcher copy does.
+    try {
+        if (-not (Set-ConsoleDelegation -RootPath 'Registry::HKEY_CURRENT_USER')) { return $false }
+        # Read back before acting on it. An exit that did not actually fix the
+        # console would repeat every minute forever, which is worse than the
+        # window it is trying to remove.
+        if (Set-ConsoleDelegation -RootPath 'Registry::HKEY_CURRENT_USER') {
+            Write-Warning "the console delegation did not persist; leaving this window as it is"
+            return $false
+        }
+        return $true
+    } catch {
+        Write-Warning "could not point the console delegation at conhost: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 # ------------------------------------------------------- liveness envelope ---
 
 function New-KeepAliveTrigger {
@@ -291,6 +357,17 @@ function Install-Watcher {
         throw ("'$AgentUser' ($userSid) is not a member of the built-in Administrators group " +
                "($AdminsSid). The elevated watcher task cannot run without it. Add the account " +
                "deliberately, or rebuild the VM; this installer will not grant it.")
+    }
+
+    # Best effort, and only when that profile's hive is already loaded: at OEM
+    # time the account has never signed in, so there is nothing to write to.
+    # The loop applies it at first logon either way (D51), which is why this is
+    # never fatal and never loads a hive of its own.
+    $hive = "Registry::HKEY_USERS\$userSid"
+    if (Test-Path -LiteralPath $hive) {
+        Step "Pointing $AgentUser's console delegation at conhost (D51)"
+        try { Set-ConsoleDelegation -RootPath $hive | Out-Null }
+        catch { Write-Warning "could not set the console delegation: $($_.Exception.Message)" }
     }
 
     Step "Hardening $ProvisionDir (SYSTEM + Administrators only)"
@@ -471,6 +548,10 @@ New-Item -ItemType Directory -Force -Path $RunsDir -ErrorAction SilentlyContinue
 Remove-StaleSecret
 Confirm-KeepAlive
 Write-WatcherBeacon
+if (Confirm-HiddenConsole) {
+    Step "Console delegation now points at conhost - exiting so the next start is windowless"
+    exit 0
+}
 $StartedFromDigest = Get-WatcherDigest
 Step "Watching $TriggerPath every $PollSeconds s"
 
