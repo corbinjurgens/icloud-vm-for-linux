@@ -744,6 +744,94 @@ project changes them for you.
 
 ---
 
+## 11. Safe Workspaces: installing and maintaining the local-replica sync
+
+Safe Workspaces lets an autosaving editor (Obsidian is the motivating case)
+open an ordinary folder on local disk instead of `/mnt/icloud`, while the GUI
+reconciles that folder with an iCloud directory using
+[Unison](https://github.com/bcpierce00/unison). What the feature is and how to
+use it day to day is the
+[Safe Workspaces section of the README](README.md#safe-workspaces-editing-a-vault-on-local-disk);
+the full design is [`docs/plan-safe-local-workspaces.md`](docs/plan-safe-local-workspaces.md).
+This section covers only what a host operator installs and re-runs.
+
+### Both install paths already bring Unison
+
+Neither install path needs an extra step for this feature:
+
+- **`host/setup-prereqs.sh`** (§3) installs the distro `unison` package in the
+  same run that installs `cifs-utils` — look for `Installing Unison` in its
+  output.
+- **`gui/install-gui.sh`** (§6) installs the same distro package right after it
+  settles PySide6. On a host with no `apt-get`, the per-user install still
+  completes and prints that Safe Workspaces stays unavailable until Unison
+  2.52 or newer is installed by hand — no binary is ever downloaded on your
+  behalf.
+- **The `.deb`** (§10) declares `unison (>= 2.52)` as a package dependency, so
+  installing or upgrading the package pulls it in with everything else.
+
+The package was developed and its integration tests run against Unison
+**2.53.8**; the declared floor is 2.52. Confirm what landed:
+
+```bash
+unison -version
+```
+
+**If the host package is already installed** and you only need to pick up the
+Unison dependency (or any other packaging change), the command is:
+
+```bash
+make reinstall
+```
+
+`make reinstall` rebuilds the `.deb` first, so this always reinstalls current
+payloads rather than a stale `dist/` artifact that happens to share a version
+stamp (the package version is a build stamp, not a release counter — see the
+`reinstall` target's own comment in the `Makefile`). It never touches
+`workspaces.json`, a workspace's local replica, its Unison sync state, or its
+backups: those live under your own `~/.local/...`, and neither `postrm` nor
+any other packaging script reaches into a user's home directory, on purge or
+otherwise.
+
+### What survives a host-side interruption
+
+The runbook above has you relogin (§4), reinstall the package, restart the
+GUI, and stop and start the Windows VM more than once. None of that needs a
+special Safe Workspaces step, because the feature was built to tolerate all of
+it without help:
+
+- **Quitting the GUI** pauses propagation — there is no separate daemon, cycles
+  only run inside the app process — but your local workspace folder is
+  ordinary local disk, so it stays fully readable and editable the whole time.
+  The next time you start the GUI, any pending change resumes from where it
+  left off.
+- **Powering the bridge off** (the GUI's own action, or `sudo
+  icloud-bridge-power off`) is safe once the currently active cycle drains —
+  it is counted in the same drain the shutdown already waits for, so the
+  unmount that follows is never forced or lazy against a workspace in the
+  middle of a cycle.
+- **A package reinstall or upgrade** leaves configuration, replicas, sync
+  state, and backups exactly where they were, per the point above.
+
+None of this is asserted from a live run: it is the design in
+`docs/plan-safe-local-workspaces.md` (§6, "Lifecycle gating") plus what the
+unit and integration test suites exercise. The rows of that document's §15
+acceptance matrix that
+correspond directly to these sequences — power-off during a cycle (A8),
+GUI-only quit (A9), restart recovery (A10), and package reinstall (A13) — are,
+like every other row there, still `unverified` against the real Windows guest.
+
+### Before creating the first Safe Workspace on this host
+
+**Turn off every other bidirectional sync mechanism for that vault first —
+including Obsidian Sync.** Two mechanisms writing the same local folder will
+fight each other, and neither can see the other's intent; this app cannot
+detect Obsidian Sync's own settings for you. Check this once per vault, before
+you use **Add workspace…** on the GUI's Safe Workspaces tab — the day-to-day
+steps from there on are in the README section linked above.
+
+---
+
 ## Appendix: Taking the data-path work onto a guest built before 2026-07-26
 
 **Read this if your container predates that date.** Two performance decisions —
