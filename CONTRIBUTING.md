@@ -42,7 +42,14 @@ compatibility matrix.
 
 The exception is the operator's own data and machine state. Preserve
 `/etc/credentials-icloud`, `exclusions.json` and its selections,
-`/etc/icloud-bridge/config`, the VM disk, and synced files. Protecting live data
+`/etc/icloud-bridge/config`, the VM disk, and synced files. Safe Workspaces adds
+more of it: the configuration at
+`$XDG_CONFIG_HOME/icloud-bridge-gui/workspaces.json`, every local replica
+directory a workspace points at, the per-workspace state under
+`$XDG_STATE_HOME/icloud-bridge-gui/workspaces/<id>/` (Unison archives, baseline,
+snapshot, status, log), and the central backups in that directory's `backups/`.
+Neither code nor a package removal script may delete any of it — forgetting a
+workspace removes its configuration entry and nothing else. Protecting live data
 is a data-safety requirement, not backwards compatibility.
 
 This freedom concerns code shape, not care. Refactors must still leave
@@ -93,7 +100,9 @@ register explicitly.
 | `provision/04-bridge-agent.ps1` | Windows guest, elevated | Bridge share, agent task, ABE, and ACL boundaries |
 | `provision/agent.ps1` | — | Byte-identical deployment copy of `guest-agent/agent.ps1` |
 | `guest-agent/agent.ps1` | Windows guest, as `icloud` | Source of truth for the scheduled, unelevated agent |
-| `gui/icloud_bridge_gui/` | Linux desktop user | Tray, status window, lifecycle, and selective sync |
+| `gui/icloud_bridge_gui/` | Linux desktop user | Tray, status window, lifecycle, selective sync, and Safe Workspaces |
+| `gui/icloud_bridge_gui/workspaces.py` | Linux desktop user | Qt-free Safe Workspace configuration, XDG paths, validation, and path rejection; no CIFS, no subprocess |
+| `gui/icloud_bridge_gui/workspace_sync.py` | Linux desktop user | Qt-free; the only module that reads the mount for a workspace and the only one that runs Unison |
 | `gui/tests/` | Linux host | `pytest` suite; must pass with and without PySide6 |
 | `gui/install-gui.sh` | Linux host, **not** root | Per-user install; preserves an existing `Hidden=true` preference |
 | `host/setup-prereqs.sh` | Linux host, root | Docker, CIFS utilities, and KVM check |
@@ -105,6 +114,7 @@ register explicitly.
 | `host/icloud-health.sh` | Linux host | Installed into `/usr/local/bin/` and driven by the timer |
 | `docs/implementation-plan.md` | — | Authoritative v1 design and D1-D13 register |
 | `docs/plan-gui-selective-sync.md` | — | V2 plan and later decisions; amends v1 and wins on conflict |
+| `docs/plan-safe-local-workspaces.md` | — | Authoritative Safe Workspaces design, locked by D52 in the v2 register |
 | `docs/selective-sync.md` | — | User-facing exclusions documentation |
 | `docs/automation-notes.md` | — | Record of unavoidable manual first-run work |
 | `README.md` | — | Overview, usage, and development entry points |
@@ -117,15 +127,16 @@ The Qt boundary is part of the design. `tray.py`, `window.py`, and
 `__main__.py` are the PySide6 layer. `health.py`, `bridge.py`, `power.py`,
 `lifecycle.py`, `backup.py`, `diagnostics.py`, `firstrun.py`, `guestprov.py`,
 `envfile.py`, `autostart.py`, `filtering.py`, `listing.py`, `sizes.py`,
-`notify.py`, and `cli.py` import no Qt and own the logic.
+`notify.py`, `workspaces.py`, `workspace_sync.py`, and `cli.py` import no Qt and
+own the logic.
 
 `lifecycle.py` is stricter still: it is a pure reducer with no I/O, subprocess,
 or clock. `envfile.py` performs no I/O of its own either; it holds the single
 `SHARE_PASS` grammar that `firstrun.py`, `guestprov.py`, and
 `host/icloud-bridge-configure` must agree on (D41). `power.py`, `backup.py`,
-`diagnostics.py`, `firstrun.py`, `guestprov.py`, and `autostart.py` must remain
-free of mount I/O. Consult their module docstrings and the v2 plan before
-changing those boundaries.
+`diagnostics.py`, `firstrun.py`, `guestprov.py`, `workspaces.py`, and
+`autostart.py` must remain free of mount I/O. Consult their module docstrings and
+the v2 plan before changing those boundaries.
 
 Keep the security and data-safety boundaries of those modules intact:
 
@@ -147,6 +158,20 @@ Keep the security and data-safety boundaries of those modules intact:
   value never appears in argv, the environment, a host temporary file, a log, a
   status, or the clipboard, and is never persisted.
 - `autostart.py` only reads and toggles the XDG entry's `Hidden=` value.
+- `workspaces.py` touches only local `$XDG_CONFIG_HOME`/`$XDG_STATE_HOME` and
+  `/proc/self/mountinfo`, using the same atomic 0600-in-0700 discipline as
+  `backup.py`. It runs no subprocess and never reads the mount, so the GUI can
+  load workspace configuration before the bridge is up. Its path rules — what a
+  remote path may be, what a local root may be, and which filesystems are
+  allowed — are safety checks, not cosmetics: keep validation separable from
+  creation and keep the rejections fail-closed (D52, plan §4-§5).
+- `workspace_sync.py` owns one finite cycle and nothing persistent. It
+  short-circuits on the powered-off marker *before* any CIFS path is touched,
+  runs every subprocess through an injected runner with no shell and a bounded
+  timeout, and builds the Unison argv exactly as plan §7.7 pins it. Never add an
+  option that picks a winner, deletes an archive, runs continuously, or
+  overrides a lock; never advance the baseline after a guarded, conflicted,
+  failed, or timed-out cycle.
 
 ## Hard rules
 

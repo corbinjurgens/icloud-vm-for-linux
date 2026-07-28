@@ -1,7 +1,8 @@
 # Safe Workspaces — local editing replicas above the raw iCloud mount
 
-**Status:** design, not yet implemented · **Audience:** an executor (human or
-model) who follows instructions literally · **Register row:** D52 in
+**Status:** implemented in the checkout; every §15 live row is still
+`unverified` · **Audience:** an executor (human or model) who follows
+instructions literally · **Register row:** D52 in
 `docs/plan-gui-selective-sync.md` §1.
 
 This document is the authoritative design for the **Safe Workspaces** feature.
@@ -127,9 +128,9 @@ Rejected alternatives:
 
 Two active bidirectional mechanisms over the same local vault will fight. If
 Obsidian Sync (or any other bidirectional sync) is enabled for a vault, it must
-be disabled before that vault becomes a Safe Workspace. The operator
-documentation (task 7) states this; the GUI states the Obsidian half of it in
-the add-workspace confirmation (§11.3).
+be disabled before that vault becomes a Safe Workspace. `README.md` states this
+to the operator; the GUI states the Obsidian half of it in the add-workspace
+confirmation (§11.3).
 
 ---
 
@@ -794,6 +795,25 @@ These cannot be proved by unit tests. They require the real host, the Windows
 guest, CIFS, Obsidian, and a second Apple device, and they run first against a
 **disposable copy** of a vault with an independent backup. The real vault is cut
 over only after every disposable-vault row passes.
+
+What the checkout already proves, and what these rows therefore do *not* have to
+re-establish: the exact argv and environment of §7.7, the shell-free execution,
+the powered-off short-circuit, lock contention, the first-run and free-space
+rules, two-poll stability, `ctime` irrelevance, the ignore list, the destructive
+guard, exit classification, timeout handling, and atomic status are unit-tested;
+initial seeding, edits in both directions, metadata-only touches that replace no
+content, ten retained central backups, deletion propagation, and a divergent
+same-file conflict that leaves both endpoints intact are covered by integration
+tests that execute the **real Unison binary** (developed and tested against
+**2.53.8**; the contract is 2.52 or newer and the package declares
+`unison (>= 2.52)`). None of that involves CIFS, the guest, Obsidian, or a
+second Apple device — which is exactly what the table below is for, and why
+every row of it reads `unverified`.
+
+Every step of the handoff's real-host acceptance sequence has a row here. The
+rows are grouped by scenario rather than following that sequence's numbering,
+and two of them — A4 (a plain local save propagating) and A10 (relaunching after
+the app dies mid-cycle) — are stated explicitly rather than left implied.
 
 Task 8 records the date, package version, Unison version, Obsidian version,
 mount options, and test-vault size/count in `docs/acceptance-results.md`, and

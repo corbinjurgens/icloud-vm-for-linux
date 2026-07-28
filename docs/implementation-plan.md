@@ -540,6 +540,24 @@ real work.
 ## 12. Known limitations (accepted, do not attempt to fix here)
 
 - **Server-side semantics:** iCloud resolves conflicts last-writer-wins with timestamps; concurrent edits on two devices can silently produce duplicates or drop one version. This is Apple-side behavior every client inherits (see arXiv 2602.19433 for the full failure catalogue). Mitigation is the backup rsync in §10.
+
+  **Through the raw `/mnt/icloud` mount this stands unamended.** A host write is
+  an iCloud write with nothing in between, so a simultaneous edit on another
+  device is resolved by Apple's rule and the §10 backup is what recovers the
+  losing version.
+
+  **Inside a Safe Workspace, the host's own half of it is narrowed** (v2 D52;
+  [`plan-safe-local-workspaces.md`](plan-safe-local-workspaces.md)). The editor
+  works on a local replica, and Unison compares both replicas against a
+  remembered common state before propagating anything: when the local copy and
+  what iCloud delivered to the guest have both moved since that state, the
+  workspace reports a conflict, keeps each version on its own replica, and
+  retains the previous common version as a central backup. Nothing is silently
+  overwritten and no winner is chosen. This does **not** change Apple's
+  semantics. A conflict created entirely between two Apple devices — or while
+  this host is off — happens inside iCloud, and the workspace only ever sees
+  whichever version the guest is given; a directory nobody made a workspace of
+  is unaffected as well.
 - Session re-login is manual by design (2FA cannot be automated and attempting to would risk account lockout).
 - **Cold reads block for the whole download.** With Files On-Demand on (D5 as
   amended), the first read of a file fetches it from Apple while the reading

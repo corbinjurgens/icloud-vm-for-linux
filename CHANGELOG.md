@@ -273,6 +273,80 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-29 — Safe Workspaces: an opt-in local replica for editing a vault
+
+An Obsidian vault opened straight from `/mnt/icloud` cleared an open note in the
+editor. The trace collected afterwards is supporting evidence rather than a
+captured cause-and-effect sequence — one note kept an unchanged content hash,
+size, inode and mtime while its `ctime` moved twice after a save — but it is the
+shape of the problem: an editor autosaving continuously into a network
+filesystem whose metadata the guest's Cloud Files filter rewrites out of band is
+exposed to a failure class no mount option removes.
+
+**Safe Workspaces** (register row **D52**; the design is
+[`docs/plan-safe-local-workspaces.md`](docs/plan-safe-local-workspaces.md))
+pairs a directory under `/mnt/icloud` with an ordinary local-disk folder that
+the editor opens instead, and reconciles the two with **Unison** in finite
+one-shot cycles run through the GUI's existing worker pool. It is opt-in and per
+directory: with none configured, nothing is copied anywhere and the raw mount
+behaves exactly as before. The load-bearing properties:
+
+- **A workspace must look identical in two consecutive five-second polls before
+  the engine runs**, which gives a 5-10 second settling window and, deliberately,
+  makes the fingerprint `(relative path, kind, size, mtime_ns)` — `ctime` is
+  excluded on purpose, so the metadata churn above can never drive the
+  synchronizer.
+- **Conflicts are retained, never resolved.** Batch mode propagates the
+  non-divergent changes and leaves each replica holding its own version of every
+  divergent path; `prefer`, `force`, `copyonconflict`, `repeat` and `ignorelocks`
+  are never passed. Central backups keep ten versions per path before every
+  overwrite and deletion.
+- **A mass deletion halts instead of propagating.** An endpoint that goes empty,
+  or a cycle that would remove at least 20 paths and at least 20 percent of an
+  endpoint, sets `guarded` and does not invoke Unison at all. There is no
+  override button.
+- **Cycles exist only inside the GUI process.** They start with normal health
+  polling, stop on every setup/powered-off/unknown/quiesce path, short-circuit on
+  the powered-off marker before touching CIFS, and are counted in the same
+  `_active` drain the shutdown already waits for — so no workspace process
+  outlives an unmount, and no forced or lazy unmount was introduced.
+- **Nothing of the operator's is ever deleted.** Forgetting a workspace removes
+  its configuration entry only; package removal keeps the configuration,
+  replicas, archives, logs and backups. `CONTRIBUTING.md` now lists them
+  alongside the credentials and the VM disk.
+- **Privacy holds at the dataclass.** The health row is a yellow-at-worst
+  synthetic row, and `diagnostics.Facts` gains counts plus one timestamp —
+  no names, paths, engine output, or note content.
+
+This reverses nothing. SMB stays the canonical raw transport and the remote side
+of every cycle (D6), the mount options and Files On-Demand are untouched
+(D14/D25/D33/D50), and §0's rejection of an always-on filesystem daemon in the
+data path still stands — these are short-lived bounded processes that hold no
+mount and die with the app. Rejected again on the way: `rclone mount
+--vfs-cache-mode full`, on its own documented warning about truncated or garbage
+content during out-of-band remote length changes, and writing a three-way merge
+engine here.
+
+Shipping: `unison (>= 2.52)` is a package dependency and is installed by both
+supported install paths (a non-apt system still completes the GUI install and
+says Safe Workspaces stays unavailable — no binary is ever downloaded);
+`host/acceptance-tests.sh` gained a non-mutating presence and version check; the
+build stamp is now `0.3.0`, the minor digit tracking the design line the code
+implements, which is not a claim that I-007's live-acceptance gate has been met.
+The operator instructions, including the requirement to disable any other
+bidirectional sync (**Obsidian Sync** included) for the same vault, are in
+README's *Safe Workspaces* section. Refresh an installed host package with
+`make reinstall`.
+
+**What is proven, and what is not.** The engine invocation, conflict retention,
+ten central backups, deletion propagation and metadata-only touches are covered
+by integration tests that execute the real Unison binary — 2.53.8 on the
+author's host — alongside unit tests for gating, stability, the guard, exit
+classification and status atomicity. Nothing about the live Windows guest, real
+CIFS behaviour, Obsidian, or a second Apple device has been exercised: every row
+of the acceptance matrix in `docs/plan-safe-local-workspaces.md` §15 reads
+`unverified`, and closing it is the operator's run.
+
 ### 2026-07-28 — `make reinstall` can no longer install a stale package
 
 `install:` and `reinstall:` depended on the built `.deb` as a *file*, and the

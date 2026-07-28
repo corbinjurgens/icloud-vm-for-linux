@@ -13,6 +13,7 @@ host as a normal mounted directory at `/mnt/icloud`.
 | Contribute or change the code | [`CONTRIBUTING.md`](CONTRIBUTING.md) — required workflow, design constraints, tests, and commit rules |
 | Lint, test or run the code | [Development](#development), below |
 | Exclude folders from sync | [`docs/selective-sync.md`](docs/selective-sync.md) |
+| Edit an Obsidian vault safely, off the mount | [Safe Workspaces](#safe-workspaces-editing-a-vault-on-local-disk), below, and [`docs/plan-safe-local-workspaces.md`](docs/plan-safe-local-workspaces.md) |
 | Fix something that broke | [`SETUP.md` troubleshooting](SETUP.md#troubleshooting-quick-reference) |
 | See what improved, what is next, or what was already ruled out | [`CHANGELOG.md`](CHANGELOG.md) |
 | Understand why it is built this way, or what was already tried and rejected | [`docs/implementation-plan.md`](docs/implementation-plan.md) (v1) and [`docs/plan-gui-selective-sync.md`](docs/plan-gui-selective-sync.md) (v2 — amends v1 and wins on conflict) |
@@ -44,14 +45,24 @@ existing pieces instead of rolling our own (see below).
 │  /mnt/icloud         ◄── cifs ───────┘          │  (127.0.0.1:10445)  │
 │  /mnt/icloud_bridge  ◄── cifs ──────────────────┘                     │
 │   (systemd automounts)                                                │
+│        │                                                              │
+│        ◄── unison one-shot cycles ──►  Safe Workspace: an opt-in      │
+│                                        local-disk replica an editor   │
+│                                        opens instead of the mount     │
 │                                                                       │
-│  tray icon + GUI: health at a glance, selective sync                  │
+│  tray icon + GUI: health, selective sync, Safe Workspaces             │
 │  systemd timer: health check (mount + write-canary + freshness)       │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
 The host writes land directly in the guest's Cloud Files sync root and upload
 immediately — a live, bidirectional bridge, not a one-way mirror.
+
+`/mnt/icloud` stays exactly that: a direct SMB view of the guest's sync root,
+with no copy in between. [Safe Workspaces](#safe-workspaces-editing-a-vault-on-local-disk)
+is an opt-in layer *above* it for the one case a live network filesystem serves
+badly — an editor autosaving into a vault — and it reads and writes the same
+mount to do its work.
 
 Files are **not** downloaded up front. Everything appears in `/mnt/icloud` at
 its real size as an online-only placeholder, and the content is fetched the
@@ -67,7 +78,17 @@ cached until the guest needs the space back.
 | VM lifecycle, unattended install, VirtIO drivers | [`dockur/windows`](https://github.com/dockur/windows) | A hand-rolled QEMU wrapper |
 | Windows image | Stock Win11 ISO, debloated at runtime | A custom-built ISO |
 | iCloud client | Apple's official iCloud for Windows | Reverse-engineered APIs |
-| Host mount | kernel `cifs` + systemd automount | A custom sync daemon |
+| Host mount | kernel `cifs` + systemd automount | Mirroring the library onto the host |
+| Local editing replicas (opt-in) | [Unison](https://github.com/bcpierce00/unison) 2.52+, in short one-shot runs | A new three-way merge engine, or a FUSE/rclone overlay |
+
+The mount is deliberately not a copy: SMB is the canonical raw transport
+because it is the guest's own live view of the sync root, so a host write is an
+iCloud write with nothing in between to fall behind or resolve. A Safe
+Workspace does add a synchronizer, but only for a directory the operator opts
+in, only while the GUI is running, and with `/mnt/icloud` still the remote side
+of every cycle — see [`docs/plan-safe-local-workspaces.md`](docs/plan-safe-local-workspaces.md)
+(D52) for why that does not reverse the mount decision or the rejection of a
+filesystem overlay.
 
 ## Repository layout
 
@@ -122,6 +143,7 @@ cached until the guest needs the space back.
 └── docs/
     ├── implementation-plan.md   # v1: full, authoritative build handoff
     ├── plan-gui-selective-sync.md # v2: GUI, bridge protocol, selective sync
+    ├── plan-safe-local-workspaces.md # Safe Workspaces: the local-replica design (D52)
     ├── selective-sync.md        # what exclusion does, and the deployment checklist
     └── automation-notes.md      # first-run record: what was manual and why
 ```
@@ -237,7 +259,8 @@ The tray's **Quit** offers three choices:
   Unuploaded changes resume on the next start (this cannot prove Apple's upload
   queue is empty). If a file on the mount is still open, the shutdown aborts and
   leaves the VM running rather than force-unmounting.
-- **Quit GUI only** — leaves the bridge running; use it when you just want to
+- **Quit GUI only** — leaves the bridge running (but pauses any Safe Workspace
+  propagation, since the cycles live in this process); use it when you just want to
   restart or upgrade the GUI.
 - **Cancel.**
 
@@ -382,6 +405,121 @@ Excluding **never deletes anything**. The item stays in iCloud and on your other
 devices; re-including it makes it reappear, and its content downloads when
 something reads it. Full details, including the `not-found` state and the rename
 limitation, are in [`docs/selective-sync.md`](docs/selective-sync.md).
+
+## Safe Workspaces (editing a vault on local disk)
+
+An editor that autosaves continuously — Obsidian is the motivating case — is a
+bad fit for a vault opened straight from `/mnt/icloud`: the guest's Cloud Files
+filter rewrites file metadata out of band, and the author watched an open note
+clear in the editor. A **Safe Workspace** removes that exposure. The editor
+opens an ordinary folder on this computer's own disk, and while the GUI is
+running the app reconciles that folder with the chosen iCloud directory using
+[Unison](https://github.com/bcpierce00/unison) in short one-shot cycles.
+
+It is **opt-in and per directory**. With no workspace configured nothing is
+copied anywhere and `/mnt/icloud` behaves exactly as it always has. The design,
+including why this neither replaces SMB nor reintroduces a filesystem overlay,
+is [`docs/plan-safe-local-workspaces.md`](docs/plan-safe-local-workspaces.md)
+(decision D52).
+
+**First, turn off every other bidirectional sync for that vault — including
+Obsidian Sync.** Two mechanisms writing the same local folder will fight, and
+neither can see the other's intent. Check Obsidian's own Sync settings before
+you start; this app cannot detect that for you.
+
+Then, on the GUI's **Safe Workspaces** tab:
+
+1. **Close the vault in Obsidian** while it still points at `/mnt/icloud`. The
+   confirmation dialog says the same thing, because opening both copies at once
+   is the one way to make this worse rather than better.
+2. **Add workspace…** — a display name, the iCloud folder typed as a path
+   relative to the mount (`Notes/Tech/Vault`), and a local folder chosen from a
+   local-only file dialog (`~/iCloud Workspaces/` is offered as the parent). The
+   local folder must be empty or not yet exist, and must sit on an ordinary
+   local filesystem (`ext4`, `xfs`, `btrfs`, `bcachefs`, `zfs`); network, FUSE
+   and memory-backed filesystems are refused by name. The confirmation states
+   the iCloud folder's size and your free space before anything is created.
+3. **Wait for the first sync.** The first stable cycle copies the iCloud folder
+   down and the row settles on *up to date*. That first pass reads every file,
+   so it hydrates the folder exactly like any other host read
+   ([Files On-Demand](#files-on-demand-and-disk-space)).
+4. **Open the local folder as the vault.** Right after a successful first seed
+   the tab offers **Open local workspace in Obsidian**; **Open local folder**
+   is always available if no `obsidian://` handler is registered. From then on,
+   **never open the `/mnt/icloud` copy again** — that is precisely the situation
+   this feature exists to end.
+
+Day to day:
+
+- **Changes take five to ten seconds to leave.** A workspace must look identical
+  in two consecutive five-second polls before Unison runs, so a burst of
+  autosaves is propagated once it stops, not once per keystroke. Metadata-only
+  churn — a changed `ctime` with the same bytes, size and mtime — is invisible to
+  that fingerprint by design and never makes a workspace look changed. **Sync
+  now** asks for one pass through the same single-flight path the timer uses; it
+  is not a second way to run the engine, and it cannot shorten the window.
+- **Status is per workspace:** `waiting`, `stabilizing`, `syncing`, `up to
+  date`, `paused`, `conflict`, `guarded`, or `error`. A conflict, a guard, or a
+  failure turns the **Safe workspaces** health row yellow; it never turns a
+  connected bridge red, and a healthy workspace never masks a real bridge
+  problem.
+- **Conflicts keep both versions.** When the same file changed on both sides
+  since the last agreement, nothing is merged, renamed, or overwritten: each
+  replica keeps its own version, the row turns yellow, and the tab names the
+  affected paths (never their contents). Compare the two, save the version you
+  want, and the next stable cycle propagates it. There is no "resolve
+  automatically" action, and there never will be.
+- **A mass deletion halts instead of propagating.** If an endpoint goes empty,
+  or a single cycle would remove at least 20 paths and at least 20 percent of an
+  endpoint, the workspace goes `guarded` and Unison is not invoked at all. It
+  clears itself if the content comes back — the usual cause is a mount that was
+  not fully there.
+- **Every overwrite and deletion is backed up first.** Ten versions per path are
+  kept under `~/.local/state/icloud-bridge-gui/workspaces/<id>/backups`. To
+  recover one: **Pause** the workspace, copy the wanted version out of that
+  directory back over the file in your local folder, then **Resume** — the next
+  stable cycle propagates the restored content to iCloud. Nothing here is
+  pruned on a schedule, so the directory grows with your edit volume.
+- **Forgetting a workspace deletes nothing.** It removes this app's entry and
+  nothing else; the local folder, the iCloud folder, the sync state and the
+  backups all stay where they are, and the dialog names each location. Package
+  removal keeps all of it too.
+
+Interruptions are safe, and none of them need an action from you:
+
+- **Quitting only the GUI pauses propagation.** There is no daemon; cycles live
+  in the app process. Your local folder is ordinary local disk, so it stays
+  fully readable and editable meanwhile, and the next app start picks the
+  pending changes up.
+- **Powering the bridge off is safe.** An in-flight cycle is counted in the same
+  drain the shutdown already waits for, so the app finishes it before
+  unmounting — never with a forced or lazy unmount. While the bridge is off, the
+  tab stays visible and every action that would touch `/mnt/icloud` is disabled.
+- **Losing the network, or the app, mid-cycle costs nothing.** Unison keeps a
+  per-workspace record of the last state both replicas agreed on, so an
+  interrupted run is simply repeated from that record, and both replicas are
+  left intact meanwhile. A cycle that did not finish cleanly never advances the
+  record the deletion guard reads.
+
+What this cannot do: it never prevents a conflict created entirely between two
+Apple devices while this host is off — that happens inside iCloud, where no
+host-side tool can see it.
+
+**Requirements.** Unison 2.52 or newer; the `.deb` declares
+`unison (>= 2.52)`, and both `host/setup-prereqs.sh` and `gui/install-gui.sh`
+install it through the distro package manager (on a non-apt system the GUI
+install still completes and tells you Safe Workspaces stays unavailable until
+Unison is present — no binary is ever downloaded). This was developed and
+tested against Unison **2.53.8**. If the host package is already installed, run
+`make reinstall` to pick this up.
+
+**Verification status.** The engine invocation, conflict retention, the ten
+central backups, deletion propagation and metadata-only touches are covered by
+integration tests that run against the real Unison binary. Nothing about the
+live Windows guest, CIFS, Obsidian, or a second Apple device has been exercised
+yet: every row of the acceptance matrix in
+[`docs/plan-safe-local-workspaces.md` §15](docs/plan-safe-local-workspaces.md)
+is still `unverified`.
 
 ## Status
 
