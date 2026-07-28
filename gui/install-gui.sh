@@ -4,10 +4,10 @@
 # Run as the DESKTOP USER, not root: everything lands under $HOME and the
 # autostart entry must belong to the session that will run it.
 #
-#   ./gui/install-gui.sh
+#   ./gui/install-gui.sh [--uninstall]
 #
 # Idempotent: re-running replaces the installed copy and rewrites the launcher
-# and both .desktop files.
+# and both .desktop files, or removes the same files with --uninstall.
 #
 # PySide6 comes from the distro packages when they exist (v2 plan D18); the
 # fallback is a dedicated venv. `pip install --user` and
@@ -28,6 +28,16 @@ DESKTOP_DIR="$HOME/.local/share/applications"
 AUTOSTART_DIR="$HOME/.config/autostart"
 ICON="$APP_DIR/icloud_bridge_gui/icons/icloud-green.svg"
 VENV="$APP_DIR/venv"
+
+if [ "${1:-}" = "--uninstall" ]; then
+  echo "==> Removing the installed application from $APP_DIR"
+  rm -f "$LAUNCHER"
+  rm -f "$DESKTOP_DIR/icloud-bridge-gui.desktop"
+  rm -f "$AUTOSTART_DIR/icloud-bridge-tray.desktop"
+  rm -rf "$APP_DIR"
+  echo "==> Removed launcher, desktop entries, autostart entry, and icon"
+  exit 0
+fi
 
 # --- 1. copy the package ------------------------------------------------------
 echo "==> Installing the application into $APP_DIR"

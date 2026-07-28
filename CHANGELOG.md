@@ -269,6 +269,18 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-28 — `install-gui.sh` can uninstall what it installed
+
+The per-user GUI install had no removal path, so removing it by hand left
+`~/.config/autostart/icloud-bridge-tray.desktop` pointing at a deleted
+`~/.local/bin/icloud-bridge-gui`; XDG resolves autostart user-dir-first, so the
+orphan shadowed the package's working `/etc/xdg/autostart` entry and the tray
+silently never started at login (todo/lifecycle-dead-ends.md item 4).
+`gui/install-gui.sh --uninstall` now mirrors `tools/install-hooks.sh
+--uninstall`: it removes the launcher, the applications and autostart desktop
+entries, and the installed app tree (which contains the icon and venv), and
+succeeds quietly when they are already absent.
+
 ### 2026-07-28 — Boot-rewritten `desktop.ini` no longer holds exclusions yellow (`agentBuild` 8 → 9)
 
 Live follow-up to D46 (`9cac9c6`, recorded as D47). With everything else
