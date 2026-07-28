@@ -107,7 +107,9 @@ class Event(Enum):
     USER_START_BRIDGE = "user_start_bridge"
     USER_RETRY_START = "user_retry_start"
     POWER_ON_SUCCEEDED = "power_on_succeeded"
-    POWER_ON_FAILED = "power_on_failed"
+    POWER_ON_FAILED_VM_NOT_STARTED = "power_on_failed_vm_not_started"
+    POWER_ON_FAILED_SHARES_UNAVAILABLE = "power_on_failed_shares_unavailable"
+    POWER_ON_FAILED_CREDENTIAL_REJECTED = "power_on_failed_credential_rejected"
 
     # The power-off transaction, with its two continuations.
     USER_POWER_OFF_CONFIRMED = "user_power_off_confirmed"
@@ -467,7 +469,9 @@ def _starting(model: Model, event: Event) -> Transition | None:
         return Transition(_next(model, Phase.PROVISIONING), _ENTER_PROVISIONING)
     if event is Event.POWER_ON_SUCCEEDED:
         return Transition(_next(model, Phase.RUNNING), _ENTER_RUNNING)
-    if event is Event.POWER_ON_FAILED:
+    if event in (Event.POWER_ON_FAILED_VM_NOT_STARTED,
+                 Event.POWER_ON_FAILED_SHARES_UNAVAILABLE,
+                 Event.POWER_ON_FAILED_CREDENTIAL_REJECTED):
         return Transition(_next(model, Phase.START_FAILED), _ENTER_START_FAILED)
     if event is Event.POWER_TRANSITION_UNKNOWN:
         return Transition(_next(model, Phase.TRANSITION_UNKNOWN, desired="on"),
@@ -481,6 +485,9 @@ def _starting(model: Model, event: Event) -> Transition | None:
 
 
 def _running(model: Model, event: Event) -> Transition | None:
+    if event is Event.PROVISION_BEGIN_FIRST_RUN:
+        return Transition(_next(model, Phase.PROVISIONING, mode=MODE_FIRST_RUN),
+                          _ENTER_PROVISIONING)
     if event is Event.PROVISION_BEGIN_REPROVISION:
         # D35's recovery and the post-feature-update repair. The mounts stay
         # mounted — the app cannot police another process using them — but this
@@ -504,6 +511,9 @@ def _running(model: Model, event: Event) -> Transition | None:
 
 
 def _start_failed(model: Model, event: Event) -> Transition | None:
+    if event is Event.PROVISION_BEGIN_FIRST_RUN:
+        return Transition(_next(model, Phase.PROVISIONING, mode=MODE_FIRST_RUN),
+                          _ENTER_PROVISIONING)
     if event in (Event.USER_RETRY_START, Event.USER_START_BRIDGE):
         return Transition(_next(model, Phase.STARTING), _BEGIN_STARTUP)
     if event is Event.QUIT_CONFIRMED_POWER_OFF:

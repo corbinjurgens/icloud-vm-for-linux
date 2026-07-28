@@ -76,7 +76,12 @@ EXPECTED: dict[tuple[P, E], tuple[P, tuple[F, ...]]] = {
     (P.STARTING, E.POWER_TRANSITION_UNKNOWN): (P.TRANSITION_UNKNOWN,
                                                lifecycle._ENTER_TRANSITION_UNKNOWN),
     (P.STARTING, E.POWER_ON_SUCCEEDED): (P.RUNNING, lifecycle._ENTER_RUNNING),
-    (P.STARTING, E.POWER_ON_FAILED): (P.START_FAILED, lifecycle._ENTER_START_FAILED),
+    (P.STARTING, E.POWER_ON_FAILED_VM_NOT_STARTED): (P.START_FAILED,
+                                                       lifecycle._ENTER_START_FAILED),
+    (P.STARTING, E.POWER_ON_FAILED_SHARES_UNAVAILABLE): (P.START_FAILED,
+                                                          lifecycle._ENTER_START_FAILED),
+    (P.STARTING, E.POWER_ON_FAILED_CREDENTIAL_REJECTED): (P.START_FAILED,
+                                                           lifecycle._ENTER_START_FAILED),
     (P.STARTING, E.QUIT_CONFIRMED_POWER_OFF): (P.SHUTTING_DOWN, lifecycle._BEGIN_POWER_OFF),
     (P.STARTING, E.QUIT_CONFIRMED_GUI_ONLY): (P.STARTING, (F.EXIT_APP,)),
 
@@ -86,9 +91,13 @@ EXPECTED: dict[tuple[P, E], tuple[P, tuple[F, ...]]] = {
     (P.RUNNING, E.USER_START_BRIDGE): (P.STARTING, lifecycle._BEGIN_STARTUP),
     (P.RUNNING, E.PROVISION_BEGIN_REPROVISION): (P.PROVISIONING,
                                                  lifecycle._BEGIN_REPROVISIONING),
+    (P.RUNNING, E.PROVISION_BEGIN_FIRST_RUN): (P.PROVISIONING,
+                                               lifecycle._ENTER_PROVISIONING),
 
     (P.START_FAILED, E.USER_RETRY_START): (P.STARTING, lifecycle._BEGIN_STARTUP),
     (P.START_FAILED, E.USER_START_BRIDGE): (P.STARTING, lifecycle._BEGIN_STARTUP),
+    (P.START_FAILED, E.PROVISION_BEGIN_FIRST_RUN): (P.PROVISIONING,
+                                                    lifecycle._ENTER_PROVISIONING),
     (P.START_FAILED, E.QUIT_CONFIRMED_POWER_OFF): (P.SHUTTING_DOWN,
                                                    lifecycle._BEGIN_POWER_OFF),
     (P.START_FAILED, E.QUIT_CONFIRMED_GUI_ONLY): (P.START_FAILED, (F.EXIT_APP,)),
@@ -345,6 +354,15 @@ def test_a_run_can_be_entered_from_setup_and_from_monitoring():
     assert from_monitoring.model.provisioning_mode == lifecycle.MODE_REPROVISION
 
 
+@pytest.mark.parametrize("phase", [P.START_FAILED, P.RUNNING])
+def test_missing_shares_can_enter_a_first_run_without_resuming_cifs(phase):
+    """D48: controller-classified share loss has one no-CIFS recovery route."""
+    transition = lifecycle.reduce(model(phase), E.PROVISION_BEGIN_FIRST_RUN)
+    assert transition.model.phase is P.PROVISIONING
+    assert transition.model.provisioning_mode == lifecycle.MODE_FIRST_RUN
+    assert not (set(transition.effects) & lifecycle.CIFS_EFFECTS)
+
+
 def test_beginning_a_run_from_monitoring_stops_reading_the_bridge():
     """Elevated scripts are about to rewrite the share, its ACLs and the agent."""
     effects = lifecycle.reduce(model(P.RUNNING), E.PROVISION_BEGIN_REPROVISION).effects
@@ -417,7 +435,8 @@ def test_creating_the_vm_is_always_a_first_run():
         E.VM_CREATED).model.provisioning_mode == lifecycle.MODE_FIRST_RUN
 
 
-@pytest.mark.parametrize("phase", [p for p in P if p not in (P.SETUP, P.PROVISIONING)])
+@pytest.mark.parametrize("phase", [p for p in P if p not in (
+    P.SETUP, P.PROVISIONING, P.RUNNING, P.START_FAILED)])
 def test_a_first_run_cannot_be_started_from_anywhere_else(phase):
     assert lifecycle.reduce(model(phase), E.PROVISION_BEGIN_FIRST_RUN).effects == (
         F.REPORT_INVALID_TRANSITION,)

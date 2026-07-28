@@ -1957,7 +1957,7 @@ def test_a_credential_specific_connect_failure_offers_a_reset(controller, fakes,
     # failure either.
     assert lifecycle.Event.PROVISION_CONNECT_FAILED in events
     assert lifecycle.Event.STARTUP_RESUME_PROVISIONING not in events
-    assert lifecycle.Event.POWER_ON_FAILED not in events
+    assert lifecycle.Event.POWER_ON_FAILED_CREDENTIAL_REJECTED not in events
     assert "never reveals the account password" in window._prov_note.text()
     assert window._prov_retry_button.text() == "Retry and reset share password…"
     assert firstrun.read_provisioning_record() is not None
@@ -1987,7 +1987,7 @@ def test_a_generic_connect_failure_never_offers_a_password_reset(controller,
     assert pump(3.0, until=lambda: app._model.phase is lifecycle.Phase.START_FAILED)
     assert app._prov_offer_reset is False
     assert lifecycle.Event.PROVISION_CONNECT_FAILED not in events
-    assert lifecycle.Event.POWER_ON_FAILED in events
+    assert lifecycle.Event.POWER_ON_FAILED_SHARES_UNAVAILABLE in events
     assert firstrun.read_provisioning_record() is not None
 
 
@@ -2015,8 +2015,69 @@ def test_a_readiness_timeout_is_routed_by_the_quoted_mount_error(controller,
     assert pump(3.0, until=lambda: app._prov_offer_reset)
     assert app._model.phase is lifecycle.Phase.PROVISIONING
     assert lifecycle.Event.PROVISION_CONNECT_FAILED in events
-    assert lifecycle.Event.POWER_ON_FAILED not in events
+    assert lifecycle.Event.POWER_ON_FAILED_CREDENTIAL_REJECTED not in events
     assert window._prov_retry_button.text() == "Retry and reset share password…"
+
+
+@pytest.mark.parametrize(("message", "heading"), [
+    ("the Windows process exited before the guest became ready",
+     "The Windows VM did not start."),
+    ("mount error(13): Permission denied (NT_STATUS_LOGON_FAILURE)",
+     "The share credential was rejected."),
+])
+def test_start_failed_heading_names_the_d45_failure_kind(controller, fakes, message,
+                                                         heading):
+    fakes.inspect.result = power.DockerStatus("stopped", raw="exited")
+    fakes.power_on.result = power.HelperResult(False, 5, message)
+    app = controller()
+    assert pump(3.0, until=lambda: app._model.phase is lifecycle.Phase.START_FAILED)
+    assert app._window._banner.text().startswith(heading)
+    assert app._window._reprovision_button.isHidden()
+
+
+def test_missing_share_start_failure_offers_first_run_recovery(controller, fakes):
+    """D45's error(2) makes Setup useful alongside Retry, not a dead end."""
+    fakes.inspect.result = power.DockerStatus("stopped", raw="exited")
+    fakes.power_on.result = power.HelperResult(
+        False, 5, "The Windows VM is running but its iCloud shares did not "
+                  "become usable.\nmount error(2): No such file or directory")
+    app = controller()
+    assert pump(3.0, until=lambda: app._model.phase is lifecycle.Phase.START_FAILED)
+    window = app._window
+    assert window._banner.text().startswith(
+        "The Windows VM is running but its iCloud shares are unavailable.")
+    assert not window._reprovision_button.isHidden()
+    assert window._reprovision_button.text() == "Set up Windows automatically"
+
+    # The D45 excerpt was truthful: Docker confirms the container is up, so the
+    # provisioning probe can stage the run instead of waiting for a boot.
+    fakes.inspect.result = power.DockerStatus("running", raw="running")
+    app._on_reprovision_requested()
+    assert pump(3.0, until=lambda: fakes.stage.count == 1)
+    assert app._model.phase is lifecycle.Phase.PROVISIONING
+    assert app._model.provisioning_mode == lifecycle.MODE_FIRST_RUN
+    record = firstrun.read_provisioning_record()
+    assert record is not None
+    assert record.mode == lifecycle.MODE_FIRST_RUN
+
+
+def test_running_without_either_mount_offers_first_run_recovery(controller, fakes):
+    """A definitively running drifted guest reaches the same recovery route."""
+    app, window = running_controller(controller, fakes)
+    app._on_snapshot(health.Snapshot(
+        checks=[
+            health.Check("Windows VM", health.GREEN, "running"),
+            health.Check("iCloud mount", health.RED, "not mounted"),
+            health.Check("Bridge mount", health.RED, "not mounted"),
+        ], overall=health.RED, status=None, tree=None))
+    app._sync_power_controls()
+    assert not window._reprovision_button.isHidden()
+    assert window._reprovision_button.text() == "Set up Windows automatically"
+
+    app._on_reprovision_requested()
+    assert pump(3.0, until=lambda: fakes.stage.count == 1)
+    assert app._model.phase is lifecycle.Phase.PROVISIONING
+    assert app._model.provisioning_mode == lifecycle.MODE_FIRST_RUN
 
 
 # ------------------------------------------------- quitting during a run --

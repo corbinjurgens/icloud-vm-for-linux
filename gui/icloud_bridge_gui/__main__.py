@@ -119,6 +119,17 @@ CREDENTIAL_FAILURE_EXPLANATION = (
     "from an .env file you pick."
 )
 
+START_FAILURE_VM_NOT_STARTED = "vm-not-started"
+START_FAILURE_SHARES_UNAVAILABLE = "shares-unavailable"
+START_FAILURE_CREDENTIAL_REJECTED = "credential-rejected"
+
+START_FAILURE_HEADINGS = {
+    START_FAILURE_VM_NOT_STARTED: "The Windows VM did not start.",
+    START_FAILURE_SHARES_UNAVAILABLE:
+        "The Windows VM is running but its iCloud shares are unavailable.",
+    START_FAILURE_CREDENTIAL_REJECTED: "The share credential was rejected.",
+}
+
 #: D38 busy surfaces: the base wording each long operation shows above its
 #: elapsed clock and, where there is one, the helper's last `==> ` phase line.
 BUSY_STARTING = "starting"
@@ -195,6 +206,14 @@ class Application(QObject):
         #: are parameterless tokens, so the text the reducer has no business
         #: knowing about is staged here immediately before the dispatch.
         self._start_error = ""
+        self._start_failure_kind = START_FAILURE_VM_NOT_STARTED
+        #: Set only from a D45 `mount error(2)` excerpt. A VM can be running
+        #: with unavailable shares for other reasons, but only this diagnosis
+        #: proves the setup recovery route is the useful next action.
+        self._shares_missing_recovery = False
+        #: A fresh monitoring snapshot can prove the drifted equivalent of the
+        #: D45 diagnosis without touching either mount again.
+        self._both_mounts_absent = False
         self._abort_message = ""
         #: Bounded record of unexpected (phase, event) pairs, so a wiring mistake
         #: is diagnosable rather than silent.
@@ -877,9 +896,28 @@ class Application(QObject):
         `incompatible`: that gate closes ordinary bridge writes, and this action
         is exactly what its banner points at. It needs no guest state of its own.
         """
+        if self._can_recover_with_first_run():
+            return True
         return (self._model.phase is lifecycle.Phase.RUNNING
                 and self._container_state == "running"
                 and not self._prov_busy)
+
+    def _can_recover_with_first_run(self) -> bool:
+        """Whether missing shares have a safe first-run recovery route.
+
+        In START_FAILED the D45 excerpt itself proves the VM is running (the
+        helper only reports `mount error(2)` after reaching a live guest), so
+        no Docker corroboration is required; the drifted RUNNING case has no
+        such excerpt and must see a definitively running container instead.
+        """
+        if self._bundle is None or self._prov_busy:
+            return False
+        if (self._model.phase is lifecycle.Phase.START_FAILED
+                and self._shares_missing_recovery):
+            return True
+        return (self._model.phase is lifecycle.Phase.RUNNING
+                and self._both_mounts_absent
+                and self._container_state == "running")
 
     def _on_provision_requested(self) -> None:
         """D31's provisioning screen: set the guest up from this app."""
@@ -896,6 +934,12 @@ class Application(QObject):
     def _on_reprovision_requested(self) -> None:
         """Monitoring's confirmed guest repair — D35's recovery, and the
         post-feature-update step."""
+        if self._can_recover_with_first_run():
+            if not self._confirm_provision():
+                return
+            self._dispatch(lifecycle.Event.PROVISION_BEGIN_FIRST_RUN)
+            self._begin_provisioning_run(reset_share_credential=True)
+            return
         if not self._can_reprovision():
             return
         confirmed, reset = self._confirm_reprovision()
@@ -954,7 +998,46 @@ class Application(QObject):
         # A new run owns the record from here on, so a corroboration still owed
         # to the previous one must not be allowed to clear it.
         self._prov_verify_pending = False
-        self._probe_guest_os()
+        self._write_provisioning_intent()
+
+    def _write_provisioning_intent(self) -> None:
+        """Persist the no-CIFS recovery decision before waiting for Windows.
+
+        D39/D48 require the selected first-run route to survive a close or
+        crash even while the guest is still booting. `_stage_run` replaces this
+        intent with the run-specific record before it can write a trigger.
+        """
+        token = self._model.token
+        mode = self._model.provisioning_mode
+        self._prov_busy = True
+
+        def work():
+            record = firstrun.ProvisioningRecord(
+                started_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                phase=firstrun.RECORD_PHASE_PROVISIONING,
+                container_id=firstrun.inspect_container_id(), mode=mode,
+                container_started_at=firstrun.inspect_container_started_at(),
+                reset_share_credential=self._prov_reset_credential)
+            firstrun.write_provisioning_record(record)
+            return record
+
+        def done(record: firstrun.ProvisioningRecord) -> None:
+            self._prov_busy = False
+            if not lifecycle.accepts(self._model, token):
+                return
+            self._record = record
+            self._record_state = firstrun.RECORD_MATCHES
+            self._probe_guest_os()
+
+        def failed(message: str) -> None:
+            self._prov_busy = False
+            if not lifecycle.accepts(self._model, token):
+                return
+            self._prov_error = f"Could not record this provisioning run: {message}"
+            self._dispatch(lifecycle.Event.PROVISION_FAILED, token)
+
+        self.run_async(work, done, failed)
+        self._render_setup()
 
     def _probe_guest_os(self) -> None:
         """Tell "Windows is still installing" from "the watcher is quiet".
@@ -1493,8 +1576,11 @@ class Application(QObject):
     def _fx_show_start_failed_banner(self) -> None:
         self._end_busy()
         self._window.show_banner(
-            f"The Windows VM did not start.\n{self._start_error}\n\n"
-            "Open the VM screen to check it, then Retry start.", "error")
+            f"{START_FAILURE_HEADINGS[self._start_failure_kind]}\n{self._start_error}\n\n"
+            + ("Open the VM screen to check it, then Retry start or set up Windows "
+               "automatically."
+               if self._shares_missing_recovery else
+               "Open the VM screen to check it, then Retry start."), "error")
 
     def _fx_show_shutdown_banner(self) -> None:
         self._begin_busy(BUSY_SHUTDOWN)
@@ -1716,7 +1802,28 @@ class Application(QObject):
             self._dispatch(lifecycle.Event.PROVISION_CONNECT_FAILED)
             return
         self._start_error = result.message
-        self._dispatch(lifecycle.Event.POWER_ON_FAILED)
+        self._start_failure_kind = self._classify_start_failure(result.message)
+        self._shares_missing_recovery = "mount error(2)" in result.message.lower()
+        self._dispatch(self._start_failure_event())
+
+    def _classify_start_failure(self, message: str) -> str:
+        """Classify D45's bounded mount excerpt in the Qt controller only."""
+        lowered = (message or "").lower()
+        if any(marker in lowered for marker in CREDENTIAL_FAILURE_MARKERS):
+            return START_FAILURE_CREDENTIAL_REJECTED
+        if ("mount error(" in lowered or
+                "the windows vm is running but its icloud shares" in lowered):
+            return START_FAILURE_SHARES_UNAVAILABLE
+        return START_FAILURE_VM_NOT_STARTED
+
+    def _start_failure_event(self) -> lifecycle.Event:
+        return {
+            START_FAILURE_VM_NOT_STARTED: lifecycle.Event.POWER_ON_FAILED_VM_NOT_STARTED,
+            START_FAILURE_SHARES_UNAVAILABLE:
+                lifecycle.Event.POWER_ON_FAILED_SHARES_UNAVAILABLE,
+            START_FAILURE_CREDENTIAL_REJECTED:
+                lifecycle.Event.POWER_ON_FAILED_CREDENTIAL_REJECTED,
+        }[self._start_failure_kind]
 
     def _credential_connect_failure(self, message: str) -> bool:
         """Whether a failed connect blames the share *credential* specifically.
@@ -1739,7 +1846,9 @@ class Application(QObject):
             return
         self._record_helper("on", False, message)
         self._start_error = f"the power helper could not be run: {message}"
-        self._dispatch(lifecycle.Event.POWER_ON_FAILED)
+        self._start_failure_kind = START_FAILURE_VM_NOT_STARTED
+        self._shares_missing_recovery = False
+        self._dispatch(lifecycle.Event.POWER_ON_FAILED_VM_NOT_STARTED)
 
     # ------------------------------------------------- the D30 power controls --
 
@@ -1753,6 +1862,15 @@ class Application(QObject):
         # it stays available exactly while a run could start, including while
         # the bridge protocol is skewed or incompatible.
         available = self._can_reprovision()
+        if self._can_recover_with_first_run():
+            self._window._reprovision_button.setText("Set up Windows automatically")
+            self._window._reprovision_button.setToolTip(
+                "Inspect the Windows VM and recreate its missing iCloud shares.")
+        else:
+            self._window._reprovision_button.setText("Re-run Windows provisioning…")
+            self._window._reprovision_button.setToolTip(
+                "Inspect the Windows VM and repair only what no longer matches this "
+                "app: the iCloud share, its permissions, and the bridge agent.")
         self._window.set_reprovision_available(available)
         if self._tray is not None:
             self._tray.set_reprovision_available(available)
@@ -2043,6 +2161,14 @@ class Application(QObject):
             # A transition owns the state now; it does its own forced pass.
             self._force_pending = False
             return
+        checks = {check.name: check for check in snapshot.checks}
+        self._both_mounts_absent = (
+            checks.get("Windows VM", health.Check("", health.RED, "")).severity
+            == health.GREEN
+            and checks.get("iCloud mount", health.Check("", health.GREEN, "")).severity
+            == health.RED
+            and checks.get("Bridge mount", health.Check("", health.GREEN, "")).severity
+            == health.RED)
         self._window.apply_snapshot(snapshot)
         # D43: a re-provisioning is finished when a *fresh* gather has seen the
         # supported protocol and the bundled agent build — not when the guest

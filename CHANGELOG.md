@@ -269,6 +269,24 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-28 — A start that fails on missing shares now offers Setup, not just Retry
+
+The first two lifecycle dead ends recorded in todo/lifecycle-dead-ends.md
+(items 1-2, from the 2026-07-27 incident): a container created outside the app
+failed power-on on the missing shares and left a red "The Windows VM did not
+start." banner whose only action, Retry, could never succeed. The controller
+now classifies D45's bounded helper excerpt before dispatching: the banner
+heading follows the failure kind (VM did not start / VM running but its iCloud
+shares are unavailable / share credential rejected), and the `mount error(2)`
+case exposes **Set up Windows automatically** alongside Retry, entering no-CIFS
+first-run provisioning and writing the D39 intent record at that moment. The
+same recovery is offered from RUNNING when a health snapshot shows both mounts
+absent and Docker definitively running, so `_can_reprovision`'s healthy-mounts
+gate is no longer circular. Recorded as D48 (amending D30 and D39);
+`lifecycle.py` stays a pure reducer — it receives only the classified events.
+Repository tests cover the reducer transitions and Qt wiring; the live pass on
+the real host (a genuinely share-less guest) remains the operator's.
+
 ### 2026-07-28 — SETUP.md is app-first
 
 Every place the runbook had the operator run `docker compose up -d` by hand
