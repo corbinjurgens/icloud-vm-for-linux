@@ -269,6 +269,25 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-28 — The app can tell "no watcher" from "the guest is busy"
+
+The positive half of todo/lifecycle-dead-ends.md item 9: the only way the host
+learned nobody was listening used to be staging a run, counting, and showing a
+bootstrap hint after 90 s. The watcher now writes a small untrusted beacon
+(`watcher.json`: task name, bundled agent build, registered-at) to the Data
+outbox at `-Install` time and refreshes it at task start, best-effort and
+atomic; `guestprov.read_watcher_beacon()` validates it defensively before
+staging, and when it is absent the app leads with the bootstrap hint
+immediately. The 90-second heuristic stays as the fallback for pre-beacon
+watchers, and presence is only ever a hint — never proof the watcher is
+healthy. The hint itself is now typeable through noVNC: it leads with
+`powershell -ep bypass -File C:/OEM/watcher.ps1 -Install` (no backslash, no
+paste), keeps the UNC form only for pre-feature VMs with no `C:\OEM` payload,
+and points at RDP on 127.0.0.1:3389 for a real clipboard and keyboard layout.
+Section 4.1's protocol table and D40 record the beacon. A seam test pins
+watcher.ps1's `$AgentBuild` copy to `bridge.AGENT_BUILD`. Live confirmation of
+the beacon writes on a real guest remains the operator's.
+
 ### 2026-07-28 — A start that fails on missing shares now offers Setup, not just Retry
 
 The first two lifecycle dead ends recorded in todo/lifecycle-dead-ends.md

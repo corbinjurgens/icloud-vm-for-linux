@@ -55,6 +55,8 @@ $Inbox        = '\\host.lan\Provision'
 $TriggerPath  = Join-Path $Inbox 'trigger.json'
 $StatusDir    = '\\host.lan\Data\.provision'
 $StatusPath   = Join-Path $StatusDir 'status.json'
+$BeaconPath   = Join-Path $StatusDir 'watcher.json'
+$AgentBuild   = 9
 
 $PayloadFiles = @(
     '03-create-share.ps1',
@@ -122,6 +124,20 @@ function Write-JsonAtomic {
     } finally {
         if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) }
     }
+}
+
+function Write-WatcherBeacon {
+    # The outbox is guest-writable, so this is only a liveness hint to the host,
+    # never an authority. Keep its failure out of both installation and polling.
+    try {
+        New-Item -ItemType Directory -Force -Path $StatusDir -ErrorAction Stop | Out-Null
+        $json = '{"version":1,' +
+                '"taskName":' + (ConvertTo-JsonString $TaskName) + ',' +
+                '"agentBuild":' + $AgentBuild + ',' +
+                '"registeredAt":' + (ConvertTo-JsonString ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))) +
+                '}'
+        Write-JsonAtomic -Path $BeaconPath -Json $json
+    } catch { }
 }
 
 function Write-WatcherError {
@@ -318,6 +334,8 @@ function Install-Watcher {
       -Trigger @($trigger, (New-KeepAliveTrigger)) `
       -Principal $principal -Settings $settings -Force | Out-Null
 
+    Write-WatcherBeacon
+
     try { Start-ScheduledTask -TaskName $TaskName } catch {
         # At OEM time the icloud session does not exist yet; the logon trigger
         # starts it at first sign-in. That is not a failure.
@@ -452,6 +470,7 @@ if ($Install) {
 New-Item -ItemType Directory -Force -Path $RunsDir -ErrorAction SilentlyContinue | Out-Null
 Remove-StaleSecret
 Confirm-KeepAlive
+Write-WatcherBeacon
 $StartedFromDigest = Get-WatcherDigest
 Step "Watching $TriggerPath every $PollSeconds s"
 

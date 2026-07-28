@@ -256,6 +256,10 @@ def fakes(monkeypatch, tmp_path):
     state.issued_run_ids: list[str] = []
     state.guest_ready = Recorder(True)
     state.ensure_channel = Recorder(None)
+    state.watcher_beacon = Recorder(guestprov.WatcherBeacon(True,
+                                                            guestprov.WATCHER_TASK_NAME,
+                                                            9,
+                                                            "2026-07-28T10:00:00Z"))
     state.stage = Recorder(None)
     state.deliver_secret = Recorder(True)
     state.cleanup = Recorder(True)
@@ -275,6 +279,7 @@ def fakes(monkeypatch, tmp_path):
     monkeypatch.setattr(guestprov, "new_run_id", next_run_id)
     monkeypatch.setattr(guestprov, "guest_os_ready", state.guest_ready)
     monkeypatch.setattr(guestprov, "ensure_channel", state.ensure_channel)
+    monkeypatch.setattr(guestprov, "read_watcher_beacon", state.watcher_beacon)
     monkeypatch.setattr(guestprov, "stage", state.stage)
     monkeypatch.setattr(guestprov, "deliver_secret", state.deliver_secret)
     monkeypatch.setattr(guestprov, "cleanup", state.cleanup)
@@ -1748,6 +1753,20 @@ def test_an_unacknowledged_run_offers_the_one_time_bootstrap(controller, fakes):
     assert "watcher.ps1 -Install" in window._prov_bootstrap[1].text()
     assert app._prov_timer.isActive()              # and polling keeps going
     assert app._prov_error == ""                   # not an error
+
+
+def test_a_missing_watcher_beacon_offers_bootstrap_as_soon_as_staged(controller,
+                                                                       fakes):
+    fakes.watcher_beacon.result = guestprov.WatcherBeacon()
+    app, window = provisioning_controller(controller, fakes)
+    start_first_run(app, fakes)
+    assert not window._prov_bootstrap[1].isHidden()
+    assert window._prov_bootstrap[1].text() == (
+        "powershell -ep bypass -File C:/OEM/watcher.ps1 -Install")
+    note = window._prov_bootstrap[0].text()
+    assert r"\\host.lan\Provision\watcher.ps1" in note
+    assert "127.0.0.1:3389" in note
+    assert app._prov_timer.isActive()
 
 
 def test_a_finished_first_run_hands_over_to_check_setup_and_connect(controller,

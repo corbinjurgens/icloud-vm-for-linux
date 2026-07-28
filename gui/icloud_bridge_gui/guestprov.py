@@ -67,6 +67,7 @@ SECRET_NAME = "secret"
 #: execution source, and never written by the host.
 STATUS_DIR = "/tmp/smb/.provision"
 STATUS_PATH = STATUS_DIR + "/status.json"
+WATCHER_BEACON_PATH = STATUS_DIR + "/watcher.json"
 
 #: dockur generates this file at container start; `ensure_channel` reconstructs
 #: only its own marker block inside it (D40).
@@ -103,6 +104,8 @@ COPY_TIMEOUT_SECONDS = 60
 #: §4.1: a status read is capped at 64 KiB, and `detail`/`error` at 500
 #: characters after control-character removal (`power.sanitize_line`).
 MAX_STATUS_BYTES = 64 * 1024
+MAX_WATCHER_BEACON_BYTES = 4096
+WATCHER_TASK_NAME = "icloud-bridge-provision"
 
 # ------------------------------------------------------------------ phases --
 
@@ -282,6 +285,13 @@ _READ_STATUS_COMMAND = (
     '[ -f "$f" ] || exit 9\n'
     "stat -c '%Y %s' -- \"$f\" || exit 8\n"
     f'head -c {MAX_STATUS_BYTES} -- "$f"\n'
+)
+
+_READ_WATCHER_BEACON_COMMAND = (
+    f"f={WATCHER_BEACON_PATH}\n"
+    '[ -f "$f" ] || exit 9\n'
+    "stat -c '%Y %s' -- \"$f\" || exit 8\n"
+    f'head -c {MAX_WATCHER_BEACON_BYTES} -- "$f"\n'
 )
 
 #: Cleanup removes executable inbox content and any secret. It deliberately
@@ -669,8 +679,75 @@ class Status:
                 and not self.error)
 
 
+@dataclass(frozen=True)
+class WatcherBeacon:
+    """One defensive reading of the watcher-presence hint from the outbox.
+
+    Presence says only that a watcher registered or started at ``registered_at``
+    with the claimed build. The guest-writable document never proves that it is
+    still running or able to accept a run.
+    """
+    present: bool = False
+    task_name: str = ""
+    agent_build: int = 0
+    registered_at: str = ""
+    reason: str = ""
+
+
 def _unreadable(reason: str) -> Status:
     return Status(PHASE_UNREADABLE, reason=sanitize_line(reason))
+
+
+def read_watcher_beacon(runner: Runner) -> WatcherBeacon:
+    """Read the untrusted watcher beacon. Never raises or grants authority."""
+    try:
+        result = _run(runner, _exec_argv(_READ_WATCHER_BEACON_COMMAND),
+                      DOCKER_TIMEOUT_SECONDS)
+    except ProvisioningError as exc:
+        return WatcherBeacon(reason=sanitize_line(str(exc)))
+    if result.returncode == 9:
+        return WatcherBeacon(reason="the watcher beacon is absent")
+    if result.returncode != 0:
+        return WatcherBeacon(reason=sanitize_line(
+            f"cannot read the watcher beacon: {_detail(result)}"))
+
+    head, _, body = (result.stdout or "").partition("\n")
+    fields = head.split()
+    if len(fields) != 2:
+        return WatcherBeacon(reason="the watcher beacon metadata is unreadable")
+    try:
+        size = int(fields[1])
+    except ValueError:
+        return WatcherBeacon(reason="the watcher beacon metadata is unreadable")
+    if size > MAX_WATCHER_BEACON_BYTES:
+        return WatcherBeacon(reason=("the watcher beacon exceeds "
+                                     f"{MAX_WATCHER_BEACON_BYTES} bytes"))
+    try:
+        document = json.loads(body)
+    except ValueError as exc:
+        return WatcherBeacon(reason=sanitize_line(
+            f"the watcher beacon is not valid JSON: {exc}"))
+    return classify_watcher_beacon(document)
+
+
+def classify_watcher_beacon(document: object) -> WatcherBeacon:
+    """Validate one parsed watcher beacon from the guest-writable outbox."""
+    if not isinstance(document, dict) or set(document) != {
+            "version", "taskName", "agentBuild", "registeredAt"}:
+        return WatcherBeacon(reason="the watcher beacon has an unexpected schema")
+    version = document["version"]
+    build = document["agentBuild"]
+    task_name = document["taskName"]
+    registered_at = document["registeredAt"]
+    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+        return WatcherBeacon(reason="the watcher beacon reports an unsupported version")
+    if task_name != WATCHER_TASK_NAME:
+        return WatcherBeacon(reason="the watcher beacon names an unknown task")
+    if isinstance(build, bool) or not isinstance(build, int) or build < 0:
+        return WatcherBeacon(reason="the watcher beacon has an unusable agent build")
+    if not isinstance(registered_at, str) or not registered_at:
+        return WatcherBeacon(reason="the watcher beacon has an unusable registration time")
+    return WatcherBeacon(True, task_name, build, sanitize_line(registered_at))
 
 
 def poll(runner: Runner, run_id: str) -> Status:

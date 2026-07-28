@@ -77,15 +77,14 @@ PROVISION_BOOTSTRAP_HINT_SECONDS = 90.0
 #: Run once in an elevated PowerShell *inside* the VM. Shown, never run: this
 #: app holds no guest-admin credentials, and the watcher registers itself (D40).
 GUEST_BOOTSTRAP_COMMAND = (
-    r"powershell -ExecutionPolicy Bypass -NoProfile -File "
-    r"\\host.lan\Provision\watcher.ps1 -Install")
+    "powershell -ep bypass -File C:/OEM/watcher.ps1 -Install")
 GUEST_BOOTSTRAP_NOTE = (
-    "The VM has not picked this up yet, and this app keeps waiting. Either the "
-    "VM has no watcher task — one created before automated provisioning never "
-    "had one — or its watcher is running but cannot start this request. Run "
-    "this once in an elevated PowerShell inside the VM; it stops any running "
-    "watcher and reinstalls it, and the request already staged here is then "
-    "picked up with no further click.")
+    "Run this once in an elevated PowerShell inside the VM; it stops any "
+    "running watcher and reinstalls it, and the request already staged here is "
+    "then picked up with no further click. For a pre-feature VM without "
+    "C:/OEM/watcher.ps1, use \\\\host.lan\\Provision\\watcher.ps1 instead. "
+    "RDP is the comfortable route: connect to 127.0.0.1:3389 for working "
+    "clipboard and your own keyboard layout.")
 
 PROVISION_WINDOWS_INSTALLING = (
     "Windows is still installing — this app cannot reach it yet. Watch the VM "
@@ -287,6 +286,7 @@ class Application(QObject):
         self._prov_warning = ""
         self._prov_error = ""
         self._prov_staged_at = 0.0
+        self._prov_watcher_present: bool | None = None
         self._prov_phase_since = 0.0
         self._prov_resume = firstrun.RESUME_NO_RUN
         #: Set when a converged run's authenticated connect failed for a
@@ -993,6 +993,7 @@ class Application(QObject):
         self._prov_warning = ""
         self._prov_note = ""
         self._prov_staged_at = 0.0
+        self._prov_watcher_present = None
         self._prov_phase_since = 0.0
         self._prov_resume = firstrun.RESUME_NO_RUN
         # A new run owns the record from here on, so a corroboration still owed
@@ -1120,15 +1121,18 @@ class Application(QObject):
             # guest saw it (D43, `record_after_status`).
             firstrun.write_provisioning_record(record)
             guestprov.ensure_channel()
+            beacon = guestprov.read_watcher_beacon(power.docker_runner)
             guestprov.stage(bundle, run_id, reset)
-            return record
+            return record, beacon
 
-        def done(record: firstrun.ProvisioningRecord) -> None:
+        def done(result) -> None:
             self._prov_busy = False
             if not lifecycle.accepts(self._model, token):
                 return
+            record, beacon = result
             self._record = record
             self._record_state = firstrun.RECORD_MATCHES
+            self._prov_watcher_present = beacon.present
             self._prov_staged_at = time.monotonic()
             self._prov_phase_since = self._prov_staged_at
             self._start_provision_polling()
@@ -1239,6 +1243,7 @@ class Application(QObject):
         self._prov_error = ""
         self._prov_offer_reset = False
         self._prov_staged_at = 0.0
+        self._prov_watcher_present = None
         self._prov_resume = firstrun.RESUME_NO_RUN
 
     def _verify_reprovision(self, snapshot: health.Snapshot) -> None:
@@ -1319,6 +1324,7 @@ class Application(QObject):
         self._prov_status = status
         self._prov_resume = resume
         self._prov_staged_at = time.monotonic()
+        self._prov_watcher_present = None
         self._prov_phase_since = self._prov_staged_at
         self._prov_secret_sent = False
         self._prov_env_path = ""
@@ -1442,8 +1448,9 @@ class Application(QObject):
             note=self._prov_note, warning=self._prov_warning,
             error=self._prov_error,
             show_bootstrap=(unacknowledged and bool(self._prov_staged_at)
-                            and (time.monotonic() - self._prov_staged_at)
-                            > PROVISION_BOOTSTRAP_HINT_SECONDS),
+                            and (self._prov_watcher_present is False or
+                                 (time.monotonic() - self._prov_staged_at)
+                                 > PROVISION_BOOTSTRAP_HINT_SECONDS)),
             bootstrap=GUEST_BOOTSTRAP_COMMAND, bootstrap_note=GUEST_BOOTSTRAP_NOTE,
             show_env_button=(waiting_secret and not self._prov_secret_sent),
             env_reselect=(self._prov_resume == firstrun.RESUME_NEEDS_SECRET

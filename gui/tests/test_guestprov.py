@@ -87,6 +87,7 @@ ACTIVATE = "mv -f /etc/samba/smb.conf.icloud-bridge-candidate /etc/samba/smb.con
 VERIFY_PATH = "--parameter-name path"
 VERIFY_READ_ONLY = "--parameter-name 'read only'"
 READ_STATUS = "f=/tmp/smb/.provision/status.json"
+READ_WATCHER_BEACON = "f=/tmp/smb/.provision/watcher.json"
 READ_TRIGGER = "f=/run/icloud-bridge-provision/trigger.json"
 WRITE_TRIGGER = "cat > .tmp-trigger.json"
 WRITE_SECRET = "cat > .tmp-secret"
@@ -128,6 +129,7 @@ def status_result(document, *, mtime=1000.0, size=None):
 
 
 ABSENT_STATUS = power.RunResult(9, "", "")
+ABSENT_WATCHER_BEACON = power.RunResult(9, "", "")
 
 
 def bundle_source(tmp_path, name: str) -> str:
@@ -511,6 +513,64 @@ def test_a_failed_delivery_is_reported_without_quoting_the_value(tmp_path):
 
 
 # ------------------------------------------------------------------ polling --
+
+def watcher_beacon_result(document, *, mtime=1000.0, size=None):
+    body = document if isinstance(document, str) else json.dumps(document)
+    length = len(body.encode("utf-8")) if size is None else size
+    return power.RunResult(0, f"{mtime} {length}\n{body}", "")
+
+
+def test_a_matching_watcher_beacon_is_a_presence_hint_only():
+    document = {
+        "version": 1,
+        "taskName": guestprov.WATCHER_TASK_NAME,
+        "agentBuild": 9,
+        "registeredAt": "2026-07-28T10:00:00Z",
+    }
+    docker = FakeDocker((READ_WATCHER_BEACON, watcher_beacon_result(document)))
+    beacon = guestprov.read_watcher_beacon(docker.runner)
+    assert beacon.present is True
+    assert beacon.task_name == guestprov.WATCHER_TASK_NAME
+    assert beacon.agent_build == 9
+    assert beacon.registered_at == "2026-07-28T10:00:00Z"
+
+
+@pytest.mark.parametrize("document", [
+    {},
+    {"version": 1, "taskName": guestprov.WATCHER_TASK_NAME,
+     "agentBuild": True, "registeredAt": "now"},
+    {"version": 1, "taskName": "other-task", "agentBuild": 9,
+     "registeredAt": "now"},
+    {"version": 2, "taskName": guestprov.WATCHER_TASK_NAME, "agentBuild": 9,
+     "registeredAt": "now"},
+])
+def test_a_malformed_watcher_beacon_is_not_presence(document):
+    assert guestprov.classify_watcher_beacon(document).present is False
+
+
+def test_a_missing_or_oversized_watcher_beacon_is_not_presence():
+    missing = FakeDocker((READ_WATCHER_BEACON, ABSENT_WATCHER_BEACON))
+    assert guestprov.read_watcher_beacon(missing.runner).present is False
+    oversized = FakeDocker((READ_WATCHER_BEACON, watcher_beacon_result(
+        "{}", size=guestprov.MAX_WATCHER_BEACON_BYTES + 1)))
+    assert guestprov.read_watcher_beacon(oversized.runner).present is False
+
+
+def test_the_watcher_beacon_build_matches_the_shipped_agent():
+    """watcher.ps1 carries its own $AgentBuild copy; keep it from drifting.
+
+    Same seam discipline as test_bridge's agent.ps1 check: the beacon claims
+    the bundled build, so the constant must move with bridge.AGENT_BUILD.
+    """
+    import re
+
+    from icloud_bridge_gui import bridge
+
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    text = open(os.path.join(repo, "provision", "watcher.ps1"),
+                encoding="utf-8").read()
+    builds = re.findall(r"^\$AgentBuild\s*=\s*(\d+)\s*$", text, re.MULTILINE)
+    assert builds == [str(bridge.AGENT_BUILD)]
 
 def test_the_status_read_is_bounded_to_the_documented_size():
     assert str(guestprov.MAX_STATUS_BYTES) in guestprov._READ_STATUS_COMMAND
