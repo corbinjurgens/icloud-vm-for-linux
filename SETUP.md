@@ -130,6 +130,97 @@ Note the GUI's **Create Windows VM** runs compose as project `icloud-bridge`
 (`-p icloud-bridge`); add that same flag to terminal compose commands aimed at
 the GUI-created container so they address the same project.
 
+### Warning: this project's Engine will absorb your other Docker work
+
+Everything above describes one direction of the conflict — Desktop reclaiming the
+context and hiding `icloud-windows` from you. **The mirror case is worse, because
+it does not look like a failure.**
+
+Installing this project leaves a native Engine running permanently (systemd
+`docker.service`, enabled at boot). Whenever Docker Desktop is *not* running, the
+active context falls back to `default` — and `default` is not a dead endpoint the
+way it is on macOS, where Desktop's VM is the only daemon and closing it makes
+`docker` fail outright. Here it is a second, fully working daemon that will
+happily accept anything you send it:
+
+```bash
+# Desktop closed. In some unrelated project:
+docker compose up -d
+# → succeeds. Builds images, creates containers, binds ports.
+#   All of it on the Engine this project reserved for the Windows VM.
+```
+
+Nothing warns you. You get a complete duplicate stack on the wrong daemon, and
+from then on `docker ps` answers differently depending on whether Desktop happens
+to be running. The usual way people notice is a port collision on the *next*
+`up` — by which time containers with identical names exist on both daemons.
+
+The real risk is not the confusion, it is shared bind mounts. If the duplicated
+stack bind-mounts a database data directory from the host, the same files are now
+reachable by two independent engines. Port conflicts are usually what stops both
+copies from running at once; that is a coincidence, not a safeguard, and two
+database servers opening one data directory will corrupt it.
+
+**Recommended fix — pin the context in your shell profile**, so the fallback can
+never happen silently:
+
+```bash
+# ~/.bashrc  (or ~/.zshrc)
+export DOCKER_CONTEXT=desktop-linux
+```
+
+`DOCKER_CONTEXT` outranks the `currentContext` value in `~/.docker/config.json`
+that Desktop rewrites on every start and quit, so Desktop can no longer redirect
+your shell in either direction. With Desktop closed you now get a connection
+error — the macOS behaviour — instead of a silent second stack.
+
+This is safe for this project because **both** of its entry points address the
+Engine explicitly rather than through the active context, and `DOCKER_HOST`
+outranks `DOCKER_CONTEXT`:
+
+- `host/icloud-bridge-power` — exports `DOCKER_HOST` (runs as root via `sudo -n`)
+- `gui/icloud_bridge_gui/power.py` — pins `DOCKER_SOCKET` in `docker_env()`
+
+Verify both halves after adding the pin:
+
+```bash
+docker ps                                          # Desktop only
+DOCKER_HOST=unix:///var/run/docker.sock docker ps   # icloud-windows
+```
+
+Note this cannot be tightened into true isolation by dropping yourself from the
+`docker` group. The root helper would survive it, but `power.py` runs its
+`docker inspect` status check as your own user, so the GUI would lose its VM
+state readout. On Linux the other daemon can be made unreachable *by default*,
+but not made to not exist.
+
+### Recovering a stack that ran on the wrong Engine
+
+Moving a bind-mounted data directory back to Desktop is not just `compose up` —
+expect permission failures, because the two daemons write host files differently:
+
+- **Native Engine** runs containers directly, so files land with the container's
+  own ids (e.g. `999:999` for `mysql`).
+- **Desktop** shares host paths through a `virtiofsd` running as *your* user, so
+  anything your account cannot read is invisible to every container (it appears
+  as `-?????????`), and anything your account cannot *write* is read-only to
+  them — regardless of the uid inside the container.
+
+So a data directory written by the Engine typically has to be made group-owned by
+you and group-writable before Desktop can serve it:
+
+```bash
+# from the project holding the bind mount; run via the Engine, which has real root
+# note the double quotes: $(id -g) must expand on the host, not in the container
+docker --context default run --rm -u 0 -v "$PWD/<data-dir>:/d" alpine \
+  sh -c "chgrp -R $(id -g) /d && chmod -R g+w /d"
+```
+
+Purely derived files can fight the fix even after their metadata looks right
+(a stale mapping keeps presenting them as `root:root`). Delete rather than repair
+those — for MySQL, `ib_buffer_pool` is a warm-start hint that is rewritten on
+every clean shutdown.
+
 ---
 
 ## 3. Host prerequisites (scripted)
