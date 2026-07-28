@@ -337,6 +337,17 @@ Section 4.1's protocol table and D40 record the beacon. A seam test pins
 watcher.ps1's `$AgentBuild` copy to `bridge.AGENT_BUILD`. Live confirmation of
 the beacon writes on a real guest remains the operator's.
 
+**Live pass, 2026-07-28.** After `make reinstall` and a GUI relaunch, the
+operator ran the manual **Re-run Windows provisioning** route against the
+provisioned guest (no skew banner: guest and checkout both at `agentBuild` 9).
+Run `e2478e4a` reached `done` with every check `ok` (`shareCredential`
+`unverifiable` by construction, D44), preserved the existing share password,
+and proposed no repair work. About a minute later the redeployed watcher wrote
+the first live beacon — `watcher.json` with the task name, `agentBuild` 9 and
+`registeredAt 2026-07-28T02:02:05Z` — to the Data outbox at task start, where
+the host validates it. The `-Install`-time write and a fresh-VM pass remain for
+the OEM rebuild exercise.
+
 ### 2026-07-28 — A start that fails on missing shares now offers Setup, not just Retry
 
 The first two lifecycle dead ends recorded in todo/lifecycle-dead-ends.md
