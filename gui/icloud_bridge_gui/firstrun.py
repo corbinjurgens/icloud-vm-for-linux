@@ -39,6 +39,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import secrets
+import stat
 from dataclasses import dataclass, replace
 from typing import Callable
 
@@ -83,6 +86,14 @@ OK = "ok"
 WARN = "warn"
 FAIL = "fail"
 
+CONFIG_DIR_NAME = "icloud-bridge"
+CONFIG_FILE_NAME = "env"
+CONFIG_DIR_MODE = 0o700
+CONFIG_FILE_MODE = 0o600
+MIN_DISK_GB = 120
+MIN_RAM_GB = 3
+MIN_CPU_CORES = 2
+
 
 # ----------------------------------------------------------------- results --
 
@@ -111,6 +122,100 @@ class Bundle:
     origin: str                       # override | source | user | package
     source_checkout: str = ""         # recorded by the per-user installer
     checkout_missing: bool = False    # …and no longer where it said
+
+
+@dataclass(frozen=True)
+class ResourceDefaults:
+    """Editable, conservative VM resources derived from this host."""
+    disk_size: str
+    ram_size: str
+    cpu_cores: str
+
+
+def configuration_path(*, environ: dict[str, str] | None = None) -> str:
+    """The one conventional env file location, resolved through XDG."""
+    environ = os.environ if environ is None else environ
+    base = environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, CONFIG_DIR_NAME, CONFIG_FILE_NAME)
+
+
+def resource_defaults(*, cpu_count: int | None = None,
+                      available_memory_bytes: int | None = None,
+                      available_disk_bytes: int | None = None) -> ResourceDefaults:
+    """Return floor-clamped VM settings without imposing a second env grammar."""
+    if cpu_count is None:
+        cpu_count = os.cpu_count()
+    cores = max(MIN_CPU_CORES, (cpu_count or MIN_CPU_CORES) // 2)
+    if available_memory_bytes is None:
+        try:
+            available_memory_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
+        except (AttributeError, OSError, ValueError):
+            available_memory_bytes = 0
+    ram_gb = max(MIN_RAM_GB, min(8, available_memory_bytes // (1024 ** 3) // 2))
+    if available_disk_bytes is None:
+        try:
+            available_disk_bytes = os.statvfs(os.path.expanduser("~")).f_bavail * os.statvfs(
+                os.path.expanduser("~")).f_frsize
+        except OSError:
+            available_disk_bytes = 0
+    free_gb = available_disk_bytes // (1024 ** 3)
+    disk_gb = max(MIN_DISK_GB, ((free_gb // 2 + 19) // 20) * 20)
+    return ResourceDefaults(f"{disk_gb}G", f"{ram_gb}G", str(cores))
+
+
+#: The values come from free-text fields, and anything written next to the
+#: generated secret must be inert in the env-file grammar: one token, no
+#: whitespace, no chance of smuggling another KEY=VALUE line.
+_SIZE_PATTERN = re.compile(r"^[0-9]+[GM]$")
+_CORES_PATTERN = re.compile(r"^[0-9]+$")
+
+
+def create_configuration(disk_size: str, ram_size: str, cpu_cores: str, *,
+                         path: str | None = None) -> str:
+    """Atomically create the conventional 0600 env file, never overwriting it."""
+    disk_size, ram_size = disk_size.strip(), ram_size.strip()
+    cpu_cores = cpu_cores.strip()
+    if not _SIZE_PATTERN.match(disk_size):
+        raise ValueError('DISK_SIZE must be a number followed by G or M, like "120G"')
+    if not _SIZE_PATTERN.match(ram_size):
+        raise ValueError('RAM_SIZE must be a number followed by G or M, like "3G"')
+    if not _CORES_PATTERN.match(cpu_cores) or int(cpu_cores) < 1:
+        raise ValueError('CPU_CORES must be a whole number of cores, like "2"')
+    path = configuration_path() if path is None else path
+    directory = os.path.dirname(path)
+    if os.path.islink(directory):
+        raise OSError("configuration directory is a symlink")
+    os.makedirs(directory, mode=CONFIG_DIR_MODE, exist_ok=True)
+    if not os.path.isdir(directory) or os.path.islink(directory):
+        raise OSError("configuration directory is not a regular directory")
+    os.chmod(directory, CONFIG_DIR_MODE)
+    if os.path.exists(path):
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or os.path.islink(path):
+            raise OSError("configuration file is not a regular file")
+        return path
+    share_pass = "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz"
+                                        "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+                         for _ in range(32))
+    content = (f"DISK_SIZE={disk_size}\nRAM_SIZE={ram_size}\n"
+               f"CPU_CORES={cpu_cores}\nSHARE_PASS={share_pass}\n")
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, CONFIG_FILE_MODE)
+    except FileExistsError:
+        return path
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    os.chmod(path, CONFIG_FILE_MODE)
+    return path
 
 
 # ------------------------------------------------------ resource resolution --
@@ -289,9 +394,9 @@ def check_bundle(bundle: Bundle | None) -> list[Check]:
 def check_env(report: EnvReport | None) -> list[Check]:
     if report is None:
         return [Check("env", "Configuration file", FAIL,
-                      "choose the .env file that holds DISK_SIZE, RAM_SIZE, "
-                      "CPU_CORES and SHARE_PASS",
-                      "cp .env.example .env   # then edit it")]
+                      "create configuration in the app, or choose an existing .env "
+                      "file holding DISK_SIZE, RAM_SIZE, CPU_CORES and SHARE_PASS",
+                      "Use Create configuration in the app; manual fallback: cp .env.example .env")]
     if report.ok:
         return [Check("env", "Configuration file", OK,
                       f"{report.path} ({len(report.keys)} settings)")]

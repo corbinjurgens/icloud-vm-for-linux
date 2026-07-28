@@ -318,6 +318,7 @@ class Application(QObject):
         self._window.create_vm_requested.connect(self._on_create_vm_requested)
         self._window.connect_requested.connect(self._on_connect_requested)
         self._window.env_file_selected.connect(self._on_env_file_selected)
+        self._window.configuration_requested.connect(self._on_configuration_requested)
         self._window.discard_record_requested.connect(self._on_discard_record)
         self._window.provision_requested.connect(self._on_provision_requested)
         self._window.provision_retry_requested.connect(self._on_provision_retry)
@@ -708,10 +709,8 @@ class Application(QObject):
 
     @staticmethod
     def _default_env_path(bundle: firstrun.Bundle | None) -> str:
-        """Pre-select the checkout's own `.env` when there is one to pre-select."""
-        if bundle is None or not bundle.source_checkout or bundle.checkout_missing:
-            return ""
-        candidate = os.path.join(bundle.source_checkout, ".env")
+        """Use a found conventional configuration, never a remembered path."""
+        candidate = firstrun.configuration_path()
         return candidate if os.path.exists(candidate) else ""
 
     def _render_setup(self) -> None:
@@ -748,7 +747,8 @@ class Application(QObject):
             show_discard=self._record_state in (firstrun.RECORD_CONTAINER_GONE,
                                                 firstrun.RECORD_DIFFERENT),
             manual=manual, show_provision=provisioning,
-            can_provision=self._can_provision())
+            can_provision=self._can_provision(),
+            resource_defaults=firstrun.resource_defaults())
         self._render_provisioning(provisioning)
 
     def _host_setup_command(self) -> str:
@@ -764,6 +764,30 @@ class Application(QObject):
     def _on_env_file_selected(self, path: str) -> None:
         self._env_path = path
         self._run_setup_checks()
+
+    def _on_configuration_requested(self, disk_size: str, ram_size: str,
+                                    cpu_cores: str) -> None:
+        if self._setup_busy or self._env_path:
+            return
+        self._setup_busy = True
+        self._setup_detail = "Creating configuration..."
+        self._render_setup()
+
+        def work():
+            return firstrun.create_configuration(disk_size, ram_size, cpu_cores)
+
+        def done(path: str) -> None:
+            self._setup_busy = False
+            self._env_path = path
+            self._setup_detail = "Configuration created."
+            self._run_setup_checks()
+
+        def failed(message: str) -> None:
+            self._setup_busy = False
+            self._setup_detail = f"Could not create configuration: {message}"
+            self._render_setup()
+
+        self.run_async(work, done, failed)
 
     def _on_create_vm_requested(self) -> None:
         """D31's one mutating setup action, and only with a container absent."""

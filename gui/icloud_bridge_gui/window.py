@@ -277,6 +277,7 @@ class MainWindow(QMainWindow):
     #: D39: forget an interrupted-provisioning record Docker has disproved.
     discard_record_requested = Signal()
     env_file_selected = Signal(str)
+    configuration_requested = Signal(str, str, str)
     #: D40-D44 app-driven guest provisioning. `reprovision_requested` has three
     #: emitters — the Status-tab button, the skew/incompatible banner's button
     #: and the tray menu — because D35 asks for one action with one set of
@@ -446,14 +447,33 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._setup_paths)
 
         env_row = QHBoxLayout()
-        self._env_label = QLabel("Configuration file: (none selected)")
+        self._env_label = QLabel("Configuration file: (none found)")
         self._env_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
         env_row.addWidget(self._env_label, 1)
-        self._env_button = QPushButton("Choose .env file…")
+        self._env_button = QPushButton("Use an existing .env...")
         self._env_button.clicked.connect(self._choose_env_file)
         env_row.addWidget(self._env_button)
         layout.addLayout(env_row)
+
+        resources = QHBoxLayout()
+        resources.addWidget(QLabel("Disk:"))
+        self._disk_size = QLineEdit()
+        self._disk_size.setMaximumWidth(90)
+        resources.addWidget(self._disk_size)
+        resources.addWidget(QLabel("RAM:"))
+        self._ram_size = QLineEdit()
+        self._ram_size.setMaximumWidth(90)
+        resources.addWidget(self._ram_size)
+        resources.addWidget(QLabel("vCPUs:"))
+        self._cpu_cores = QLineEdit()
+        self._cpu_cores.setMaximumWidth(90)
+        resources.addWidget(self._cpu_cores)
+        self._configuration_button = QPushButton("Create configuration")
+        self._configuration_button.clicked.connect(self._create_configuration)
+        resources.addWidget(self._configuration_button)
+        resources.addStretch(1)
+        layout.addLayout(resources)
 
         self._setup_checks = QWidget()
         self._setup_checks_layout = QVBoxLayout(self._setup_checks)
@@ -837,6 +857,10 @@ class MainWindow(QMainWindow):
         if chosen:
             self.env_file_selected.emit(chosen)
 
+    def _create_configuration(self) -> None:
+        self.configuration_requested.emit(self._disk_size.text(), self._ram_size.text(),
+                                          self._cpu_cores.text())
+
     def show_setup_tab(self) -> None:
         """Put the assistant in front; the other tabs stay but are disabled."""
         if self._tabs.indexOf(self._setup_page) < 0:
@@ -853,13 +877,20 @@ class MainWindow(QMainWindow):
                      detail: str = "", busy: bool = False,
                      show_discard: bool = False, manual: str = "",
                      show_provision: bool = False,
-                     can_provision: bool = False) -> None:
+                     can_provision: bool = False,
+                     resource_defaults: firstrun.ResourceDefaults | None = None) -> None:
         """Render one assistant state.  Pure presentation of firstrun's answers."""
         self._env_path = env_path
         self._setup_title.setText(title)
         self._setup_intro.setText(intro)
         self._setup_paths.setText(paths)
-        self._env_label.setText(f"Configuration file: {env_path or '(none selected)'}")
+        self._env_label.setText(f"Configuration file: {env_path or '(none found)'}")
+        if resource_defaults is not None:
+            for field, value in ((self._disk_size, resource_defaults.disk_size),
+                                 (self._ram_size, resource_defaults.ram_size),
+                                 (self._cpu_cores, resource_defaults.cpu_cores)):
+                if not field.text():
+                    field.setText(value)
         self._setup_create.setEnabled(can_create and not busy)
         self._setup_provision.setVisible(show_provision)
         self._setup_provision.setEnabled(can_provision and not busy)
@@ -875,6 +906,10 @@ class MainWindow(QMainWindow):
         self._setup_discard.setVisible(show_discard)
         self._setup_discard.setEnabled(not busy)
         self._env_button.setEnabled(not busy)
+        self._configuration_button.setEnabled(not busy and not env_path)
+        self._disk_size.setEnabled(not busy and not env_path)
+        self._ram_size.setEnabled(not busy and not env_path)
+        self._cpu_cores.setEnabled(not busy and not env_path)
         if detail:
             self._setup_detail.setText(detail)
             self._setup_detail.show()

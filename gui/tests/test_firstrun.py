@@ -116,6 +116,55 @@ def test_no_bundle_at_all_fails_with_a_command():
     assert "install-gui.sh" in checks[0].command
 
 
+# ----------------------------------------------------- app configuration --
+
+def test_conventional_configuration_path_uses_xdg_config_home(tmp_path):
+    assert firstrun.configuration_path(environ={"XDG_CONFIG_HOME": str(tmp_path)}) == (
+        str(tmp_path / "icloud-bridge" / "env"))
+
+
+def test_create_configuration_is_private_and_uses_the_shared_password_grammar(tmp_path):
+    path = firstrun.create_configuration("120G", "3G", "2",
+                                         path=str(tmp_path / "config" / "env"))
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(tmp_path / "config").st_mode) == 0o700
+    value, problems = envfile.share_pass_problems(open(path, encoding="utf-8").read())
+    assert problems == []
+    assert len(value) >= 24
+    assert value.isalnum()
+
+
+def test_create_configuration_reuses_an_existing_file_without_rewriting_it(tmp_path):
+    path = tmp_path / "config" / "env"
+    path.parent.mkdir()
+    path.write_text("keep this file\n", encoding="utf-8")
+    before = path.read_bytes()
+    assert firstrun.create_configuration("120G", "3G", "2", path=str(path)) == str(path)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("disk,ram,cores", [
+    ("", "3G", "2"),
+    ("120", "3G", "2"),
+    ("120G\nSHARE_PASS=injected", "3G", "2"),
+    ("120G", "lots", "2"),
+    ("120G", "3G", "two"),
+    ("120G", "3G", "0"),
+])
+def test_create_configuration_rejects_values_outside_the_env_grammar(
+        tmp_path, disk, ram, cores):
+    with pytest.raises(ValueError):
+        firstrun.create_configuration(disk, ram, cores,
+                                      path=str(tmp_path / "config" / "env"))
+    assert not (tmp_path / "config" / "env").exists()
+
+
+def test_resource_defaults_are_clamped_to_the_example_floors():
+    defaults = firstrun.resource_defaults(cpu_count=1, available_memory_bytes=1,
+                                          available_disk_bytes=1)
+    assert defaults == firstrun.ResourceDefaults("120G", "3G", "2")
+
+
 # -------------------------------------------------------------- env parsing --
 
 def write_env(tmp_path, text) -> str:

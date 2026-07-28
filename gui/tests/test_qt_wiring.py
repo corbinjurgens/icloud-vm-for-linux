@@ -230,6 +230,7 @@ def fakes(monkeypatch, tmp_path):
     # The D36 backup is real local-disk work inside the read/Apply workers, so
     # point XDG state at a tmpdir before anything can touch the real one.
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     state = type("Fakes", (), {})()
     state.state_home = tmp_path / "state"
     state.inspect = Recorder(power.DockerStatus("running", raw="running"))
@@ -459,7 +460,7 @@ def test_setup_required_performs_no_bridge_reads(controller, fakes):
     fakes.gather.blocked = True
     fakes.read_exclusions.blocked = True
     app = controller()
-    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.SETUP)
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.SETUP and not app._setup_busy)
     assert app._model.phase is lifecycle.Phase.SETUP
     assert not app._timer.isActive()
     assert fakes.power_on.count == 0
@@ -467,6 +468,29 @@ def test_setup_required_performs_no_bridge_reads(controller, fakes):
     pump(0.3)
     assert fakes.gather.count == 0
     assert fakes.read_exclusions.count == 0
+
+
+def test_setup_default_action_creates_the_conventional_configuration(controller, fakes):
+    fakes.inspect.result = power.DockerStatus("absent", detail="no such object")
+    app = controller()
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.SETUP and not app._setup_busy)
+    assert app._window._configuration_button.isEnabled()
+    app._window.configuration_requested.emit("120G", "3G", "2")
+    path = os.path.join(os.environ["XDG_CONFIG_HOME"], "icloud-bridge", "env")
+    assert pump(2.0, until=lambda: app._env_path == path and not app._setup_busy)
+    assert os.path.exists(path)
+
+
+def test_setup_advanced_existing_env_path_remains_selectable(controller, fakes, tmp_path):
+    fakes.inspect.result = power.DockerStatus("absent", detail="no such object")
+    path = tmp_path / "manual.env"
+    path.write_text("DISK_SIZE=120G\nRAM_SIZE=3G\nCPU_CORES=2\n"
+                    "SHARE_PASS=manual-test-secret-value\n", encoding="utf-8")
+    app = controller()
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.SETUP and not app._setup_busy)
+    app._window.env_file_selected.emit(str(path))
+    assert pump(2.0, until=lambda: app._env_path == str(path))
+    assert app._window._env_button.text() == "Use an existing .env..."
 
 
 def test_inspection_failure_routes_into_setup_without_mutating(controller, fakes):

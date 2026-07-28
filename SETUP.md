@@ -198,7 +198,15 @@ docker version --format '{{.Server.Version}}'     # native Engine version
 
 ---
 
-## 5. Configure `.env`
+## 5. Configuration
+
+The Setup assistant creates the normal configuration by default at
+`$XDG_CONFIG_HOME/icloud-bridge/env` (usually `~/.config/icloud-bridge/env`).
+It generates the share credential, chooses conservative machine-derived VM
+sizes that you can edit before creation, and keeps the file private. Install
+the GUI in §6 and choose **Create configuration** there.
+
+Creating `.env` yourself is the advanced/manual path:
 
 ```bash
 cp .env.example .env
@@ -251,15 +259,20 @@ end up launched twice. The per-user installer stays the right choice on a releas
 whose archives lack the `python3-pyside6` packages, since only it falls back to a
 dedicated venv.
 
+Run `./gui/install-gui.sh --uninstall` to remove this per-user install.
+
 **GNOME users:** install the *AppIndicator and KStatusNotifierItem Support*
 extension, or the tray icon will not be visible.
 
 On a host with no VM yet, the GUI opens a Setup assistant (v2 plan D31) instead
 of the status view: it re-checks the §2/§4 prerequisites, shows which
 `docker-compose.yml` and `provision/` copy it resolved (package, per-user, or
-this checkout — never the working directory), validates your `.env` without ever
-reading the password out, and offers **Create Windows VM**. Select that action to
-create the VM; do not create its container by hand.
+this checkout — never the working directory), finds the conventional
+configuration when it exists, and otherwise offers **Create configuration** with
+editable VM sizes. **Use an existing .env** keeps the manual path available. It
+then validates the file without ever reading the password out and offers
+**Create Windows VM**. Select that action to create the VM; do not create its
+container by hand.
 
 The assistant then waits through the Windows install — it does not try to mount
 anything — offers **Set up Windows automatically** to drive the §9 guest sequence
@@ -447,10 +460,11 @@ phase by phase. Two moments need you:
   earlier run, the bridge agent clears that intent once on its first start,
   without evicting any content.
 - **The share password**, but only when the run actually has to set it — a first
-  run, a missing `syncshare` account, or an explicit reset. The app then asks you
-  to select the env file and streams `SHARE_PASS` straight into the guest at that
-  moment; it is never stored by the app, never shown, and never put on a command
-  line (v2 plan D41). An ordinary repair never asks for it at all.
+  run, a missing `syncshare` account, or an explicit reset. The app offers its
+  conventional configuration when found, or lets you choose the advanced manual
+  env file, then streams `SHARE_PASS` straight into the guest at that moment; it
+  is never shown or put on a command line (v2 plan D41/D49). An ordinary repair
+  never asks for it at all.
 
 The share-credential row is **never green**. It reads *reset during this run* or
 *preserved*, both qualified with the reason: Windows never reveals a password, so

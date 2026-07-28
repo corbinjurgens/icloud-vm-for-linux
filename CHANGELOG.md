@@ -269,6 +269,24 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-28 — The app creates its own configuration; choosing a .env is now the advanced path
+
+todo/lifecycle-dead-ends.md item 7: the Setup tab used to block on "choose the
+.env file", and `check_env`'s hint sent the operator to a terminal to invent a
+machine-to-machine credential the app already transports safely. **Create
+configuration** is now the default Setup action: it writes an exclusive-create
+0600 file at `$XDG_CONFIG_HOME/icloud-bridge/env` (0700 directory) containing a
+`secrets`-generated 32-character alphanumeric `SHARE_PASS` — which also retires
+the placeholder-not-replaced failure mode — plus `DISK_SIZE`/`RAM_SIZE`/
+`CPU_CORES` defaults derived conservatively from the machine, editable on the
+tab and validated against the env grammar before anything is written. An
+existing file at the conventional path is reused, never rewritten, and resume
+and reselect moments now find that conventional file instead of asking again;
+**Use an existing .env** remains the manual path. Recorded as D49, narrowly
+amending D41's "never persists": the GUI writes the generated secret exactly
+once, at creation, and still never logs, displays, or re-reads it outside the
+existing delivery channel.
+
 ### 2026-07-28 — The app can tell "no watcher" from "the guest is busy"
 
 The positive half of todo/lifecycle-dead-ends.md item 9: the only way the host
