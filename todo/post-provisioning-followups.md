@@ -68,7 +68,7 @@ This checkout sits on the author's live host, which also runs the
 - The watcher task is registered and running, and self-restarts into refreshed
   code. Its inability to *record* run acceptance — the failure that made the
   first run look like a guest with no watcher at all — was fixed the same day.
-  This VM is no longer the "pre-feature VM" bootstrap case (SETUP.md §8).
+  This VM is no longer the "pre-feature VM" bootstrap case (SETUP.md §9).
 - The guest clock was corrected in place (its UTC had been seven hours ahead of
   the host's); `01-debloat.ps1` now sets `RealTimeIsUniversal` and the UTC zone
   at install.

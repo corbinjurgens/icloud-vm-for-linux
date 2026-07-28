@@ -37,4 +37,4 @@ docker run --rm -v /srv:/srv alpine sh -c "
   ln -f /srv/icloud-vm/storage/$(basename "$KEEP") $STASH 2>/dev/null || true
   ls -la $STASH_DIR/
 "
-echo "ISO preserved. Reinstall recipe: SETUP.md section 7."
+echo "ISO preserved. Reinstall recipe: SETUP.md section 8."

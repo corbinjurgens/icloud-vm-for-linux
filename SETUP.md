@@ -105,14 +105,20 @@ context every time it starts, silently rewriting `currentContext` back to
 `desktop-linux` in `~/.docker/config.json`. Any command you run afterwards
 answers from Desktop's daemon, which has never heard of `icloud-windows`.
 
-So pin the socket per command instead of switching a global setting — that also
-leaves Desktop free to be your default for every *other* project:
+The GUI pins the native socket internally (`gui/icloud_bridge_gui/power.py`), so
+it is unaffected by the active context. Use its **Create Windows VM** action for
+the first container; the troubleshooting and appendix commands below are only
+for diagnosed recovery work.
+
+When you do run one of those recovery commands, pin the socket per command
+rather than switching the global context — that leaves Desktop free to be your
+default for every *other* project:
 
 ```bash
 DOCKER_HOST=unix:///var/run/docker.sock docker compose up -d
 ```
 
-The `Makefile` exports exactly that variable, so the wrappers are immune without
+The `Makefile` exports exactly that variable, so its wrappers are immune without
 you typing it:
 
 ```bash
@@ -120,8 +126,9 @@ make vm-up      # start the guest        make vm-ps     # container state
 make vm-down    # stop and remove it     make vm-logs   # follow its logs
 ```
 
-The GUI pins the same socket internally (`gui/icloud_bridge_gui/power.py`), so it
-is unaffected by the context either way.
+Note the GUI's **Create Windows VM** runs compose as project `icloud-bridge`
+(`-p icloud-bridge`); add that same flag to terminal compose commands aimed at
+the GUI-created container so they address the same project.
 
 ---
 
@@ -202,7 +209,7 @@ Set:
 
 - `SHARE_PASS` — **generate a strong 20+ char random password.** This is the SMB
   account password. The app delivers this same value into the guest during setup
-  (§8), from an env file you select at that moment; the manual fallback pastes it
+  (§9), from an env file you select at that moment; the manual fallback pastes it
   by hand instead. `.env` is gitignored — never commit it, and never put the real
   value in this file or any other tracked file.
 - `DISK_SIZE` / `RAM_SIZE` / `CPU_CORES` — size per `.env.example` comments. The
@@ -217,32 +224,84 @@ docker compose config      # should print the resolved service with your .env va
 
 ---
 
-## 6. Boot the guest (first run downloads Windows)
+## 6. Install the host GUI and tray icon
+
+Install the GUI before a VM exists. It records the creation attempt and is the
+documented way to create the Windows container.
+
+**If you installed the package later in §10, the GUI is already there** — it
+ships in the same `.deb`, at `/usr/bin/icloud-bridge-gui`. Skip to the GNOME note
+below.
+
+Otherwise, install it for your user:
 
 ```bash
-docker compose up -d
-docker compose logs -f     # Ctrl-C stops the log tail, not the container
+./gui/install-gui.sh         # run as your desktop user, NOT root
 ```
+
+Installs into `~/.local/share/icloud-bridge-gui/`, adds a launcher at
+`~/.local/bin/icloud-bridge-gui`, an application entry, and an autostart entry
+that starts the tray minimised. PySide6 comes from the distro packages when they
+exist and from a dedicated venv otherwise (never `pip install --user`).
+
+Both may be installed at once: a per-user install shadows the system one by
+`PATH`, and `~/.local/share/applications` and `~/.config/autostart` override
+their `/usr/share` and `/etc/xdg` counterparts by basename, so the tray cannot
+end up launched twice. The per-user installer stays the right choice on a release
+whose archives lack the `python3-pyside6` packages, since only it falls back to a
+dedicated venv.
+
+**GNOME users:** install the *AppIndicator and KStatusNotifierItem Support*
+extension, or the tray icon will not be visible.
+
+On a host with no VM yet, the GUI opens a Setup assistant (v2 plan D31) instead
+of the status view: it re-checks the §2/§4 prerequisites, shows which
+`docker-compose.yml` and `provision/` copy it resolved (package, per-user, or
+this checkout — never the working directory), validates your `.env` without ever
+reading the password out, and offers **Create Windows VM**. Select that action to
+create the VM; do not create its container by hand.
+
+The assistant then waits through the Windows install — it does not try to mount
+anything — offers **Set up Windows automatically** to drive the §9 guest sequence
+for you (the manual list stays behind **Show manual steps**), and hands back to
+the power helper when you choose **Check setup and connect**.
+
+The GUI is the bridge's on/off switch (v2 plan D29/D30). Launching it powers the
+Windows VM on and mounts the shares; the tray's **Quit → Quit and power off VM**
+cleanly disconnects both mounts and powers the VM off (leaving unuploaded changes
+to resume next start). **Quit GUI only** leaves the bridge running. **Power off
+bridge (keep this app running)** does the same teardown without exiting, and
+**Start bridge** brings it back — that action also appears when the container is
+found stopped mid-session, so a manual `docker stop` is recoverable from the app.
+The tray's **Start when the computer starts** toggles the autostart entry. A reboot
+while powered off stays off (a marker plus systemd conditions suppress the mounts
+and health timer) until you log in with autostart enabled, or run
+`sudo /usr/local/bin/icloud-bridge-power on`.
+
+---
+
+## 7. Create Windows VM (first run downloads Windows)
+
+In the Setup assistant, choose **Create Windows VM** and then watch the install
+live at **http://127.0.0.1:8006** (noVNC). The first creation downloads a
+multi-gigabyte Windows 11 ISO and runs an unattended install — typically
+**20–40 min**. The debloat step runs automatically via the `/oem` mount,
+registers the provisioning watcher the app talks to (§9), and drops a
+`NEXT-STEPS.txt` on the guest desktop. Wait for the Windows desktop to appear.
 
 > **Do this now if you might ever rebuild the guest.** dockur deletes the ISO it
 > downloaded partway through the install, so the only chance to keep it is
 > *while the download is still running* — by the time this install finishes it
-> is already gone. Run the hard-link rescue in §7 now; the reasoning can wait:
+> is already gone. Run the hard-link rescue in §8 now; the reasoning can wait:
 >
 > ```bash
 > docker exec icloud-windows ln -f /storage/tmp/win11x64.iso /storage/win11x64-keep.iso
 > ```
 >
 > If it reports *no such file*, the download has not started yet — wait a moment
-> and repeat. Repeating is safe, and §7 explains why you may need to: a restarted
+> and repeat. Repeating is safe, and §8 explains why you may need to: a restarted
 > download lands on a new inode and leaves your link holding a stale partial.
 > Skip all this only if you accept re-downloading the whole ISO.
-
-The **first** `up` downloads a multi-gigabyte Windows 11 ISO and runs an unattended
-install — typically **20–40 min**. Watch live at **http://127.0.0.1:8006**
-(noVNC). The debloat step runs automatically via the `/oem` mount, registers the
-provisioning watcher the app talks to (§8), and drops a `NEXT-STEPS.txt` on the
-guest desktop. Wait for the Windows desktop to appear.
 
 Quick pre-boot KVM passthrough check (should print the device, not an error):
 
@@ -252,12 +311,12 @@ docker run --rm --device /dev/kvm alpine ls -l /dev/kvm
 
 ---
 
-## 7. Keep the downloaded Windows ISO (avoid re-downloading)
+## 8. Keep the downloaded Windows ISO (avoid re-downloading)
 
 **You normally never re-download.** The installed guest lives in
-`/srv/icloud-vm/storage`, so `docker compose stop/start/down/up` just boots the
-existing disk — no reinstall, no download. A re-download only happens if you
-**wipe that storage directory** to redo the install from scratch.
+`/srv/icloud-vm/storage`, so ordinary GUI power changes boot the existing disk —
+no reinstall, no download. A re-download only happens if you **wipe that storage
+directory** to redo the install from scratch.
 
 **The catch:** dockur *deletes the ISO it downloaded* as soon as it has prepared
 the install media — `removeImage()` is called at `install.sh:1353`, which runs
@@ -317,7 +376,13 @@ first run — one inode, two names, zero extra disk:
 Actual ISO as downloaded on 2026-07-22: `Win11_25H2_English_x64_v2.iso`,
 **8,471,603,200 bytes (7.9 GB)**.
 
-### Reusing it for a clean reinstall
+### Appendix: Reusing it for a clean reinstall
+
+> **Warning:** this is a manual recovery procedure, not the normal setup path.
+> A container created by hand has no GUI provisioning record, so the app can
+> misclassify it and strand you. If a start fails on missing shares, use the
+> app's Setup offer when available; until that recovery route lands, remove the
+> hand-created container so the app can return to its Setup tab.
 
 To rebuild the guest from scratch **without** re-downloading:
 
@@ -337,9 +402,9 @@ different file from the pristine download. Don't mistake it for the cached ISO.
 
 ---
 
-## 8. In-guest setup (the app drives it; the Apple sign-in is yours)
+## 9. In-guest setup (the app drives it; the Apple sign-in is yours)
 
-Install the GUI first (§10) if you have not already — it is what performs this
+Install the GUI first (§6) if you have not already — it is what performs this
 section. With the VM created and Windows installed, its **Setup** tab offers
 
 > **Set up Windows automatically**
@@ -394,7 +459,7 @@ this app cannot confirm it; connecting is the proof. That proof is the existing
 
 If you deliberately select a *different* password from the one this host already
 mounts with, the app tells you so and prints the matching
-`sudo icloud-bridge-configure --env-file …` follow-up (§9) — it cannot read or
+`sudo icloud-bridge-configure --env-file …` follow-up (§10) — it cannot read or
 write root's `/etc/credentials-icloud` itself.
 
 ### Re-running it later
@@ -491,7 +556,7 @@ follow plan §5–§7:
 
 ---
 
-## 9. Mount on the host and verify
+## 10. Mount on the host and verify
 
 ```bash
 sudo ./host/setup-host.sh    # places the units, helpers and marker dir, then configures this machine
@@ -561,64 +626,7 @@ project changes them for you.
 
 ---
 
-## 10. Install the host GUI and tray icon
-
-**If you installed the package in §9, the GUI is already there** — it ships in
-the same `.deb`, at `/usr/bin/icloud-bridge-gui`. Skip to the GNOME note below.
-
-Otherwise, install it for your user:
-
-```bash
-./gui/install-gui.sh         # run as your desktop user, NOT root
-```
-
-Installs into `~/.local/share/icloud-bridge-gui/`, adds a launcher at
-`~/.local/bin/icloud-bridge-gui`, an application entry, and an autostart entry
-that starts the tray minimised. PySide6 comes from the distro packages when they
-exist and from a dedicated venv otherwise (never `pip install --user`).
-
-Both may be installed at once: a per-user install shadows the system one by
-`PATH`, and `~/.local/share/applications` and `~/.config/autostart` override
-their `/usr/share` and `/etc/xdg` counterparts by basename, so the tray cannot
-end up launched twice. The per-user installer stays the right choice on a release
-whose archives lack the `python3-pyside6` packages, since only it falls back to a
-dedicated venv.
-
-**GNOME users:** install the *AppIndicator and KStatusNotifierItem Support*
-extension, or the tray icon will not be visible.
-
-**On a host with no VM yet, the GUI opens a Setup assistant** (v2 plan D31)
-instead of the status view: it re-checks the §2/§4 prerequisites, shows which
-`docker-compose.yml` and `provision/` copy it resolved (package, per-user, or
-this checkout — never the working directory), validates your `.env` without ever
-reading the password out, and offers **Create Windows VM**, which runs
-
-```bash
-docker compose -p icloud-bridge -f <bundle>/docker-compose.yml --env-file <your .env> up -d
-```
-
-Use that same `-p icloud-bridge` project name for later terminal commands so
-they address the same project. The assistant then waits through the Windows
-install — it does not try to mount anything — offers **Set up Windows
-automatically** to drive the §8 guest sequence for you (the manual list stays
-behind **Show manual steps**), and hands back to the power helper when you choose
-**Check setup and connect**.
-
-The GUI is the bridge's on/off switch (v2 plan D29/D30). Launching it powers the
-Windows VM on and mounts the shares; the tray's **Quit → Quit and power off VM**
-cleanly disconnects both mounts and powers the VM off (leaving unuploaded changes
-to resume next start). **Quit GUI only** leaves the bridge running. **Power off
-bridge (keep this app running)** does the same teardown without exiting, and
-**Start bridge** brings it back — that action also appears when the container is
-found stopped mid-session, so a manual `docker stop` is recoverable from the app.
-The tray's **Start when the computer starts** toggles the autostart entry. A reboot while
-powered off stays off (a marker plus systemd conditions suppress the mounts and
-health timer) until you log in with autostart enabled, or run
-`sudo /usr/local/bin/icloud-bridge-power on`.
-
----
-
-## Taking the data-path work onto a guest built before 2026-07-26
+## Appendix: Taking the data-path work onto a guest built before 2026-07-26
 
 **Read this if your container predates that date.** Two performance decisions —
 D32 (SMB signing off) and D33 (`/dev/vhost-net`) — shipped on 2026-07-26, and
@@ -638,6 +646,12 @@ neither can reach a container or a guest that already exists:
 Do it in this order. Do **not** `docker rm` or `docker kill` a live bridge —
 that is what the ordered teardown exists to prevent:
 
+> **Warning:** these are manual recovery commands, not the setup path. A
+> hand-created container has no GUI provisioning record, so the app can
+> misclassify it and strand you. If a start fails on missing shares, use the
+> app's Setup offer when available; until that recovery route lands, remove the
+> hand-created container so the app can return to its Setup tab.
+
 ```bash
 sudo icloud-bridge-power off       # or Quit from the GUI; unmounts first, then stops the VM
 docker compose up -d               # recreates the container, now with /dev/vhost-net
@@ -648,8 +662,8 @@ Then reconcile the guest half from the app: **Re-run Windows provisioning…**
 (Status tab or tray menu). The data-share check covers the D32 signing and
 encryption settings, so a guest that still has signing on is repaired as ordinary
 drift — with the credential preserved, and without touching the agent or the ACL
-boundaries if they are already correct (§8). The manual equivalent, if you prefer
-it, is step 3 of the fallback sequence in §8; it is idempotent, which is why
+boundaries if they are already correct (§9). The manual equivalent, if you prefer
+it, is step 3 of the fallback sequence in §9; it is idempotent, which is why
 either route is safe.
 
 `make acceptance` proves the D33 half from the host, and it is the half that is
@@ -747,18 +761,18 @@ in every state, including setup and powered-off.
 | `Failed to enable unit: Unit docker.service does not exist` from `setup-prereqs.sh` | Desktop's CLI present so Engine install was skipped; no host daemon | Use the fixed script (tests `dockerd`, not `docker`); or install Engine via `get.docker.com` then re-run |
 | `permission denied … unix:///var/run/docker.sock` | Not in `docker` group in this session | §4 — relogin (or `newgrp docker` for one shell) |
 | `newgrp: command not found` | `newgrp` not installed (minimal Ubuntu) | `sudo apt install util-linux-extra` |
-| In the guest: *"running scripts is disabled on this system"* | PowerShell execution policy is `Restricted` by default | Launch via `powershell -ExecutionPolicy Bypass -NoProfile -File <script>` (§8) |
+| In the guest: *"running scripts is disabled on this system"* | PowerShell execution policy is `Restricted` by default | Launch via `powershell -ExecutionPolicy Bypass -NoProfile -File <script>` (§9) |
 | `docker version` server shows the wrong number (Desktop's, not Engine's) | Context still `desktop-linux` | `docker context use default` |
-| Guest install extremely slow / no KVM in logs | KVM not passed through (Desktop, or no `/dev/kvm`) | Confirm §2 + `kvm-ok`; run the KVM passthrough check in §6 |
+| Guest install extremely slow / no KVM in logs | KVM not passed through (Desktop, or no `/dev/kvm`) | Confirm §2 + `kvm-ok`; run the KVM passthrough check in §7 |
 | `04-bridge-agent.ps1`: *"exclusions.json is missing but this looks like an existing install"* | The config was lost while the task/share/state survived; writing an empty list would silently re-include everything | Finish provisioning, start the GUI, and use **Restore from backup…** on the Selective Sync tab (v2 plan D36) — the host keeps a copy at `~/.local/state/icloud-bridge-gui/exclusions-backup.json`. Failing that, write an explicitly chosen `C:\ProgramData\icloud-bridge\io\exclusions.json` and re-run |
 | Selective Sync warns *"choices are not backed up on this computer"* | The bridge read or Apply worked; only the local D36 snapshot failed to write | Check permissions on `~/.local/state/icloud-bridge-gui/` and free space on `$HOME`. Nothing on the bridge is affected |
 | Selective Sync says the saved copy is *newer* than the VM's configuration | Normal after a VM rebuild: the fresh guest reports revision 0 and the host deliberately keeps the better copy | **Restore from backup…** to push your choices back into the rebuilt VM |
 | Tray icon shows yellow, `status.json` stale | The guest scheduled task is not running (it only runs in the logged-on `icloud` session) | Open `:8006`, confirm auto-logon happened; `Start-ScheduledTask icloud-bridge-agent` |
 | An exclusion is stuck at `pending-dehydrate` | Cloud Files refuses to dehydrate content that is open, modified, or not yet uploaded | Wait for the upload; the item is already hidden and inaccessible from the host. See `docs/selective-sync.md` |
-| An exclusion reports `acl-write-denied` | Provisioning step 4 (the agent's `RC,WDAC` grant) did not take, or that object has a protected DACL | **Re-run Windows provisioning…** — the bridge-boundary repair re-applies the grant, and a protected child DACL is reported as blocked with the exact paths so you restore inheritance deliberately (§8) |
-| *"The guest agent does not match this app"* (yellow banner) | The GUI was updated but `C:\ProgramData\icloud-bridge\agent.ps1` was not — a package upgrade cannot reach inside the guest (v2 plan D35). Everything still works | Use the banner's **Re-run Windows provisioning…** button. On a healthy VM the plan is just *Update bridge agent*: no password is asked for and your exclusions are untouched. A VM created before automated provisioning needs the one-time bootstrap in §8 first |
+| An exclusion reports `acl-write-denied` | Provisioning step 4 (the agent's `RC,WDAC` grant) did not take, or that object has a protected DACL | **Re-run Windows provisioning…** — the bridge-boundary repair re-applies the grant, and a protected child DACL is reported as blocked with the exact paths so you restore inheritance deliberately (§9) |
+| *"The guest agent does not match this app"* (yellow banner) | The GUI was updated but `C:\ProgramData\icloud-bridge\agent.ps1` was not — a package upgrade cannot reach inside the guest (v2 plan D35). Everything still works | Use the banner's **Re-run Windows provisioning…** button. On a healthy VM the plan is just *Update bridge agent*: no password is asked for and your exclusions are untouched. A VM created before automated provisioning needs the one-time bootstrap in §9 first |
 | *"not speaking this app's bridge protocol"* (red banner); Apply and browsing disabled | Same cause, but the guest agent predates the version check entirely, so nothing will be written to it | The same **Re-run Windows provisioning…** action — it stays available in this state precisely because it is the way out. The current `exclusions.json` is deliberately left exactly as it is until the versions agree |
-| Provisioning runs but the VM never acknowledges it (the app shows a one-line bootstrap command after ~90 s) | The VM was created before automated provisioning, so it has no watcher task. Not an error — the app is still polling | Run that command once in an elevated PowerShell inside the VM (§8). The already-staged request is then picked up with no further click on the host |
+| Provisioning runs but the VM never acknowledges it (the app shows a one-line bootstrap command after ~90 s) | The VM was created before automated provisioning, so it has no watcher task. Not an error — the app is still polling | Run that command once in an elevated PowerShell inside the VM (§9). The already-staged request is then picked up with no further click on the host |
 | GUI shows *"could not be powered on/off within the time allowed"* and offers only **Retry** | The outer timeout fired. Killing this app's `sudo` is no proof the root helper stopped, so nothing is read or changed until you retry (v2 plan D38) | Give the helper a moment, then press **Retry** — `flock` serializes it against any surviving run. `journalctl -u icloud-health.timer` and the diagnostic report show what actually happened |
 | After restarting the GUI mid-install it says *"Setup was interrupted while Windows was installing"* | The D39 record survived the restart, so the app resumed the no-CIFS Provisioning state instead of guessing | Continue the guest steps and choose **Check setup and connect**; the note clears itself once the bridge powers on |
 | Setup offers **Discard failed setup record** | This app noted that a VM creation was started, but Docker says that container is absent or is a different one | Use it if you gave up on that attempt. It removes only this app's note — no container, no virtual disk, no `.env` |
@@ -768,7 +782,7 @@ in every state, including setup and powered-off.
 | GUI stuck on *Starting Windows VM…* or shows a start error | The VM did not boot or its SMB was not ready within five minutes | Open `:8006`, confirm iCloud is signed in, then **Retry start**. The GUI never auto-retries or arms health against a dead mount |
 | After a reboot the bridge is off and `/mnt/icloud` is empty | The GUI powered it off; the marker + unit conditions keep it down (intended, D29) | Launch the GUI (autostart does this at login), or `sudo /usr/local/bin/icloud-bridge-power on` |
 | GUI: *"sudo: a password is required"* when starting/quitting | The power-helper `sudoers` grant names a different account, or was never installed | `sudo icloud-bridge-configure --user <your account>` — this works whether you installed from the repo or the package, and needs no `.env` if credentials already exist |
-| GUI: *"Cannot inspect the Windows VM: … no such object …"* instead of the create-the-VM message | Pre-fix `power.py` matched Docker's error casing literally, so Docker 29's lowercase text was read as an inspect failure rather than "no container yet" | Update to a build containing the case-insensitive match; the guest itself is fine — run `docker compose up -d` if you have not created it yet |
+| GUI: *"Cannot inspect the Windows VM: … no such object …"* instead of the create-the-VM message | Pre-fix `power.py` matched Docker's error casing literally, so Docker 29's lowercase text was read as an inspect failure rather than "no container yet" | Update to a build containing the case-insensitive match; the guest itself is fine — use **Create Windows VM** if you have not created it yet |
 | Setup assistant: *"could not find docker-compose.yml and provision/"* | The GUI cannot see an installation bundle — it never guesses from the working directory, because a desktop launcher has none | Re-run `./gui/install-gui.sh` (it copies the bundle to `~/.local/share/icloud-bridge-gui/resources`) or install the `.deb`, which ships `/usr/share/icloud-bridge` |
 | Setup assistant: *"this GUI was installed from … which no longer contains host/setup-host.sh"* | The checkout recorded at install time was moved or deleted, so the printed `setup-host.sh` path would be wrong | Run the host setup from wherever the repository is now, or re-run `./gui/install-gui.sh` from there |
 | Setup assistant: **Create Windows VM** stays greyed out | A check is failing, or a container named `icloud-windows` already exists — the assistant never creates one beside an existing container | Fix the red rows and press **Re-check**; if the container exists, close the assistant and let the app start it |

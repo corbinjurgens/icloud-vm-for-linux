@@ -181,7 +181,7 @@ The full manual sequence — scripts 02, sign-in, 03, 04, run as Administrator o
 the guest desktop (§5–§7) — remains supported and is one click away under **Show
 manual steps**. It is written out, with the correct script directory and the
 one-time bootstrap needed by VMs created before automated provisioning, in
-[`SETUP.md` §8](SETUP.md).
+[`SETUP.md` §9](SETUP.md).
 
 ### 4. Mount on the host and verify
 

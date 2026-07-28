@@ -10,7 +10,7 @@
 >
 > - **Shipped** (see "A second read-only review" under 2026-07-27 in
 >   `CHANGELOG.md`): **P1**, the
->   content-preview hydration warning in `README.md`, `SETUP.md` §9 and
+>   content-preview hydration warning in `README.md`, `SETUP.md` §10 and
 >   `docs/selective-sync.md`; **P2**, the GUI response poll armed on demand
 >   instead of ticking for the whole session; and the read-only sampler **F2**
 >   asked for, `tools/profile-windows-idle.ps1`, which is written and parsed but
@@ -67,7 +67,7 @@ Read-only observations on 2026-07-27, before the bridge was powered off:
 | Disk path | QEMU 10.0.11 uses a sparse raw image with `cache=none,aio=native,discard=unmap,detect-zeroes=on` and a virtio-SCSI iothread | The safe high-performance/discard path is already active; there is no qcow2 or writeback-cache tax to remove |
 | Disk allocation | `data.img` is 120 GiB logical and about **14.8 GiB allocated**; the storage filesystem is local ext4 on NVMe | Sparse discard is working |
 | Disk fragmentation | `filefrag` reported 12,887 extents for `data.img` | Expected from repeated sparse allocation and hole punching; not a tuning target without measured guest-disk latency, especially after R-026 bounded the block path at 0.23% of lifetime CPU |
-| Cached installer | the retained Windows ISO is 7.9 GiB, hard-linked between storage and `/srv/isos` | One physical copy, intentionally trading host disk for avoiding an 8 GB rebuild download; deletion is an operator trade-off already documented in `SETUP.md` §7 |
+| Cached installer | the retained Windows ISO is 7.9 GiB, hard-linked between storage and `/srv/isos` | One physical copy, intentionally trading host disk for avoiding an 8 GB rebuild download; deletion is an operator trade-off already documented in `SETUP.md` §8 |
 | Image version | the container is dockur/windows **v6.02**, revision `9caf1a9`, QEMU base image current for that release | v6.02 was also the current upstream release during this review; there is no upgrade gap to claim as a performance fix |
 | vhost | QEMU command line had `vhost=on,vhostfd=...` | D33 remains applied |
 | THP/KSM | host THP is `madvise`; KSM is enabled but shares zero pages | Matches the already-settled DFR-003 THP result; Windows guest memory is not currently deduplicated |

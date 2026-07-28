@@ -101,7 +101,7 @@ it is provisioned.** I-008 discovered that `03-create-share.ps1` and
 `04-bridge-agent.ps1` have never run on the author's guest, and the 2026-07-27
 review confirmed it: no agent build 3, no real scan duration, no exclusion costs,
 no representative tree, and the only share that exists is the historical D5
-`icloudtest` one. Run the `SETUP.md` §8 sequence, then treat all four of these as
+`icloudtest` one. Run the `SETUP.md` §9 sequence, then treat all four of these as
 the precondition for every later measurement — `status.json` advancing every 15 s
 with `agentBuild: 3`; `scan.lastCompletedAt` non-null with a plausible
 `scan.entries` and no `tree`, `scan` or ACL failure in `lastError`; a *second*
@@ -268,6 +268,23 @@ Bumping the minor digit is a one-line change; `Makefile` and
 happens after that, never before.
 
 ## Shipped improvements
+
+### 2026-07-28 — SETUP.md is app-first
+
+Every place the runbook had the operator run `docker compose up -d` by hand
+created the dead end recorded in todo/lifecycle-dead-ends.md: a hand-created
+container has no provisioning record, so the app misclassifies it and strands
+the operator (no Setup tab, a Retry that cannot succeed). SETUP.md now installs
+the GUI before any VM exists (§6) and documents **Create Windows VM** as the way
+to bring the container up (§7); the bare compose commands survive only in the
+reinstall and data-path-catch-up appendices, each behind a warning that a
+hand-created container currently needs removal for the app to recover. The
+`DOCKER_HOST` per-command pin, the `make vm-*` wrappers, and the
+`-p icloud-bridge` project-name note moved into the recovery context they serve.
+Cross-references to the renumbered sections were updated in `README.md`,
+`docs/automation-notes.md`, `docs/implementation-plan.md`, `tools/keep-iso.sh`,
+the live todo notes, and the one live reference above; historical entries below
+keep the numbering that was true when they were written.
 
 ### 2026-07-28 — `install-gui.sh` can uninstall what it installed
 

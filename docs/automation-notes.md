@@ -39,7 +39,7 @@ and an elevated task inside Windows inspects the VM, repairs only what is missin
 or drifted, and verifies the result (v2 plan D40-D44, §4.1/§4.2). The scripts
 themselves did not change purpose — the automated path runs exactly what the
 operator would have run by hand, which is still the documented fallback in
-[`SETUP.md` §8](../SETUP.md). Step 8's execution-policy prefix is likewise now
+[`SETUP.md` §9](../SETUP.md). Step 9's execution-policy prefix is likewise now
 the app's problem rather than the operator's, except in that fallback. **None of
 this has been exercised against a real guest yet** — see the 2026-07-27 entries
 in [`CHANGELOG.md`](../CHANGELOG.md).
@@ -243,7 +243,7 @@ install time and goes stale from then on.
 
 This was written before the guest half was automated. It is kept because it is
 the shell-level shape of the run; in practice the guest steps are now the app's
-**Set up Windows automatically** button (`SETUP.md` §8), which does them over the
+**Set up Windows automatically** button (`SETUP.md` §9), which does them over the
 provisioning channel rather than by typing into the guest:
 
 ```bash
