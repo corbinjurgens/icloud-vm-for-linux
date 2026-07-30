@@ -750,7 +750,7 @@ class Application(QObject):
 
         def work():
             bundle = firstrun.resolve_bundle()
-            chosen = env_path or self._default_env_path(bundle)
+            chosen = env_path or self._default_env_path()
             report = firstrun.read_env_file(chosen) if chosen else None
             status = power.inspect_container()
             checks = firstrun.gather_checks(bundle=bundle, env=report,
@@ -811,7 +811,7 @@ class Application(QObject):
         return box.clickedButton() is discard
 
     @staticmethod
-    def _default_env_path(bundle: firstrun.Bundle | None) -> str:
+    def _default_env_path() -> str:
         """Use a found conventional configuration, never a remembered path."""
         candidate = firstrun.configuration_path()
         return candidate if os.path.exists(candidate) else ""
@@ -2040,16 +2040,8 @@ class Application(QObject):
         # it stays available exactly while a run could start, including while
         # the bridge protocol is skewed or incompatible.
         available = self._can_reprovision()
-        if self._can_recover_with_first_run():
-            self._window._reprovision_button.setText("Set up Windows automatically")
-            self._window._reprovision_button.setToolTip(
-                "Inspect the Windows VM and recreate its missing iCloud shares.")
-        else:
-            self._window._reprovision_button.setText("Re-run Windows provisioning…")
-            self._window._reprovision_button.setToolTip(
-                "Inspect the Windows VM and repair only what no longer matches this "
-                "app: the iCloud share, its permissions, and the bridge agent.")
-        self._window.set_reprovision_available(available)
+        self._window.set_reprovision_action(
+            available, first_run=self._can_recover_with_first_run())
         if self._tray is not None:
             self._tray.set_reprovision_available(available)
 

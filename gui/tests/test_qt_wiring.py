@@ -14,6 +14,7 @@ keeps `CONTRIBUTING.md`'s with-and-without-Qt rule satisfiable.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import stat
@@ -45,7 +46,7 @@ _confirm_create_vm = app_module.Application._confirm_create_vm
 _ask_quit = app_module.Application._ask_quit
 from icloud_bridge_gui import (backup, bridge, diagnostics, firstrun,  # noqa: E402
                                guestprov, health, lifecycle, listing, power,
-                               theme, workspace_sync, workspaces)
+                               theme, uistate, workspace_sync, workspaces)
 
 
 # ------------------------------------------------------------------ fakes --
@@ -397,6 +398,58 @@ def pump(seconds: float = 2.0, until=None) -> bool:
             return True
     QApplication.processEvents()
     return bool(until()) if until is not None else True
+
+
+def test_window_restores_geometry_and_tab_on_first_show(qapp, fakes):
+    assert uistate.save(900, 650, 10, 10, "Safe Workspaces")
+    window = window_module.MainWindow(lambda *_args: None)
+    window.show()
+    pump(0.2)
+    assert (window.width(), window.height()) == (900, 650)
+    assert window._tabs.tabText(window._tabs.currentIndex()) == "Safe Workspaces"
+    window.hide()
+
+
+def test_offscreen_geometry_is_discarded_on_first_show(qapp, fakes):
+    assert uistate.save(900, 650, 7000, 0, "Status")
+    window = window_module.MainWindow(lambda *_args: None)
+    window.show()
+    pump(0.2)
+    assert (window.width(), window.height()) == (880, 620)
+    window.hide()
+
+
+def test_closing_to_tray_saves_window_state(qapp, fakes):
+    window = window_module.MainWindow(lambda *_args: None)
+    window.hide_on_close = True
+    window.resize(920, 680)
+    window._tabs.setCurrentWidget(window._workspaces_page)
+    window.close()
+    saved = uistate.load()
+    assert (saved.width, saved.height, saved.tab) == (920, 680, "Safe Workspaces")
+
+
+def test_failed_external_open_uses_the_status_bar(qapp, fakes, monkeypatch):
+    monkeypatch.setattr(window_module, "open_externally", lambda _target: False)
+    window = window_module.MainWindow(lambda *_args: None)
+    window._open_externally("/mnt/icloud")
+    assert window.statusBar().currentMessage() == \
+        "Could not open /mnt/icloud: no desktop handler could be started."
+
+
+def test_reprovision_action_owns_both_wordings(qapp, fakes):
+    window = window_module.MainWindow(lambda *_args: None)
+    window.set_reprovision_action(True, first_run=True)
+    assert window._reprovision_button.text() == "Set up Windows automatically"
+    window.set_reprovision_action(True, first_run=False)
+    assert window._reprovision_button.text() == "Re-run Windows provisioning…"
+
+
+def test_controller_uses_the_public_reprovision_method():
+    assert "_reprovision_button" not in inspect.getsource(
+        app_module.Application._sync_power_controls)
+    assert "set_reprovision_action" in inspect.getsource(
+        app_module.Application._sync_power_controls)
 
 
 @pytest.fixture
@@ -3419,7 +3472,8 @@ def test_cancelling_forget_changes_nothing(controller, fakes, dialogs, tmp_path)
 def test_open_local_and_open_icloud_use_the_external_helper(controller, fakes,
                                                             monkeypatch, tmp_path):
     opened: list[str] = []
-    monkeypatch.setattr(window_module, "open_externally", opened.append)
+    monkeypatch.setattr(window_module, "open_externally",
+                        lambda target: (opened.append(target), True)[1])
     app = workspace_controller(controller, fakes, [workspace_entry(tmp_path, 1)])
     window = app._window
     select_workspace(window, 1)
@@ -3594,7 +3648,8 @@ def test_a_failed_probe_creates_nothing(controller, fakes, dialogs, monkeypatch,
 def test_the_first_seed_offers_obsidian_with_a_percent_encoded_url(
         controller, fakes, cycles, dialogs, monkeypatch, tmp_path):
     opened: list[str] = []
-    monkeypatch.setattr(window_module, "open_externally", opened.append)
+    monkeypatch.setattr(window_module, "open_externally",
+                        lambda target: (opened.append(target), True)[1])
     app = workspace_controller(controller, fakes, [])
     window, candidate, _checked = add_flow(
         app, fakes, monkeypatch, tmp_path, local=str(tmp_path / "New vault"))

@@ -279,6 +279,32 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-30 — The window remembers itself, and a dead launch says so
+
+A tray application is opened many times a day, and this one reopened at the same
+default size on the same default tab every time. It now records its geometry and
+selected tab in `$XDG_STATE_HOME/icloud-bridge-gui/window.json` through a new
+Qt-free `uistate.py`, using the same atomic 0600-in-0700 discipline as the
+selective-sync backup. Decision **D55** states what that file is worth: it is
+presentation state, never operator data, so every read and write failure is
+swallowed, a geometry that no longer meets any screen is discarded rather than
+applied, and nothing about startup or the lifecycle waits on it.
+
+Two smaller honesty fixes travel with it. `open_externally` swallowed the one
+error it could get: if no desktop handler could be started, **Open iCloud
+folder** — the action pressed most often — did nothing at all and said nothing.
+It now reports the failure, on the status bar from the window and as a
+notification from the tray. And adding a Safe Workspace runs a probe over CIFS
+that can take a while; the status bar now says so instead of leaving greyed
+buttons as the only clue.
+
+Internally, the controller no longer reaches into the window's private
+re-provision button to relabel it: `MainWindow.set_reprovision_action(available,
+first_run=...)` owns both wordings, which is the layering the rest of that file
+already keeps. E18 is the live check for restore-across-restart and for a
+corrupt `window.json` being a non-event; repository tests cover the state file's
+rules and the wiring, not the real desktop.
+
 ### 2026-07-30 — The status window now explains itself at a glance
 
 The Status tab now separates bridge health, capacity and support, while its

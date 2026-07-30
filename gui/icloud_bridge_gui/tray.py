@@ -61,13 +61,14 @@ def current_scheme() -> str:
         palette.color(QPalette.ColorRole.Text).lightness())
 
 
-def open_externally(target: str) -> None:
+def open_externally(target: str) -> bool:
     """Hand a path or URL to the desktop, without blocking the GUI thread."""
     try:
         subprocess.Popen(["xdg-open", target],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
-        pass
+        return False
+    return True
 
 
 def load_icon(state: str) -> QIcon:
@@ -126,7 +127,8 @@ class TrayIcon(QObject):
 
         menu = QMenu()
         self._action_open_files = QAction("Open iCloud folder", menu)
-        self._action_open_files.triggered.connect(lambda: open_externally(bridge.mount_dir()))
+        self._action_open_files.triggered.connect(
+            lambda: self._open_externally(bridge.mount_dir()))
         menu.addAction(self._action_open_files)
 
         action_status = QAction("Open status window", menu)
@@ -134,7 +136,7 @@ class TrayIcon(QObject):
         menu.addAction(action_status)
 
         action_vm = QAction("Open VM screen", menu)
-        action_vm.triggered.connect(lambda: open_externally(VM_VIEWER_URL))
+        action_vm.triggered.connect(lambda: self._open_externally(VM_VIEWER_URL))
         menu.addAction(action_vm)
 
         # Shown only after a failed power-on; a dead-end otherwise (v2 plan D29).
@@ -227,6 +229,11 @@ class TrayIcon(QObject):
         icon = (QSystemTrayIcon.MessageIcon.Information if level == notify_model.RECOVERY
                 else QSystemTrayIcon.MessageIcon.Warning)
         self._icon.showMessage(title, message, icon)
+
+    def _open_externally(self, target: str) -> None:
+        if not open_externally(target):
+            self.notify("iCloud bridge",
+                        f"Could not open {target}: no desktop handler could be started.")
 
     def update_state(self, state: str, checks) -> None:
         self._icon.setIcon(load_icon(state))

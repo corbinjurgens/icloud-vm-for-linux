@@ -18,8 +18,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Sequence
 
-from PySide6.QtCore import QEvent, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QKeySequence, QPalette
+from PySide6.QtCore import QEvent, QRect, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QBrush, QColor, QGuiApplication, QKeySequence, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QScrollArea,
@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 
 from . import (__version__, backup, bridge, diagnostics, filtering, firstrun,
                guestprov, health, listing, power, sizes, workspace_sync,
-               theme, workspaces)
+               theme, uistate, workspaces)
 from .tray import VM_VIEWER_URL, current_scheme, open_externally
 
 ROLE_PATH = Qt.ItemDataRole.UserRole
@@ -597,6 +597,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("iCloud bridge")
         self.setMinimumSize(760, 520)
         self.resize(880, 620)
+        self._uistate_restored = False
 
         self._status: dict | None = None
         self._tree: dict | None = None
@@ -908,7 +909,7 @@ class MainWindow(QMainWindow):
 
         self._setup_secondary_row = QHBoxLayout()
         setup_vm = QPushButton("Open VM screen")
-        setup_vm.clicked.connect(lambda: open_externally(VM_VIEWER_URL))
+        setup_vm.clicked.connect(lambda: self._open_externally(VM_VIEWER_URL))
         self._setup_secondary_row.addWidget(setup_vm)
         # D39: only offered when Docker has proved the recorded container is
         # absent or different. It removes a local record and nothing else — no
@@ -1451,10 +1452,10 @@ class MainWindow(QMainWindow):
 
         buttons = QHBoxLayout()
         open_files = QPushButton("Open iCloud folder")
-        open_files.clicked.connect(lambda: open_externally(bridge.mount_dir()))
+        open_files.clicked.connect(lambda: self._open_externally(bridge.mount_dir()))
         self._open_files_button = open_files
         open_vm = QPushButton("Open VM screen")
-        open_vm.clicked.connect(lambda: open_externally(VM_VIEWER_URL))
+        open_vm.clicked.connect(lambda: self._open_externally(VM_VIEWER_URL))
         refresh = QPushButton("Refresh now")
         refresh.clicked.connect(self.request_refresh)
         for button in (open_files, open_vm, refresh):
@@ -1845,13 +1846,13 @@ class MainWindow(QMainWindow):
     def _open_workspace_local(self) -> None:
         row = self._selected_workspace()
         if row is not None:
-            open_externally(row.workspace.local)
+            self._open_externally(row.workspace.local)
 
     def _open_workspace_remote(self) -> None:
         row = self._selected_workspace()
         if row is None or self._io_paused:
             return
-        open_externally(workspace_remote_display(row.workspace))
+        self._open_externally(workspace_remote_display(row.workspace))
 
     def _offer_obsidian(self) -> None:
         """After a first seed, offer Obsidian — and keep the plain folder action.
@@ -1876,7 +1877,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes)
             if answer == QMessageBox.StandardButton.Yes:
-                open_externally(obsidian_url(row.workspace.local))
+                self._open_externally(obsidian_url(row.workspace.local))
 
     # ------------------------------------------- workspace configuration edits --
 
@@ -1975,16 +1976,19 @@ class MainWindow(QMainWindow):
 
         def done(probe: WorkspaceProbe) -> None:
             self._workspace_busy = False
+            self.statusBar().clearMessage()
             self._update_workspace_buttons()
             self._confirm_new_workspace(candidate, probe)
 
         def failed(message: str) -> None:
             self._workspace_busy = False
+            self.statusBar().clearMessage()
             self._update_workspace_buttons()
             QMessageBox.warning(self, "Cannot add this workspace",
                                 f"{message}\n\nNothing was created.")
 
         self._workspace_busy = True
+        self.statusBar().showMessage("Checking the iCloud folder…")
         self._update_workspace_buttons()
         self._run_async(work, done, failed)
 
@@ -2021,6 +2025,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------- refreshing --
 
     def closeEvent(self, event) -> None:   # noqa: N802 (Qt naming)
+        self._save_uistate()
         if self.hide_on_close:
             event.ignore()
             self.hide()
@@ -2029,6 +2034,40 @@ class MainWindow(QMainWindow):
             # through the controller's confirmation/transition, not exit under us.
             event.ignore()
             self.quit_requested.emit()
+
+    def showEvent(self, event) -> None:   # noqa: N802 (Qt naming)
+        super().showEvent(event)
+        if not self._uistate_restored:
+            self._uistate_restored = True
+            self._restore_uistate()
+
+    def _restore_uistate(self) -> None:
+        """Put the window back where it was, or leave the defaults alone.
+
+        A stored geometry that no longer meets any screen — an unplugged monitor,
+        a smaller session — is discarded rather than applied, because a window
+        nobody can see is worse than one in the wrong place. The stored tab may
+        also be **Setup**, which the lifecycle inserts and removes (D31), so a
+        name that is not currently a tab is simply ignored.
+        """
+        saved = uistate.load()
+        candidate = QRect(saved.x, saved.y, saved.width, saved.height)
+        if any(screen.availableGeometry().intersects(candidate)
+               for screen in QGuiApplication.screens()):
+            self.setGeometry(candidate)
+        for index in range(self._tabs.count()):
+            if self._tabs.tabText(index) == saved.tab:
+                self._tabs.setCurrentIndex(index)
+                return
+
+    def _save_uistate(self) -> None:
+        uistate.save(self.width(), self.height(), self.x(), self.y(),
+                     self._tabs.tabText(self._tabs.currentIndex()))
+
+    def _open_externally(self, target: str) -> None:
+        if not open_externally(target):
+            self.show_transient(
+                f"Could not open {target}: no desktop handler could be started.")
 
     # ------------------------------------------------------- lifecycle gating --
 
@@ -2108,7 +2147,7 @@ class MainWindow(QMainWindow):
             if action == power.ACTION_POWER_OFF else "")
         self._power_button.show()
 
-    def set_reprovision_available(self, available: bool) -> None:
+    def set_reprovision_action(self, available: bool, *, first_run: bool) -> None:
         """Offer (or withdraw) the D35/D40-D44 re-provision action.
 
         One rule, decided by the controller, applied to both surfaces: the
@@ -2117,6 +2156,15 @@ class MainWindow(QMainWindow):
         pointing at a control that is not there would be worse than one pointing
         at a control that is greyed out.
         """
+        if first_run:
+            self._reprovision_button.setText("Set up Windows automatically")
+            self._reprovision_button.setToolTip(
+                "Inspect the Windows VM and recreate its missing iCloud shares.")
+        else:
+            self._reprovision_button.setText("Re-run Windows provisioning…")
+            self._reprovision_button.setToolTip(
+                "Inspect the Windows VM and repair only what no longer matches this "
+                "app: the iCloud share, its permissions, and the bridge agent.")
         self._reprovision_button.setVisible(available)
         self._protocol_button.setEnabled(available)
 
@@ -2159,8 +2207,7 @@ class MainWindow(QMainWindow):
         index = self._tabs.indexOf(self._sync_page)
         if index >= 0:
             self._tabs.setTabEnabled(index, enabled)
-        if hasattr(self, "_open_files_button"):
-            self._open_files_button.setEnabled(enabled)
+        self._open_files_button.setEnabled(enabled)
 
     def set_io_paused(self, paused: bool) -> None:
         """Gate new bridge I/O; also reflect it in the controls."""
