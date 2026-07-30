@@ -279,6 +279,29 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-30 — Both trees get their room back, and the filter stops re-walking
+
+Neither tree configured its header, so Qt's default ~100 px sections crushed the
+name column of a folder tree and both absolute-path columns of the Safe
+Workspaces tab. The selective-sync tree now stretches **Name** and sizes the four
+narrow columns to their contents; the workspaces tree sizes Name, Enabled, Last
+successful sync and Status to contents, shares the slack between the two path
+columns, elides them in the middle, and carries the whole path as a tooltip. The
+column itself remains the iCloud-*relative* folder that
+`plan-safe-local-workspaces.md` §11.1 fixes; only the tooltip resolves it against
+the mount. That tab's rows can also be sorted now, name-ascending by default.
+
+The selective-sync filter waits 150 ms before it re-applies, instead of walking
+every row on every keystroke — the state-column note in `window.py` records
+5 219 directory rows in a real library, and the filter walked them three times
+per character. The workspace detail area moved into a height-bounded scroll area
+so twenty conflicted paths scroll rather than squeezing the tree above them, and
+a duplicated excluded-summary refresh in the tree rebuild is gone.
+
+No decision row and no Phase E row: this is presentation of already-decided
+behaviour, and the Qt wiring tests prove the header modes, the debounce
+coalescing, the scroll bound, and that sorting preserves the selected row.
+
 ### 2026-07-30 — D54: keyboard-selective sync and legible severity
 
 Selective Sync can now be operated without a mouse: Space, Enter and Return

@@ -33,7 +33,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QDeadlineTimer, QEvent, QThreadPool, QTimer, Qt   # noqa: E402
 from PySide6.QtGui import QKeyEvent                              # noqa: E402
-from PySide6.QtWidgets import QApplication, QTreeWidgetItem      # noqa: E402
+from PySide6.QtWidgets import QApplication, QHeaderView, QTreeWidgetItem      # noqa: E402
 
 from icloud_bridge_gui import __main__ as app_module              # noqa: E402
 from icloud_bridge_gui import window as window_module             # noqa: E402
@@ -1601,6 +1601,106 @@ def _key_press(widget, key, modifiers=Qt.KeyboardModifier.NoModifier):
     QApplication.sendEvent(widget, QKeyEvent(QEvent.Type.KeyPress, key, modifiers))
 
 
+def _seed_selective_sync_tree(window) -> None:
+    window._tree = {
+        "root": {
+            "dirs": [
+                {
+                    "path": "Docs",
+                    "name": "Docs",
+                    "logicalBytes": 1024,
+                    "fileCount": 2,
+                    "dirs": [
+                        {
+                            "path": "Docs/Alpha",
+                            "name": "Alpha",
+                            "logicalBytes": 256,
+                            "fileCount": 1,
+                            "dirs": [],
+                        },
+                    ],
+                },
+                {
+                    "path": "Notes",
+                    "name": "Notes",
+                    "logicalBytes": 2048,
+                    "fileCount": 3,
+                    "dirs": [],
+                },
+            ]
+        }
+    }
+    window._wanted = []
+    window._loaded_wanted = []
+    window._config_error = None
+    window._rebuild_tree()
+
+
+def test_the_tree_headers_use_their_resize_modes(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    sync_header = window._tree_widget.header()
+    assert sync_header.stretchLastSection() is False
+    assert sync_header.sectionResizeMode(window_module.COL_NAME) == \
+        QHeaderView.ResizeMode.Stretch
+    for column in (window_module.COL_SIZE, window_module.COL_ITEMS,
+                   window_module.COL_INCLUDED, window_module.COL_STATE):
+        assert sync_header.sectionResizeMode(column) == \
+            QHeaderView.ResizeMode.ResizeToContents
+
+    workspace_header = window._workspace_tree.header()
+    assert window._workspace_tree.isSortingEnabled()
+    assert window._workspace_tree.textElideMode() == Qt.TextElideMode.ElideMiddle
+    assert workspace_header.sectionResizeMode(window_module.WS_COL_NAME) == \
+        QHeaderView.ResizeMode.ResizeToContents
+    for column in (window_module.WS_COL_LOCAL, window_module.WS_COL_REMOTE):
+        assert workspace_header.sectionResizeMode(column) == \
+            QHeaderView.ResizeMode.Stretch
+    for column in (window_module.WS_COL_ENABLED, window_module.WS_COL_SYNCED,
+                   window_module.WS_COL_STATE):
+        assert workspace_header.sectionResizeMode(column) == \
+            QHeaderView.ResizeMode.ResizeToContents
+
+
+def test_filter_is_debounced_and_still_hides_and_reveals_rows(controller, fakes,
+                                                             monkeypatch):
+    calls = []
+    real_apply_filter = window_module.MainWindow._apply_filter
+
+    def wrapped(self, _text=None):
+        calls.append(self._filter_edit.text())
+        return real_apply_filter(self, _text)
+
+    monkeypatch.setattr(window_module.MainWindow, "_apply_filter", wrapped)
+    app, window = running_controller(controller, fakes)
+    _seed_selective_sync_tree(window)
+    calls.clear()
+
+    window._filter_edit.setText("alpha")
+    window._filter_edit.setText("")
+    assert pump(0.3, until=lambda: len(calls) == 1)
+    assert calls == [""]
+    assert not window._items_by_path["docs"].isHidden()
+    assert not window._items_by_path["notes"].isHidden()
+
+    calls.clear()
+    window._filter_edit.setText("alpha")
+    assert pump(0.3, until=lambda: len(calls) == 1)
+    assert window._items_by_path["docs"].isHidden() is False
+    assert window._items_by_path["docs/alpha"].isHidden() is False
+    assert window._items_by_path["notes"].isHidden() is True
+
+    window._filter_edit.setText("")
+    assert pump(0.3, until=lambda: len(calls) == 2)
+    assert window._items_by_path["docs"].isHidden() is False
+    assert window._items_by_path["notes"].isHidden() is False
+
+
+def test_the_workspace_detail_scroll_area_is_height_bounded(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    assert window._workspace_detail_scroll.maximumHeight() == 140
+    assert window._workspace_detail_scroll.widget() is window._workspace_detail
+
+
 def test_space_toggles_the_selected_folder_through_the_existing_selection_path(
         controller, fakes):
     app, window = running_controller(controller, fakes)
@@ -2967,6 +3067,9 @@ def test_the_tab_is_painted_from_status_json_with_no_mount_access(
     assert rows[0][window_module.WS_COL_ENABLED] == "yes"
     assert rows[0][window_module.WS_COL_SYNCED] == "2026-07-28T08:00:00Z"
     assert rows[0][window_module.WS_COL_STATE] == "conflict"
+    item = window._workspace_tree.topLevelItem(0)
+    assert item.toolTip(window_module.WS_COL_LOCAL) == str(tmp_path / "ws-1")
+    assert item.toolTip(window_module.WS_COL_REMOTE) == workspaces.remote_root("Docs/W1")
     assert app._workspace_timer.isActive() is False
 
 
@@ -2983,6 +3086,43 @@ def test_the_machine_token_up_to_date_is_rendered_as_words(controller, fakes,
         workspace_sync.STATE_SYNCING, workspace_sync.STATE_UP_TO_DATE,
         workspace_sync.STATE_PAUSED, workspace_sync.STATE_CONFLICT,
         workspace_sync.STATE_GUARDED, workspace_sync.STATE_ERROR}
+
+
+def test_the_workspaces_tree_sorts_and_keeps_the_selection_on_rebuild(
+        controller, fakes, monkeypatch, tmp_path):
+    app = workspace_controller(controller, fakes, [
+        workspace_entry(tmp_path, 2),
+        workspace_entry(tmp_path, 1),
+    ])
+    window = app._window
+    assert window._workspace_tree.isSortingEnabled()
+    assert [row[window_module.WS_COL_NAME] for row in workspace_rows_shown(window)] == [
+        "Workspace 1",
+        "Workspace 2",
+    ]
+
+    select_workspace(window, 2)
+    rebuilds = []
+    real_rebuild = window._rebuild_workspace_rows
+
+    def wrapped():
+        rebuilds.append(True)
+        return real_rebuild()
+
+    monkeypatch.setattr(window, "_rebuild_workspace_rows", wrapped)
+    app._render_workspaces()
+    assert rebuilds == []
+    assert window._selected_workspace_id() == workspace_id(2)
+
+    app._record_workspace_result(workspace_id(1), workspace_sync.CycleResult(
+        workspace_id=workspace_id(1),
+        outcome=workspace_sync.SYNCHRONIZED,
+        state=workspace_sync.STATE_UP_TO_DATE,
+        last_success_at="2026-07-28T10:00:00Z",
+    ))
+
+    assert rebuilds == [True]
+    assert window._selected_workspace_id() == workspace_id(2)
 
 
 def test_a_paused_workspace_reads_paused_whatever_it_last_did(controller, fakes,

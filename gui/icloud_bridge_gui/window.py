@@ -22,7 +22,7 @@ from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QKeySequence, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFormLayout, QHBoxLayout, QLabel,
+    QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QScrollArea,
     QLineEdit, QMainWindow,
     QMessageBox, QPushButton, QSizePolicy, QTabWidget, QTreeWidget,
     QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget,
@@ -1518,7 +1518,11 @@ class MainWindow(QMainWindow):
         self._filter_edit = QLineEdit()
         self._filter_edit.setPlaceholderText("folder name or path")
         self._filter_edit.setClearButtonEnabled(True)
-        self._filter_edit.textChanged.connect(self._apply_filter)
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(150)
+        self._filter_timer.timeout.connect(self._apply_filter)
+        self._filter_edit.textChanged.connect(self._restart_filter_timer)
         filter_row.addWidget(self._filter_edit, 1)
         layout.addLayout(filter_row)
         self._filter_note = QLabel(
@@ -1548,6 +1552,11 @@ class MainWindow(QMainWindow):
         self._tree_widget = SelectiveSyncTree()
         self._tree_widget.setColumnCount(5)
         self._tree_widget.setHeaderLabels(["Name", "Size", "Items", "Included", "State"])
+        header = self._tree_widget.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(COL_NAME, QHeaderView.ResizeMode.Stretch)
+        for column in (COL_SIZE, COL_ITEMS, COL_INCLUDED, COL_STATE):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         self._tree_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._tree_widget.setUniformRowHeights(True)
         self._tree_widget.itemChanged.connect(self._on_item_changed)
@@ -1611,6 +1620,17 @@ class MainWindow(QMainWindow):
         self._workspace_tree.setHeaderLabels(
             ["Name", "Local folder", "iCloud folder", "Enabled",
              "Last successful sync", "Status"])
+        self._workspace_tree.setSortingEnabled(True)
+        self._workspace_tree.sortByColumn(WS_COL_NAME, Qt.SortOrder.AscendingOrder)
+        self._workspace_tree.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        header = self._workspace_tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(WS_COL_NAME, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(WS_COL_LOCAL, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(WS_COL_REMOTE, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(WS_COL_ENABLED, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(WS_COL_SYNCED, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(WS_COL_STATE, QHeaderView.ResizeMode.ResizeToContents)
         self._workspace_tree.setRootIsDecorated(False)
         self._workspace_tree.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection)
@@ -1625,7 +1645,11 @@ class MainWindow(QMainWindow):
         self._workspace_detail.setWordWrap(True)
         self._workspace_detail.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self._workspace_detail)
+        self._workspace_detail_scroll = QScrollArea()
+        self._workspace_detail_scroll.setMaximumHeight(140)
+        self._workspace_detail_scroll.setWidgetResizable(True)
+        self._workspace_detail_scroll.setWidget(self._workspace_detail)
+        layout.addWidget(self._workspace_detail_scroll)
 
         buttons = QHBoxLayout()
         self._workspace_add = QPushButton("&Add workspace…")
@@ -1705,6 +1729,11 @@ class MainWindow(QMainWindow):
             item = QTreeWidgetItem(self._workspace_tree,
                                    list(self._workspace_columns(row)))
             item.setData(0, ROLE_PATH, row.workspace.id)
+            # The cells elide in the middle, so both path columns carry the whole
+            # path as a tooltip. The remote *column* stays the iCloud-relative
+            # folder §11.1 fixes; only the tooltip resolves it against the mount.
+            item.setToolTip(WS_COL_LOCAL, row.workspace.local)
+            item.setToolTip(WS_COL_REMOTE, workspace_remote_display(row.workspace))
             if row.state in WORKSPACE_ATTENTION_STATES:
                 brush = QBrush(QColor(theme.severity_color(current_scheme(), health.YELLOW)))
                 for column in range(self._workspace_tree.columnCount()):
@@ -2264,7 +2293,6 @@ class MainWindow(QMainWindow):
         self._refresh_state_column()
         self._update_buttons()
         self._update_excluded_summary()
-        self._update_excluded_summary()
         # A rebuild replaces every row, so a filter typed before it must be
         # re-applied against the new ones.
         self._pre_filter_expanded = None
@@ -2336,6 +2364,9 @@ class MainWindow(QMainWindow):
                     expanded.add(filtering.normalize(path))
         return expanded
 
+    def _restart_filter_timer(self, _text: str) -> None:
+        self._filter_timer.start()
+
     def _apply_filter(self, _text: str | None = None) -> None:
         """Show only matching rows and their ancestors; never change selection.
 
@@ -2343,6 +2374,8 @@ class MainWindow(QMainWindow):
         in-memory tree are untouched, so clearing the filter restores exactly
         what was there — including which folders the operator had open.
         """
+        if self._filter_timer.isActive():
+            self._filter_timer.stop()
         query = self._filter_edit.text()
         visible = filtering.visible_paths(query, self._filterable_paths())
 
