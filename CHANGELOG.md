@@ -282,9 +282,11 @@ happens after that, never before.
 ### 2026-07-30 — The working notes move to the operator's vault
 
 The `todo/` directory (live notes and their `archive/`) left the repository and
-now lives in the operator's cloud-synced Obsidian vault under
-`4. Projects/iCloud Bridge/todo/`, kept in sync across machines by the Safe
-Workspaces feature itself. Earlier entries in this document reference `todo/...`
+now lives in the operator's cloud-synced Obsidian vault, kept in sync across
+machines by the Safe Workspaces feature itself: live notes under
+`4. Projects/iCloud Bridge/todo/` and archived ones under
+`4. Projects/iCloud Bridge/archive/todo/`, matching the vault's convention for
+its other projects. Earlier entries in this document reference `todo/...`
 paths as they existed when written; those links now resolve only through git
 history (any commit up to this one), while the current content of each note is
 the vault copy.

@@ -189,8 +189,10 @@ Move specifications together, not duplicate text:
   lands.
 - A working note proposing a decision must move the decision into a plan
   register before implementation. Working notes live outside the repository, in
-  the operator's cloud-synced vault under `4. Projects/iCloud Bridge/todo/`
-  (the pre-2026-07-30 history keeps the old in-repo `todo/` copies).
+  the operator's cloud-synced vault: live notes under
+  `4. Projects/iCloud Bridge/todo/`, completed ones under
+  `4. Projects/iCloud Bridge/archive/todo/` (the pre-2026-07-30 history keeps
+  the old in-repo `todo/` copies).
 
 Decisions D1-D13 in the v1 plan and D14 onward in the v2 plan are locked. Do
 not silently substitute components. SMB rather than a robocopy mirror is D6;
