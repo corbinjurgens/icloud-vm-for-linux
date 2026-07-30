@@ -279,6 +279,21 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-30 — The status window now explains itself at a glance
+
+The Status tab now separates bridge health, capacity and support, while its
+diagnostic copy confirmation uses the status bar instead of briefly changing a
+button's meaning. Setup and Safe Workspaces split related actions into spaced
+groups, the window has a minimum usable size, and the Safe Workspace explanation
+gets out of the way after the first workspace is configured. Secondary notes are
+smaller and muted so primary state and controls lead.
+
+Repository tests cover the widget structure and the feedback wiring, and no
+decision row or Phase E row is added: nothing here changes decided behaviour.
+What a test cannot judge is whether the result *reads* well — wrapping, balance
+and density on a real screen at a real font size. That is a matter for the
+operator's eye the next time the window is open, not for a repository gate.
+
 ### 2026-07-30 — Both trees get their room back, and the filter stops re-walking
 
 Neither tree configured its header, so Qt's default ~100 px sections crushed the

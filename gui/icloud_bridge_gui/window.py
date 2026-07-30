@@ -22,7 +22,7 @@ from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QKeySequence, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QScrollArea,
+    QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QScrollArea,
     QLineEdit, QMainWindow,
     QMessageBox, QPushButton, QSizePolicy, QTabWidget, QTreeWidget,
     QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget,
@@ -595,6 +595,7 @@ class MainWindow(QMainWindow):
         #: this window only presses the button (D37).
         self.diagnostics_facts: Callable[[], diagnostics.Facts] | None = None
         self.setWindowTitle("iCloud bridge")
+        self.setMinimumSize(760, 520)
         self.resize(880, 620)
 
         self._status: dict | None = None
@@ -648,6 +649,7 @@ class MainWindow(QMainWindow):
         self._workspace_painted: tuple = ()
         self._workspace_busy = False
         self._awaiting_seed: set[str] = set()
+        self._workspace_intro_count: int | None = None
 
         central = QWidget()
         central_layout = QVBoxLayout(central)
@@ -714,6 +716,7 @@ class MainWindow(QMainWindow):
         self._setup_page = self._build_setup_tab()
         central_layout.addWidget(self._tabs, 1)
         self.setCentralWidget(central)
+        self.statusBar()
 
         # The one-second response poll. It is armed by a dispatched list request
         # and stopped again when none is outstanding, so a tray session that
@@ -783,6 +786,18 @@ class MainWindow(QMainWindow):
         self._refresh_check_states()
         self._rebuild_workspace_rows()
 
+    @staticmethod
+    def _secondary_label(label: QLabel) -> None:
+        """Apply the smaller type shared by secondary explanatory copy."""
+        font = label.font()
+        if font.pointSize() > 1:
+            font.setPointSize(font.pointSize() - 1)
+        label.setFont(font)
+
+    def show_transient(self, text: str) -> None:
+        """Show short-lived feedback without changing a control's purpose."""
+        self.statusBar().showMessage(text, 4000)
+
     # ------------------------------------------------------------- setup tab --
 
     def _build_setup_tab(self) -> QWidget:
@@ -807,6 +822,7 @@ class MainWindow(QMainWindow):
         self._setup_paths.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
         self._setup_paths.setStyleSheet(f"color: {theme.muted_color(current_scheme())};")
+        self._secondary_label(self._setup_paths)
         layout.addWidget(self._setup_paths)
 
         env_row = QHBoxLayout()
@@ -865,14 +881,14 @@ class MainWindow(QMainWindow):
 
         layout.addStretch(1)
 
-        buttons = QHBoxLayout()
+        self._setup_primary_row = QHBoxLayout()
         self._setup_recheck = QPushButton("Re-check")
         self._setup_recheck.clicked.connect(self.setup_recheck_requested.emit)
-        buttons.addWidget(self._setup_recheck)
+        self._setup_primary_row.addWidget(self._setup_recheck)
         self._setup_create = QPushButton("Create Windows VM")
         self._setup_create.clicked.connect(self.create_vm_requested.emit)
         self._setup_create.setEnabled(False)
-        buttons.addWidget(self._setup_create)
+        self._setup_primary_row.addWidget(self._setup_create)
         # D40-D44: the confirmed first run. It stages this app's own scripts and
         # watches their effects; the only step left inside the VM is the Apple
         # sign-in.
@@ -882,14 +898,18 @@ class MainWindow(QMainWindow):
             "share and install the bridge agent.")
         self._setup_provision.clicked.connect(self.provision_requested.emit)
         self._setup_provision.hide()
-        buttons.addWidget(self._setup_provision)
-        setup_vm = QPushButton("Open VM screen")
-        setup_vm.clicked.connect(lambda: open_externally(VM_VIEWER_URL))
-        buttons.addWidget(setup_vm)
+        self._setup_primary_row.addWidget(self._setup_provision)
         self._setup_connect = QPushButton("Check setup and connect")
         self._setup_connect.clicked.connect(self.connect_requested.emit)
         self._setup_connect.hide()
-        buttons.addWidget(self._setup_connect)
+        self._setup_primary_row.addWidget(self._setup_connect)
+        self._setup_primary_row.addStretch(1)
+        layout.addLayout(self._setup_primary_row)
+
+        self._setup_secondary_row = QHBoxLayout()
+        setup_vm = QPushButton("Open VM screen")
+        setup_vm.clicked.connect(lambda: open_externally(VM_VIEWER_URL))
+        self._setup_secondary_row.addWidget(setup_vm)
         # D39: only offered when Docker has proved the recorded container is
         # absent or different. It removes a local record and nothing else — no
         # container, no VM disk, no env file, no bundle.
@@ -899,7 +919,7 @@ class MainWindow(QMainWindow):
             "Nothing is deleted: no container, no disk image, no settings.")
         self._setup_discard.clicked.connect(self.discard_record_requested.emit)
         self._setup_discard.hide()
-        buttons.addWidget(self._setup_discard)
+        self._setup_secondary_row.addWidget(self._setup_discard)
         self._setup_manual = QPushButton("Show manual steps")
         self._setup_manual.setCheckable(True)
         self._setup_manual.setToolTip(
@@ -907,9 +927,9 @@ class MainWindow(QMainWindow):
             "would rather not let the app do it.")
         self._setup_manual.toggled.connect(self._toggle_manual_steps)
         self._setup_manual.hide()
-        buttons.addWidget(self._setup_manual)
-        buttons.addStretch(1)
-        layout.addLayout(buttons)
+        self._setup_secondary_row.addWidget(self._setup_manual)
+        self._setup_secondary_row.addStretch(1)
+        layout.addLayout(self._setup_secondary_row)
         return page
 
     def _toggle_manual_steps(self, shown: bool) -> None:
@@ -1349,9 +1369,7 @@ class MainWindow(QMainWindow):
         def deliver(text: str) -> None:
             # The only route to the clipboard: an explicit Copy action.
             QApplication.clipboard().setText(text)
-            self._diag_copy.setText("Copied")
-            QTimer.singleShot(1500,
-                              lambda: self._diag_copy.setText("Copy diagnostics"))
+            self.show_transient("Diagnostic report copied to the clipboard")
 
         self._run_diagnostics(deliver)
 
@@ -1378,35 +1396,42 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
 
+        health_box = QGroupBox("Bridge health")
+        health_layout = QVBoxLayout(health_box)
         self._check_rows = QWidget()
         self._check_layout = QVBoxLayout(self._check_rows)
         self._check_layout.setContentsMargins(0, 0, 0, 0)
         self._check_layout.setSpacing(4)
-        layout.addWidget(self._check_rows)
+        health_layout.addWidget(self._check_rows)
+        layout.addWidget(health_box)
         self._check_widgets: dict[str, tuple[QLabel, QLabel]] = {}
 
-        layout.addSpacing(8)
+        capacity_box = QGroupBox("Capacity")
+        capacity_layout = QVBoxLayout(capacity_box)
         self._disk_label = QLabel("Guest disk: -")
         self._local_label = QLabel("Fully local content: -")
         self._local_label.setToolTip("partially downloaded files are not counted")
         self._scan_label = QLabel("Last full scan: -")
         for label in (self._disk_label, self._local_label, self._scan_label):
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            layout.addWidget(label)
+            capacity_layout.addWidget(label)
 
         note = QLabel("“Fully local content” is a lower bound: partially downloaded "
                       "files are not counted, so it is not the space iCloud uses in the VM.")
         note.setWordWrap(True)
         self._status_note = note
         note.setStyleSheet(f"color: {theme.muted_color(current_scheme())};")
-        layout.addWidget(note)
+        self._secondary_label(note)
+        capacity_layout.addWidget(note)
+        layout.addWidget(capacity_box)
 
         layout.addStretch(1)
 
         # D37: support export. Deliberately on the Status tab and available in
         # every lifecycle state, because a failure state is exactly when a
         # report is worth having.
-        diag = QHBoxLayout()
+        support_box = QGroupBox("Support")
+        diag = QHBoxLayout(support_box)
         self._diag_copy = QPushButton("Copy diagnostics")
         self._diag_copy.setToolTip(
             "Put a privacy-safe diagnostic report on the clipboard")
@@ -1422,7 +1447,7 @@ class MainWindow(QMainWindow):
         diag.addWidget(self._diag_save)
         diag.addWidget(self._diag_paths)
         diag.addStretch(1)
-        layout.addLayout(diag)
+        layout.addWidget(support_box)
 
         buttons = QHBoxLayout()
         open_files = QPushButton("Open iCloud folder")
@@ -1511,6 +1536,7 @@ class MainWindow(QMainWindow):
         summary_note.setWordWrap(True)
         self._summary_note = summary_note
         summary_note.setStyleSheet(f"color: {theme.muted_color(current_scheme())};")
+        self._secondary_label(summary_note)
         layout.addWidget(summary_note)
 
         filter_row = QHBoxLayout()
@@ -1529,6 +1555,7 @@ class MainWindow(QMainWindow):
             "Searches the folder list plus files already loaded in this session.")
         self._filter_note.setWordWrap(True)
         self._filter_note.setStyleSheet(f"color: {theme.muted_color(current_scheme())};")
+        self._secondary_label(self._filter_note)
         self._filter_note.hide()
         layout.addWidget(self._filter_note)
 
@@ -1602,9 +1629,14 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
 
-        intro = QLabel(WORKSPACE_INTRO)
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
+        self._workspace_intro_toggle = QPushButton("What is a Safe Workspace?")
+        self._workspace_intro_toggle.setCheckable(True)
+        self._workspace_intro_toggle.setChecked(True)
+        layout.addWidget(self._workspace_intro_toggle)
+        self._workspace_intro = QLabel(WORKSPACE_INTRO)
+        self._workspace_intro.setWordWrap(True)
+        self._workspace_intro_toggle.toggled.connect(self._workspace_intro.setVisible)
+        layout.addWidget(self._workspace_intro)
 
         # A configuration this app refuses to read stops every cycle, so it is
         # said plainly rather than left as an empty list (§4.1).
@@ -1675,10 +1707,14 @@ class MainWindow(QMainWindow):
             "Remove this workspace's entry from this app. The local folder, the "
             "iCloud folder, the sync state and the backups are all kept.")
         self._workspace_forget.clicked.connect(self._forget_workspace)
-        for button in (self._workspace_add, self._workspace_sync,
-                       self._workspace_pause, self._workspace_resume,
-                       self._workspace_open_local, self._workspace_open_remote):
-            buttons.addWidget(button)
+        buttons.addWidget(self._workspace_add)
+        buttons.addWidget(self._workspace_sync)
+        buttons.addSpacing(16)
+        buttons.addWidget(self._workspace_pause)
+        buttons.addWidget(self._workspace_resume)
+        buttons.addSpacing(16)
+        buttons.addWidget(self._workspace_open_local)
+        buttons.addWidget(self._workspace_open_remote)
         buttons.addStretch(1)
         buttons.addWidget(self._workspace_forget)
         layout.addLayout(buttons)
@@ -1693,6 +1729,9 @@ class MainWindow(QMainWindow):
         controller reads without touching the mount.
         """
         self._workspace_rows = list(rows)
+        if self._workspace_intro_count != len(self._workspace_rows):
+            self._workspace_intro_count = len(self._workspace_rows)
+            self._workspace_intro_toggle.setChecked(not self._workspace_rows)
         # A pass completes every five seconds, and most of them change nothing
         # a column shows. Rebuilding the tree anyway would reset the operator's
         # scroll position and selection while they are reading it, so the rows

@@ -1246,6 +1246,48 @@ def test_collection_runs_on_a_worker_and_only_copy_reaches_the_clipboard(
     window._copy_diagnostics()
     pump(2.0, until=lambda: clipboard.text() != "untouched")
     assert diagnostics.HEADER in clipboard.text()
+    assert window.statusBar().currentMessage() == \
+        "Diagnostic report copied to the clipboard"
+    assert window._diag_copy.text() == "Copy diagnostics"
+
+
+def test_status_sections_and_minimum_size_keep_related_controls_together(
+        controller, fakes):
+    app, window = running_controller(controller, fakes)
+    sections = {box.title(): box for box in window._tabs.widget(0).findChildren(
+        window_module.QGroupBox)}
+
+    assert set(sections) == {"Bridge health", "Capacity", "Support"}
+    assert sections["Bridge health"].isAncestorOf(window._check_rows)
+    for widget in (window._disk_label, window._local_label, window._scan_label,
+                   window._status_note):
+        assert sections["Capacity"].isAncestorOf(widget)
+    for widget in (window._diag_copy, window._diag_save, window._diag_paths):
+        assert sections["Support"].isAncestorOf(widget)
+    assert window.minimumWidth() == 760
+    assert window.minimumHeight() == 520
+
+
+def test_setup_button_rows_keep_their_existing_visibility_rules(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    primary = window._setup_primary_row
+    secondary = window._setup_secondary_row
+    assert [primary.itemAt(index).widget() for index in range(4)] == [
+        window._setup_recheck, window._setup_create, window._setup_provision,
+        window._setup_connect,
+    ]
+    assert secondary.itemAt(0).widget().text() == "Open VM screen"
+    assert secondary.itemAt(1).widget() is window._setup_discard
+    assert secondary.itemAt(2).widget() is window._setup_manual
+
+    window.update_setup(title="Setup required", intro="", checks=(), paths="",
+                        env_path="", can_create=True, show_connect=True,
+                        show_discard=True, manual="manual", show_provision=True,
+                        can_provision=True)
+    assert not window._setup_provision.isHidden()
+    assert not window._setup_connect.isHidden()
+    assert not window._setup_discard.isHidden()
+    assert not window._setup_manual.isHidden()
 
 
 def test_the_report_carries_the_controller_facts_and_no_folder_names(controller, fakes):
@@ -3037,6 +3079,25 @@ def test_the_safe_workspaces_tab_follows_selective_sync_and_is_persistent(
     assert titles == ["Status", "Selective Sync", "Safe Workspaces"]
     assert tabs.indexOf(window._workspaces_page) == \
         tabs.indexOf(window._sync_page) + 1
+
+
+def test_safe_workspace_intro_defaults_and_toggle_do_not_edit_configuration(
+        controller, fakes, tmp_path):
+    app = workspace_controller(controller, fakes, [])
+    window = app._window
+    original = read_workspace_config()
+
+    assert window._workspace_intro_toggle.isChecked()
+    assert not window._workspace_intro.isHidden()
+    window._workspace_intro_toggle.click()
+    assert not window._workspace_intro_toggle.isChecked()
+    assert window._workspace_intro.isHidden()
+    assert read_workspace_config() == original
+
+    write_workspace_config([workspace_entry(tmp_path, 1)])
+    app.reload_workspaces()
+    assert not window._workspace_intro_toggle.isChecked()
+    assert window._workspace_intro.isHidden()
 
 
 def test_the_tab_is_painted_from_status_json_with_no_mount_access(

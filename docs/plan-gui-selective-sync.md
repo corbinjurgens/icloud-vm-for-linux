@@ -1314,8 +1314,13 @@ gui/
 │   │                      #   its revision-monotonicity and restore preview (D36)
 │   ├── diagnostics.py     # Qt-free, no mount I/O: the allowlisted, redacted
 │   │                      #   support report over `Facts` (D37)
+│   ├── workspaces.py      # Qt-free: Safe Workspace configuration, XDG paths,
+│   │                      #   validation and local-only state (D52)
+│   ├── workspace_sync.py  # Qt-free: one bounded Safe Workspace Unison cycle
+│   │                      #   and its persisted status (D52)
 │   ├── tray.py            # QSystemTrayIcon: icon state (D23), menu, autostart item
-│   ├── window.py          # QMainWindow with 2 tabs: Status, Selective Sync
+│   ├── window.py          # QMainWindow: Status, Selective Sync, Safe Workspaces,
+│   │                      #   and the conditional Setup tab
 │   └── icons/             # icloud-green.svg, icloud-yellow.svg, icloud-red.svg,
 │                          #   icloud-starting.svg (blue disc, the D29 transition)
 ├── icloud-bridge-gui.desktop        # launches the app (window)
@@ -1417,13 +1422,16 @@ Return results to the GUI thread by signals; never touch widgets from a worker.
   autostart `--minimized` launch exits with a diagnostic in that case; the GNOME
   install note tells the operator how to enable tray support.
 
-**Status tab:** one row per check above — green circle, yellow triangle or red
-square paired with the severity colour, name and detail, plus guest
-disk free/total from `status.json` and `fullyLocalLogicalBytes` labelled
-**"Fully local content"** with the note *"partially downloaded files are not
-counted"*, alongside `scan.lastCompletedAt`. Never label it as total space used
-by iCloud — it is a lower bound (§2.2). Buttons: the same three actions as the
-tray menu. `Version <__version__>` sits at the bottom as selectable text.
+**Status tab:** three sections: **Bridge health** holds one row per check — green
+circle, yellow triangle or red square paired with the severity colour, name and
+detail; **Capacity** holds guest disk free/total from `status.json`,
+`fullyLocalLogicalBytes` labelled **"Fully local content"** with the note
+*"partially downloaded files are not counted"*, and `scan.lastCompletedAt`; and
+**Support** holds the diagnostic export. Never label fully local content as total
+space used by iCloud — it is a lower bound (§2.2). The open, refresh and lifecycle
+buttons sit below the sections, and `Version <__version__>` is selectable text
+at the bottom. Short-lived feedback, including a successful diagnostic copy,
+uses the window status bar rather than changing a button label.
 
 **Version.** `icloud_bridge_gui/__init__.py::__version__` is the single version
 source; the `Makefile` and `packaging/build-deb.sh` derive the package version
@@ -1639,7 +1647,8 @@ useful when the tray instance already exists.
   diagnostics** and **Save diagnostic report…** are enabled in every lifecycle
   state — a report is most valuable when something is broken. Collection runs on
   a worker (it spawns `systemctl` and `sudo -n -l`, though it touches no mount),
-  and only the explicit Copy action reaches the clipboard. In the no-CIFS states
+  and only the explicit Copy action reaches the clipboard; success is confirmed
+  in the window status bar. In the no-CIFS states
   the bridge facts come from the last successful gather and every such section
   is labelled with its timestamp, or "not gathered" when there has never been
   one; the host-unit and authorization probes still run, because they are safe
