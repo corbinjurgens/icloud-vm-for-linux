@@ -102,6 +102,7 @@ register explicitly.
 | `guest-agent/agent.ps1` | Windows guest, as `icloud` | Source of truth for the scheduled, unelevated agent |
 | `gui/icloud_bridge_gui/` | Linux desktop user | Tray, status window, lifecycle, selective sync, and Safe Workspaces |
 | `gui/icloud_bridge_gui/workspaces.py` | Linux desktop user | Qt-free Safe Workspace configuration, XDG paths, validation, and path rejection; no CIFS, no subprocess |
+| `gui/icloud_bridge_gui/theme.py` | Linux desktop user | Qt-free palette-aware colours and scheme selection; no I/O |
 | `gui/icloud_bridge_gui/workspace_sync.py` | Linux desktop user | Qt-free; the only module that reads the mount for a workspace and the only one that runs Unison |
 | `gui/tests/` | Linux host | `pytest` suite; must pass with and without PySide6 |
 | `gui/install-gui.sh` | Linux host, **not** root | Per-user install; preserves an existing `Hidden=true` preference |
@@ -127,7 +128,7 @@ The Qt boundary is part of the design. `tray.py`, `window.py`, and
 `__main__.py` are the PySide6 layer. `health.py`, `bridge.py`, `power.py`,
 `lifecycle.py`, `backup.py`, `diagnostics.py`, `firstrun.py`, `guestprov.py`,
 `envfile.py`, `autostart.py`, `filtering.py`, `listing.py`, `sizes.py`,
-`notify.py`, `workspaces.py`, `workspace_sync.py`, and `cli.py` import no Qt and
+`notify.py`, `workspaces.py`, `workspace_sync.py`, `theme.py`, and `cli.py` import no Qt and
 own the logic.
 
 `lifecycle.py` is stricter still: it is a pure reducer with no I/O, subprocess,

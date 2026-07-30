@@ -279,6 +279,26 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-30 — D53: the GUI follows the desktop palette
+
+The GUI's painted colours now live in one Qt-free, palette-aware `theme.py`
+module. Health severity keeps the established `health` tokens, while banners,
+protocol warnings, provisioning surfaces, links, muted copy and excluded rows
+all choose a light or dark token from the same place. The window reapplies those
+styles after a desktop palette change, so a session does not retain its old
+light-theme contrast after the desktop switches to dark.
+
+This closes the dark-session defects where severity dots and the “Load more…”
+link could disappear into the background, and where excluded rows became
+brighter than ordinary rows. Secondary, copyable labels now use muted text
+instead of being disabled, so their build and setup-path text remains selectable.
+Decision **D53** records the ownership and refresh rule.
+
+The pure palette rules and offscreen Qt wiring are covered in the checkout.
+The appearance itself cannot be verified here: development has no display or
+dark desktop session. E16 is the real-desktop check for both schemes and a live
+theme switch.
+
 ### 2026-07-29 — Safe Workspaces: an opt-in local replica for editing a vault
 
 An Obsidian vault opened straight from `/mnt/icloud` cleared an open note in the

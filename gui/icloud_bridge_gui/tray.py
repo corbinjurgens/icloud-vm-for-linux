@@ -12,11 +12,12 @@ from __future__ import annotations
 import os
 import subprocess
 
-from PySide6.QtCore import QObject, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
+from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtGui import (QAction, QColor, QGuiApplication, QIcon, QPainter,
+                           QPalette, QPixmap)
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
-from . import autostart, bridge, health, power
+from . import autostart, bridge, health, power, theme
 from . import notify as notify_model
 
 VM_VIEWER_URL = "http://127.0.0.1:8006"
@@ -35,13 +36,29 @@ _ICON_FILES = {
     STARTING: "icloud-starting.svg",
     OFF: "icloud-off.svg",
 }
-_FALLBACK_COLORS = {
-    health.GREEN: "#2e9e4f",
-    health.YELLOW: "#d99b1a",
-    health.RED: "#c8402c",
-    STARTING: "#3a7bd5",
-    OFF: "#8b8e91",
-}
+
+
+def current_scheme() -> str:
+    """Which colour scheme the desktop is using — the Qt half of :mod:`theme`.
+
+    It lives in this module rather than in ``window`` because ``window`` imports
+    this one, so the dependency can only ever point this way; :mod:`theme` itself
+    stays Qt-free and therefore cannot read a palette at all.  The style hint is
+    the authority when the platform reports one; the palette is the older
+    fallback, and its own tie-break lives in ``theme.scheme_for``.
+    """
+    hints = QGuiApplication.styleHints()
+    color_scheme = getattr(hints, "colorScheme", lambda: None)()
+    enum = getattr(Qt, "ColorScheme", None)
+    if enum is not None:
+        if color_scheme == enum.Dark:
+            return theme.DARK
+        if color_scheme == enum.Light:
+            return theme.LIGHT
+    palette = QGuiApplication.palette()
+    return theme.scheme_for(
+        palette.color(QPalette.ColorRole.Window).lightness(),
+        palette.color(QPalette.ColorRole.Text).lightness())
 
 
 def open_externally(target: str) -> None:
@@ -64,7 +81,13 @@ def load_icon(state: str) -> QIcon:
     pixmap.fill(QColor(0, 0, 0, 0))
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setBrush(QColor(_FALLBACK_COLORS.get(state, "#c8402c")))
+    scheme = current_scheme()
+    if state in (health.GREEN, health.YELLOW, health.RED):
+        color = theme.severity_color(scheme, state)
+    else:
+        color = theme.provision_color(
+            scheme, "wait" if state == STARTING else "pending")
+    painter.setBrush(QColor(color))
     painter.setPen(QColor(0, 0, 0, 0))
     painter.drawEllipse(6, 6, 52, 52)
     painter.end()

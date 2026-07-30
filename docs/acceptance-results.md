@@ -91,6 +91,7 @@ Every row starts as `not yet run`. `Result` is one of `not yet run`, `pass`,
 | E13 | | not yet run | |
 | E14 | | not yet run | |
 | E15 | | not yet run | |
+| E16 | | not yet run | |
 
 ## Remediation evidence outside the Phase E matrix
 

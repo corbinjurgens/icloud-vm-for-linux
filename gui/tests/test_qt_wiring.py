@@ -31,7 +31,7 @@ pytest.importorskip("PySide6")
 # does not exist on a build machine.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QDeadlineTimer, QThreadPool, QTimer   # noqa: E402
+from PySide6.QtCore import QDeadlineTimer, QEvent, QThreadPool, QTimer, Qt   # noqa: E402
 from PySide6.QtWidgets import QApplication                       # noqa: E402
 
 from icloud_bridge_gui import __main__ as app_module              # noqa: E402
@@ -44,7 +44,7 @@ _confirm_create_vm = app_module.Application._confirm_create_vm
 _ask_quit = app_module.Application._ask_quit
 from icloud_bridge_gui import (backup, bridge, diagnostics, firstrun,  # noqa: E402
                                guestprov, health, lifecycle, listing, power,
-                               workspace_sync, workspaces)
+                               theme, workspace_sync, workspaces)
 
 
 # ------------------------------------------------------------------ fakes --
@@ -464,6 +464,28 @@ class _Signalish:
 def test_every_effect_has_a_handler():
     """Adding an effect without wiring it is a test failure, not a silent no-op."""
     assert set(lifecycle.Effect) == set(app_module.Application._EFFECTS)
+
+
+def test_theme_refresh_uses_dark_tokens_and_palette_event(controller, fakes, monkeypatch):
+    app = controller()
+    window = app._window
+    monkeypatch.setattr(window_module, "current_scheme", lambda: theme.DARK)
+    window.show_banner("Starting")
+    window.apply_snapshot(green_snapshot())
+    window.changeEvent(QEvent(QEvent.Type.ApplicationPaletteChange))
+
+    assert theme.banner_style(theme.DARK, "starting") == window._banner.styleSheet()
+    dot, _detail = window._check_widgets["Container"]
+    assert theme.severity_color(theme.DARK, health.GREEN) in dot.styleSheet()
+
+
+def test_secondary_copyable_labels_remain_enabled(controller, fakes):
+    app = controller()
+    window = app._window
+    selectable = Qt.TextInteractionFlag.TextSelectableByMouse
+    for label in (window._version_label, window._setup_paths):
+        assert label.isEnabled()
+        assert label.textInteractionFlags() & selectable
 
 
 def test_startup_schedules_no_bridge_work_before_power_on_resolves(controller, fakes):

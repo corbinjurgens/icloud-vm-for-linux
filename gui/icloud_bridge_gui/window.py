@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Sequence
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QDialog, QDialogButtonBox,
@@ -30,8 +30,8 @@ from PySide6.QtWidgets import (
 
 from . import (__version__, backup, bridge, diagnostics, filtering, firstrun,
                guestprov, health, listing, power, sizes, workspace_sync,
-               workspaces)
-from .tray import VM_VIEWER_URL, open_externally
+               theme, workspaces)
+from .tray import VM_VIEWER_URL, current_scheme, open_externally
 
 ROLE_PATH = Qt.ItemDataRole.UserRole
 ROLE_KIND = Qt.ItemDataRole.UserRole + 1
@@ -41,16 +41,6 @@ COL_NAME, COL_SIZE, COL_ITEMS, COL_INCLUDED, COL_STATE = range(5)
 
 LIST_TIMEOUT_SECONDS = 15
 LIST_PAGE = 1000
-
-DOT_COLORS = {health.GREEN: "#2e9e4f", health.YELLOW: "#d99b1a", health.RED: "#c8402c"}
-#: Underlined and coloured, so a "Load more…" row reads as something to click.
-LINK_COLOR = "#1a5fb4"
-#: Setup-check dots. A warning is not a blocker, and must not look like one.
-SETUP_COLORS = {
-    firstrun.OK: DOT_COLORS[health.GREEN],
-    firstrun.WARN: DOT_COLORS[health.YELLOW],
-    firstrun.FAIL: DOT_COLORS[health.RED],
-}
 
 # ------------------------- app-driven guest provisioning (D40-D44, §4.1/§4.2) --
 # Every word and colour below is this app's own.  The guest supplies a state
@@ -112,16 +102,6 @@ PROVISION_GLYPHS = {
     PROVISION_BLOCKED: "■",
     PROVISION_CREDENTIAL: "◆",
     PROVISION_PENDING: "○",
-}
-PROVISION_COLORS = {
-    PROVISION_READY: DOT_COLORS[health.GREEN],
-    PROVISION_WORK: DOT_COLORS[health.YELLOW],
-    PROVISION_WAIT: LINK_COLOR,
-    PROVISION_BLOCKED: DOT_COLORS[health.RED],
-    # Deliberately neither green nor red: Windows cannot read a password back,
-    # so this row is never a verdict on whether the password is right.
-    PROVISION_CREDENTIAL: "#6a3fa0",
-    PROVISION_PENDING: "#8b8e91",
 }
 
 #: What each phase means, in this app's words.  Includes the three host-side
@@ -385,7 +365,8 @@ class AddWorkspaceDialog(QDialog):
 
         self._message = QLabel("")
         self._message.setWordWrap(True)
-        self._message.setStyleSheet(f"color: {DOT_COLORS[health.YELLOW]};")
+        self._message.setStyleSheet(
+            f"color: {theme.severity_color(current_scheme(), health.YELLOW)};")
         layout.addWidget(self._message)
 
         self._buttons = QDialogButtonBox(
@@ -579,6 +560,7 @@ class MainWindow(QMainWindow):
         self._status: dict | None = None
         self._tree: dict | None = None
         self._checks: list[health.Check] = []
+        self._banner_kind = "starting"
 
         # Selective-sync model
         self._wanted: list[str] = []            # pending selection, canonical casing
@@ -646,7 +628,8 @@ class MainWindow(QMainWindow):
         self._notice = QLabel("")
         self._notice.setWordWrap(True)
         self._notice.setContentsMargins(10, 6, 10, 6)
-        self._notice.setStyleSheet(f"color: {DOT_COLORS[health.RED]};")
+        self._notice.setStyleSheet(
+            f"color: {theme.severity_color(current_scheme(), health.RED)};")
         self._notice.hide()
         central_layout.addWidget(self._notice)
 
@@ -699,6 +682,44 @@ class MainWindow(QMainWindow):
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(1000)
         self._poll_timer.timeout.connect(self._poll_pending)
+        self._apply_theme()
+
+    def changeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        super().changeEvent(event)
+        theme_change = getattr(QEvent.Type, "ThemeChange", None)
+        if event.type() in (QEvent.Type.ApplicationPaletteChange, theme_change):
+            self._apply_theme()
+
+    def _apply_theme(self) -> None:
+        """Restyle persistent surfaces after the desktop palette changes."""
+        scheme = current_scheme()
+        self._notice.setStyleSheet(f"color: {theme.severity_color(scheme, health.RED)};")
+        self._prov_instruction.setStyleSheet(theme.instruction_style(scheme))
+        self._prov_warning.setStyleSheet(
+            f"color: {theme.severity_color(scheme, health.YELLOW)};")
+        self._prov_error.setStyleSheet(f"color: {theme.severity_color(scheme, health.RED)};")
+        self._sync_error.setStyleSheet(f"color: {theme.severity_color(scheme, health.RED)};")
+        self._backup_warning.setStyleSheet(
+            f"color: {theme.severity_color(scheme, health.YELLOW)};")
+        self._workspace_error_label.setStyleSheet(
+            f"color: {theme.severity_color(scheme, health.RED)};")
+        for label in (self._setup_paths, self._status_note, self._version_label,
+                      self._summary_note, self._filter_note):
+            label.setStyleSheet(f"color: {theme.muted_color(scheme)};")
+        self._banner.setStyleSheet(theme.banner_style(
+            scheme, self._banner_kind if self._banner_kind in theme.BANNER_STYLES[theme.LIGHT]
+            else "starting"))
+        if self._compatibility.state in theme.PROTOCOL_STYLES[theme.LIGHT]:
+            self._protocol.setStyleSheet(theme.protocol_style(scheme, self._compatibility.state))
+        for label in self.findChildren(QLabel):
+            kind = label.property("provision_kind")
+            if kind:
+                label.setStyleSheet(f"color: {theme.provision_color(scheme, kind)};")
+        for check in self._checks:
+            dot, _detail = self._ensure_check_row(check.name)
+            dot.setStyleSheet(f"color: {theme.severity_color(scheme, check.severity)};")
+        self._refresh_check_states()
+        self._rebuild_workspace_rows()
 
     # ------------------------------------------------------------- setup tab --
 
@@ -723,7 +744,7 @@ class MainWindow(QMainWindow):
         self._setup_paths.setWordWrap(True)
         self._setup_paths.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
-        self._setup_paths.setEnabled(False)
+        self._setup_paths.setStyleSheet(f"color: {theme.muted_color(current_scheme())};")
         layout.addWidget(self._setup_paths)
 
         env_row = QHBoxLayout()
@@ -861,8 +882,7 @@ class MainWindow(QMainWindow):
         self._prov_instruction = QLabel("")
         self._prov_instruction.setWordWrap(True)
         self._prov_instruction.setContentsMargins(10, 6, 10, 6)
-        self._prov_instruction.setStyleSheet(
-            f"background: #eef4fb; color: {PROVISION_COLORS[PROVISION_WAIT]};")
+        self._prov_instruction.setStyleSheet(theme.instruction_style(current_scheme()))
         self._prov_instruction.hide()
         layout.addWidget(self._prov_instruction)
 
@@ -879,7 +899,8 @@ class MainWindow(QMainWindow):
 
         self._prov_warning = QLabel("")
         self._prov_warning.setWordWrap(True)
-        self._prov_warning.setStyleSheet(f"color: {DOT_COLORS[health.YELLOW]};")
+        self._prov_warning.setStyleSheet(
+            f"color: {theme.severity_color(current_scheme(), health.YELLOW)};")
         self._prov_warning.hide()
         layout.addWidget(self._prov_warning)
 
@@ -887,7 +908,8 @@ class MainWindow(QMainWindow):
         self._prov_error.setWordWrap(True)
         self._prov_error.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
-        self._prov_error.setStyleSheet(f"color: {DOT_COLORS[health.RED]};")
+        self._prov_error.setStyleSheet(
+            f"color: {theme.severity_color(current_scheme(), health.RED)};")
         self._prov_error.hide()
         layout.addWidget(self._prov_error)
 
@@ -1118,7 +1140,8 @@ class MainWindow(QMainWindow):
         row_layout.setContentsMargins(0, 0, 0, 0)
         dot = QLabel(PROVISION_GLYPHS[kind])
         dot.setFixedWidth(16)
-        dot.setStyleSheet(f"color: {PROVISION_COLORS[kind]};")
+        dot.setProperty("provision_kind", kind)
+        dot.setStyleSheet(f"color: {theme.provision_color(current_scheme(), kind)};")
         title = QLabel(name)
         title.setMinimumWidth(170)
         title.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
@@ -1212,7 +1235,9 @@ class MainWindow(QMainWindow):
         head = QHBoxLayout()
         dot = QLabel("●")
         dot.setFixedWidth(16)
-        dot.setStyleSheet(f"color: {SETUP_COLORS.get(check.status, DOT_COLORS[health.RED])};")
+        severity = {firstrun.OK: health.GREEN, firstrun.WARN: health.YELLOW,
+                    firstrun.FAIL: health.RED}.get(check.status, health.RED)
+        dot.setStyleSheet(f"color: {theme.severity_color(current_scheme(), severity)};")
         name = QLabel(check.name)
         name.setMinimumWidth(170)
         name.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
@@ -1306,7 +1331,8 @@ class MainWindow(QMainWindow):
         note = QLabel("“Fully local content” is a lower bound: partially downloaded "
                       "files are not counted, so it is not the space iCloud uses in the VM.")
         note.setWordWrap(True)
-        note.setEnabled(False)
+        self._status_note = note
+        note.setStyleSheet(f"color: {theme.muted_color(current_scheme())};")
         layout.addWidget(note)
 
         layout.addStretch(1)
@@ -1367,7 +1393,8 @@ class MainWindow(QMainWindow):
         # `icloud-bridge-gui --version` prints.
         version = QLabel(f"Version {__version__}")
         version.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        version.setEnabled(False)
+        self._version_label = version
+        version.setStyleSheet(f"color: {theme.muted_color(current_scheme())};")
         layout.addWidget(version)
         return page
 
@@ -1416,7 +1443,8 @@ class MainWindow(QMainWindow):
             "Sizes are logical content size, not space already freed — the "
             "Status tab reports reclamation separately.")
         summary_note.setWordWrap(True)
-        summary_note.setEnabled(False)
+        self._summary_note = summary_note
+        summary_note.setStyleSheet(f"color: {theme.muted_color(current_scheme())};")
         layout.addWidget(summary_note)
 
         filter_row = QHBoxLayout()
@@ -1430,13 +1458,14 @@ class MainWindow(QMainWindow):
         self._filter_note = QLabel(
             "Searches the folder list plus files already loaded in this session.")
         self._filter_note.setWordWrap(True)
-        self._filter_note.setEnabled(False)
+        self._filter_note.setStyleSheet(f"color: {theme.muted_color(current_scheme())};")
         self._filter_note.hide()
         layout.addWidget(self._filter_note)
 
         self._sync_error = QLabel("")
         self._sync_error.setWordWrap(True)
-        self._sync_error.setStyleSheet(f"color: {DOT_COLORS[health.RED]};")
+        self._sync_error.setStyleSheet(
+            f"color: {theme.severity_color(current_scheme(), health.RED)};")
         self._sync_error.hide()
         layout.addWidget(self._sync_error)
 
@@ -1445,7 +1474,8 @@ class MainWindow(QMainWindow):
         # failed, so this warns persistently rather than failing the operation.
         self._backup_warning = QLabel("")
         self._backup_warning.setWordWrap(True)
-        self._backup_warning.setStyleSheet(f"color: {DOT_COLORS[health.YELLOW]};")
+        self._backup_warning.setStyleSheet(
+            f"color: {theme.severity_color(current_scheme(), health.YELLOW)};")
         self._backup_warning.hide()
         layout.addWidget(self._backup_warning)
 
@@ -1506,7 +1536,7 @@ class MainWindow(QMainWindow):
         self._workspace_error_label = QLabel("")
         self._workspace_error_label.setWordWrap(True)
         self._workspace_error_label.setStyleSheet(
-            f"color: {DOT_COLORS[health.RED]};")
+            f"color: {theme.severity_color(current_scheme(), health.RED)};")
         self._workspace_error_label.hide()
         layout.addWidget(self._workspace_error_label)
 
@@ -1610,7 +1640,7 @@ class MainWindow(QMainWindow):
                                    list(self._workspace_columns(row)))
             item.setData(0, ROLE_PATH, row.workspace.id)
             if row.state in WORKSPACE_ATTENTION_STATES:
-                brush = QBrush(QColor(DOT_COLORS[health.YELLOW]))
+                brush = QBrush(QColor(theme.severity_color(current_scheme(), health.YELLOW)))
                 for column in range(self._workspace_tree.columnCount()):
                     item.setForeground(column, brush)
             if row.workspace.id == selected:
@@ -1868,18 +1898,12 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------- lifecycle gating --
 
-    BANNER_STYLES = {
-        "starting": "background: #e7f0fb; color: #1a3a63;",
-        "shutdown": "background: #e7f0fb; color: #1a3a63;",
-        # Neutral grey: an intentional off state is not an error (D30).
-        "off": "background: #ececec; color: #3a3a3a;",
-        "error": f"background: #fbecea; color: {DOT_COLORS[health.RED]};",
-    }
-
     def show_banner(self, text: str, kind: str = "starting") -> None:
         """Show a transitional banner above the tabs."""
         self._banner.setText(text)
-        self._banner.setStyleSheet(self.BANNER_STYLES.get(kind, self.BANNER_STYLES["starting"]))
+        self._banner_kind = kind
+        self._banner.setStyleSheet(theme.banner_style(
+            current_scheme(), kind if kind in theme.BANNER_STYLES[theme.LIGHT] else "starting"))
         self._banner.show()
 
     def hide_banner(self) -> None:
@@ -1894,13 +1918,6 @@ class MainWindow(QMainWindow):
         self._notice.hide()
 
     # ------------------------------------------------- the D35 version gate --
-
-    #: Yellow for skew (everything works, the pair is wrong), red for an
-    #: unsupported protocol (nothing may be written).
-    PROTOCOL_STYLES = {
-        bridge.COMPAT_SKEWED: "background: #fdf5e2; color: #6b4e00;",
-        bridge.COMPAT_INCOMPATIBLE: f"background: #fbecea; color: {DOT_COLORS[health.RED]};",
-    }
 
     def _apply_compatibility(self, compatibility: bridge.Compatibility) -> None:
         """Record the classification and show the matching persistent banner.
@@ -1921,7 +1938,8 @@ class MainWindow(QMainWindow):
             self._protocol_box.hide()
             self._update_buttons()
             return
-        self._protocol.setStyleSheet(self.PROTOCOL_STYLES[compatibility.state])
+        self._protocol.setStyleSheet(theme.protocol_style(
+            current_scheme(), compatibility.state))
         self._protocol_box.show()
         self._update_buttons()
 
@@ -2061,7 +2079,8 @@ class MainWindow(QMainWindow):
         self._apply_compatibility(snapshot.compatibility)
         for check in snapshot.checks:
             dot, detail = self._ensure_check_row(check.name)
-            dot.setStyleSheet(f"color: {DOT_COLORS[check.severity]};")
+            dot.setStyleSheet(
+                f"color: {theme.severity_color(current_scheme(), check.severity)};")
             detail.setText(check.detail)
 
         status = snapshot.status or {}
@@ -2341,7 +2360,7 @@ class MainWindow(QMainWindow):
         lowered = [w.lower() for w in self._wanted]
         palette = self._tree_widget.palette()
         normal = QBrush(palette.color(QPalette.ColorRole.Text))
-        greyed = QBrush(QColor(palette.color(QPalette.ColorRole.Text)).lighter(170))
+        greyed = QBrush(QColor(theme.dim_color(current_scheme())))
 
         self._suppress_item_signals = True
         try:
@@ -2539,7 +2558,7 @@ class MainWindow(QMainWindow):
         font = more.font(COL_NAME)
         font.setUnderline(True)
         more.setFont(COL_NAME, font)
-        more.setForeground(COL_NAME, QBrush(QColor(LINK_COLOR)))
+        more.setForeground(COL_NAME, QBrush(QColor(theme.link_color(current_scheme()))))
 
     def _restore_more_row(self, request: listing.PendingRequest) -> None:
         """Put a failed continuation back at its original offset so it can retry."""
