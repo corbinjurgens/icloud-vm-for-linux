@@ -158,14 +158,21 @@ Runner = Callable[[list[str], float, Mapping[str, str]], RunResult]
 
 def default_runner(argv: list[str], timeout: float,
                    env: Mapping[str, str]) -> RunResult:
-    """Section 7.7's production adapter: no shell, bounded, captured as text."""
+    """Section 7.7's production adapter: no shell, bounded, decoded leniently.
+
+    Unison's own progress lines are truncated at a fixed column count, which
+    can slice a multibyte filename in half; the bytes it prints are therefore
+    not guaranteed valid UTF-8, so decoding here must never raise.
+    """
     try:
         completed = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout, check=False,
+            argv, capture_output=True, timeout=timeout, check=False,
             env=dict(env), cwd=WORKING_DIRECTORY)
     except subprocess.TimeoutExpired as exc:      # normalize for callers/tests
         raise TimeoutError(f"{argv[0]} timed out after {timeout}s") from exc
-    return RunResult(completed.returncode, completed.stdout, completed.stderr)
+    stdout = completed.stdout.decode("utf-8", errors="replace")
+    stderr = completed.stderr.decode("utf-8", errors="replace")
+    return RunResult(completed.returncode, stdout, stderr)
 
 
 def base_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:

@@ -279,6 +279,26 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-30 — A sliced non-ASCII filename no longer crash-loops a workspace
+
+Unison truncates its scan-progress status lines at a fixed 80-column boundary,
+which can slice a multibyte UTF-8 filename in half and leave orphaned
+continuation bytes (observed live: `0x8b 0x95` from a Japanese filename) in its
+captured stdout. `workspace_sync.default_runner` called `subprocess.run(...,
+text=True, ...)`, which decodes strictly, so that byte sequence raised
+`UnicodeDecodeError` from inside `_invoke`. Nothing on the call path catches
+that exception class — `_invoke` only handles `FileNotFoundError`,
+`TimeoutError` and `OSError`, and `run_cycle` only `WorkspaceError` — so it
+escaped to the GUI's last-resort worker handler: the Safe Workspaces tab showed
+a bare "error", no status document was written, and the five-second tick
+retried forever, an endless crash loop of full rescans triggered
+deterministically by any workspace containing a long non-ASCII filename.
+
+`default_runner` now captures stdout and stderr as bytes and decodes each with
+`errors="replace"`, so an invalid byte becomes U+FFFD instead of an exception.
+Section 7.7's execution-environment contract in
+`docs/plan-safe-local-workspaces.md` is updated to match.
+
 ### 2026-07-30 — The window remembers itself, and a dead launch says so
 
 A tray application is opened many times a day, and this one reopened at the same

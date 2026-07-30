@@ -234,6 +234,27 @@ def test_the_default_runner_reports_a_timeout_rather_than_hanging():
                                       workspace_sync.base_env())
 
 
+def test_the_default_runner_replaces_invalid_utf8_instead_of_raising():
+    # A filename sliced mid-character by Unison's 80-column progress line
+    # leaves orphaned continuation bytes (0xaa, 0x8b) in real captured output.
+    result = workspace_sync.default_runner(
+        [sys.executable, "-c",
+         "import sys; sys.stdout.buffer.write(b'ab\\xaa\\x8bcd')"],
+        30, workspace_sync.base_env())
+    assert result.stdout == "ab��cd"
+
+
+def test_the_default_runner_replaces_invalid_utf8_on_stderr_too():
+    result = workspace_sync.default_runner(
+        [sys.executable, "-c",
+         "import sys\n"
+         "sys.stdout.buffer.write(b'out\\xaa')\n"
+         "sys.stderr.buffer.write(b'err\\x8b')\n"],
+        30, workspace_sync.base_env())
+    assert result.stdout == "out�"
+    assert result.stderr == "err�"
+
+
 # ------------------------------------------------------------ the gating order --
 
 def test_a_paused_workspace_does_no_io_at_all(env):

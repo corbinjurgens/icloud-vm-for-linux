@@ -503,7 +503,10 @@ winner, deletes an archive, runs continuously, or overrides a lock.
 Execution environment (production adapter):
 
 - `subprocess.run` with a **120-second** timeout, `capture_output=True`,
-  `text=True`, no shell, and no `cwd` inside either replica;
+  no shell, and no `cwd` inside either replica; stdout and stderr are captured
+  as bytes and decoded UTF-8 with `errors="replace"`, because Unison truncates
+  its progress lines at a fixed column and can slice a non-ASCII filename mid-
+  character;
 - `UNISON=<state>/unison` — a workspace-private archive/profile directory
   (mode 0700), so a user-wide `~/.unison` profile can never change behaviour;
 - `NO_COLOR=1`;
