@@ -122,7 +122,6 @@ register explicitly.
 | `README.md` | — | Overview, usage, and development entry points |
 | `SETUP.md` | — | Annotated real-machine runbook |
 | `CHANGELOG.md` | — | Improvements, investigations, and next work |
-| `todo/` | — | Non-authoritative working notes |
 | `CONTRIBUTING.md` | — | This canonical contributor guide |
 
 The Qt boundary is part of the design. `tray.py`, `window.py`, and
@@ -188,8 +187,10 @@ Move specifications together, not duplicate text:
   commit.
 - A change to a locked decision updates that decision's register row before it
   lands.
-- A todo proposing a decision must move the decision into a plan register
-  before implementation.
+- A working note proposing a decision must move the decision into a plan
+  register before implementation. Working notes live outside the repository, in
+  the operator's cloud-synced vault under `4. Projects/iCloud Bridge/todo/`
+  (the pre-2026-07-30 history keeps the old in-repo `todo/` copies).
 
 Decisions D1-D13 in the v1 plan and D14 onward in the v2 plan are locked. Do
 not silently substitute components. SMB rather than a robocopy mirror is D6;
