@@ -19,6 +19,17 @@ def test_both_schemes_cover_all_theme_tokens():
         assert set(theme.PROTOCOL_STYLES[scheme]) == {"skewed", "incompatible"}
 
 
+def test_the_tray_covers_its_two_non_severity_states_in_both_schemes():
+    for scheme in (theme.LIGHT, theme.DARK):
+        assert set(theme.TRAY_COLORS[scheme]) == {"starting", "off"}
+    # The boot disc must stay a distinct blue rather than drifting towards the
+    # yellow fault colour (D29): more blue than red in both schemes.
+    for scheme in (theme.LIGHT, theme.DARK):
+        starting = theme.tray_color(scheme, "starting")
+        red, blue = int(starting[1:3], 16), int(starting[5:7], 16)
+        assert blue > red
+
+
 def test_dark_severity_colours_are_lighter_than_light():
     for severity in (health.GREEN, health.YELLOW, health.RED):
         assert theme.lightness(theme.severity_color(theme.DARK, severity)) > \

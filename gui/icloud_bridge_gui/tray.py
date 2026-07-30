@@ -86,8 +86,7 @@ def load_icon(state: str) -> QIcon:
     if state in (health.GREEN, health.YELLOW, health.RED):
         color = theme.severity_color(scheme, state)
     else:
-        color = theme.provision_color(
-            scheme, "wait" if state == STARTING else "pending")
+        color = theme.tray_color(scheme, STARTING if state == STARTING else OFF)
     painter.setBrush(QColor(color))
     painter.setPen(QColor(0, 0, 0, 0))
     painter.drawEllipse(6, 6, 52, 52)

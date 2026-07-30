@@ -1489,7 +1489,9 @@ asking the binary for its version never disturbs a running tray instance.
   selection semantics, not the in-memory tree. Ancestor expansion is performed
   with the expansion handler suppressed so it fires no list requests, and the
   operator's own expanded/collapsed state is saved when a filter starts and
-  restored when it is cleared.
+  restored when it is cleared. Typing is debounced by 150 ms: a real library is
+  thousands of rows and the pass walks all of them, so it runs once the operator
+  pauses rather than once per keystroke.
 - **Excluded-space summary (`sizes.py`, Qt-free)** sits under the introduction
   and is recomputed whenever `_wanted`, a tree/list response, `status.json`, or
   a Reload changes something: *"Excluded: 3 roots, about 42 GB logical (1 size

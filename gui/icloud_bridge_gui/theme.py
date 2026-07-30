@@ -36,6 +36,14 @@ PROTOCOL_STYLES = {
     DARK: {"skewed": "background: #4b3a17; color: #ffe39a;",
            "incompatible": "background: #4a2829; color: #ffaaa2;"},
 }
+#: The two tray states that are not health severities: the multi-minute Windows
+#: boot (a distinct blue, never the yellow fault colour — D29) and a deliberate
+#: power-off (grey, because an intentional off state is not a fault — D30). Only
+#: the SVG-less fallback disc uses these; the shipped icons carry their own.
+TRAY_COLORS = {
+    LIGHT: {"starting": "#3a7bd5", "off": "#8b8e91"},
+    DARK: {"starting": "#7aa9e8", "off": "#b6b8bb"},
+}
 _LINK_COLORS = {LIGHT: "#1a5fb4", DARK: "#78aeed"}
 _MUTED_COLORS = {LIGHT: "#697277", DARK: "#aeb2b5"}
 _DIM_COLORS = {LIGHT: "#697277", DARK: "#aeb2b5"}
@@ -56,6 +64,11 @@ def severity_color(scheme: str, severity: str) -> str:
 
 def provision_color(scheme: str, kind: str) -> str:
     return PROVISION_COLORS[scheme][kind]
+
+
+def tray_color(scheme: str, state: str) -> str:
+    """The fallback disc colour for a tray state that is not a severity."""
+    return TRAY_COLORS[scheme][state]
 
 
 def link_color(scheme: str) -> str:

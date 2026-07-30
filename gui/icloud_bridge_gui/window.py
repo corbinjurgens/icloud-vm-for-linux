@@ -101,6 +101,11 @@ SEVERITY_GLYPHS = {
     health.RED: "■",
 }
 
+#: No severity to report yet: a row cleared with `clear_health_rows`, a check not
+#: yet inspected. Hollow rather than filled, so it cannot be mistaken for green in
+#: a monochrome screenshot.
+NEUTRAL_GLYPH = "○"
+
 SEVERITY_WORDS = {
     health.GREEN: "healthy",
     health.YELLOW: "warning",
@@ -113,7 +118,7 @@ PROVISION_GLYPHS = {
     PROVISION_WAIT: "▶",
     PROVISION_BLOCKED: SEVERITY_GLYPHS[health.RED],
     PROVISION_CREDENTIAL: "◆",
-    PROVISION_PENDING: "○",
+    PROVISION_PENDING: NEUTRAL_GLYPH,
 }
 
 
@@ -784,6 +789,14 @@ class MainWindow(QMainWindow):
         for check in self._checks:
             dot, _detail = self._ensure_check_row(check.name)
             dot.setStyleSheet(f"color: {theme.severity_color(scheme, check.severity)};")
+        # A "Load more…" row is painted rather than styled, so it needs the same
+        # repaint the check states and the workspace rows get below; otherwise a
+        # theme switch leaves the previous scheme's link colour on screen until
+        # something happens to rebuild the tree.
+        link = QBrush(QColor(theme.link_color(scheme)))
+        for item in self._iter_items():
+            if item.data(0, ROLE_KIND) == "more":
+                item.setForeground(COL_NAME, link)
         self._refresh_check_states()
         self._rebuild_workspace_rows()
 
@@ -1496,7 +1509,7 @@ class MainWindow(QMainWindow):
         row = QWidget()
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(0, 0, 0, 0)
-        dot = QLabel("○")
+        dot = QLabel(NEUTRAL_GLYPH)
         dot.setFixedWidth(16)
         title = QLabel(name)
         title.setMinimumWidth(150)
@@ -2189,7 +2202,7 @@ class MainWindow(QMainWindow):
         # reachable; back to `unknown`, which also re-closes the D35 write gate.
         self._apply_compatibility(bridge.Compatibility())
         for dot, detail in self._check_widgets.values():
-            dot.setText("○")
+            dot.setText(NEUTRAL_GLYPH)
             dot.setAccessibleName("status unavailable")
             dot.setToolTip("status unavailable")
             dot.setStyleSheet("color: palette(mid);")

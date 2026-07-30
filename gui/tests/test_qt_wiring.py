@@ -437,6 +437,20 @@ def test_failed_external_open_uses_the_status_bar(qapp, fakes, monkeypatch):
         "Could not open /mnt/icloud: no desktop handler could be started."
 
 
+def test_the_remembered_tab_roster_is_every_tab_the_window_can_show(qapp, fakes):
+    """`uistate.TABS` is matched against tab *titles*, so drift is silent.
+
+    A renamed or added tab would simply stop being restorable, with nothing to
+    notice it — so the roster is asserted against the real window, Setup tab
+    included.
+    """
+    window = window_module.MainWindow(lambda *_args: None)
+    window.show_setup_tab()
+    titles = {window._tabs.tabText(index)
+              for index in range(window._tabs.count())}
+    assert titles == set(uistate.TABS)
+
+
 def test_reprovision_action_owns_both_wordings(qapp, fakes):
     window = window_module.MainWindow(lambda *_args: None)
     window.set_reprovision_action(True, first_run=True)
@@ -543,6 +557,14 @@ def test_theme_refresh_uses_dark_tokens_and_palette_event(controller, fakes, mon
     assert theme.banner_style(theme.DARK, "starting") == window._banner.styleSheet()
     dot, _detail = window._check_widgets["Container"]
     assert theme.severity_color(theme.DARK, health.GREEN) in dot.styleSheet()
+
+    # A painted row, not a styled widget: it must follow the switch as well.
+    parent = _dir_row(window, "Docs")
+    window._more_row(parent, "Docs", 100)
+    window.changeEvent(QEvent(QEvent.Type.ApplicationPaletteChange))
+    more = parent.child(0)
+    assert more.foreground(window_module.COL_NAME).color().name() == \
+        theme.link_color(theme.DARK)
 
 
 def test_severity_glyphs_and_accessible_names_cover_status_and_setup(controller, fakes):
