@@ -279,6 +279,19 @@ happens after that, never before.
 
 ## Shipped improvements
 
+### 2026-07-30 — D54: keyboard-selective sync and legible severity
+
+Selective Sync can now be operated without a mouse: Space, Enter and Return
+toggle the selected file or folder through the same confirmation and selection
+rules as its checkbox, while Load more keeps its keyboard activation. Status and
+Setup rows now pair their severity colours with distinct circle, triangle and
+square glyphs plus accessible severity text, so the result does not depend on
+colour alone.
+
+Repository tests cover the Qt wiring, but keyboard-only operation and
+colour-blind legibility can only be confirmed on the real desktop. E17 records
+that required live check, including the greyscale screenshot confirmation.
+
 ### 2026-07-30 — D53: the GUI follows the desktop palette
 
 The GUI's painted colours now live in one Qt-free, palette-aware `theme.py`

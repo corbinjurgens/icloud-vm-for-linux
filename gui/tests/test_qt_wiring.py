@@ -32,7 +32,8 @@ pytest.importorskip("PySide6")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QDeadlineTimer, QEvent, QThreadPool, QTimer, Qt   # noqa: E402
-from PySide6.QtWidgets import QApplication                       # noqa: E402
+from PySide6.QtGui import QKeyEvent                              # noqa: E402
+from PySide6.QtWidgets import QApplication, QTreeWidgetItem      # noqa: E402
 
 from icloud_bridge_gui import __main__ as app_module              # noqa: E402
 from icloud_bridge_gui import window as window_module             # noqa: E402
@@ -437,6 +438,13 @@ def controller(qapp, fakes, request):
         for _ in range(2):
             QThreadPool.globalInstance().waitForDone(5000)
             pump(0.2)
+        # A late landing can dispatch START_POLLING and restart the timer that was
+        # stopped above; a controller left with a live 5 s tick would keep gathering
+        # against whatever fakes the *next* test installs.
+        instance._timer.stop()
+        instance._prov_timer.stop()
+        instance._prov_probe_timer.stop()
+        instance._workspace_timer.stop()
 
 
 def _connectable(tray):
@@ -468,6 +476,11 @@ def test_every_effect_has_a_handler():
 
 def test_theme_refresh_uses_dark_tokens_and_palette_event(controller, fakes, monkeypatch):
     app = controller()
+    # Let startup settle inside this test: a controller left mid-startup
+    # finishes during teardown, and the effects of that late landing restart
+    # the poll timer after teardown has already stopped it — a leaked timer
+    # that then counts gathers against a later test's fakes.
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.RUNNING)
     window = app._window
     monkeypatch.setattr(window_module, "current_scheme", lambda: theme.DARK)
     window.show_banner("Starting")
@@ -479,8 +492,99 @@ def test_theme_refresh_uses_dark_tokens_and_palette_event(controller, fakes, mon
     assert theme.severity_color(theme.DARK, health.GREEN) in dot.styleSheet()
 
 
+def test_severity_glyphs_and_accessible_names_cover_status_and_setup(controller, fakes):
+    app = controller()
+    # Let startup settle inside this test: a controller left mid-startup
+    # finishes during teardown, and the effects of that late landing restart
+    # the poll timer after teardown has already stopped it — a leaked timer
+    # that then counts gathers against a later test's fakes.
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.RUNNING)
+    window = app._window
+    checks = [health.Check("Green", health.GREEN, "ok"),
+              health.Check("Yellow", health.YELLOW, "attention"),
+              health.Check("Red", health.RED, "broken")]
+    window.apply_snapshot(health.Snapshot(checks, health.RED, None, None))
+
+    for check in checks:
+        dot, _detail = window._check_widgets[check.name]
+        assert dot.text() == window_module.SEVERITY_GLYPHS[check.severity]
+        assert dot.accessibleName() == \
+            f"{check.name}: {window_module.SEVERITY_WORDS[check.severity]}"
+        assert dot.toolTip() == dot.accessibleName()
+
+    setup_checks = [firstrun.Check("green", "Green", firstrun.OK, "ok"),
+                    firstrun.Check("yellow", "Yellow", firstrun.WARN, "attention"),
+                    firstrun.Check("red", "Red", firstrun.FAIL, "broken")]
+    for check in setup_checks:
+        widget = window._build_check_row(check)
+        row = widget.layout().itemAt(0).layout()
+        dot = row.itemAt(0).widget()
+        severity = {firstrun.OK: health.GREEN, firstrun.WARN: health.YELLOW,
+                    firstrun.FAIL: health.RED}[check.status]
+        assert dot.text() == window_module.SEVERITY_GLYPHS[severity]
+        assert dot.accessibleName() == \
+            f"{check.name}: {window_module.SEVERITY_WORDS[severity]}"
+        assert dot.toolTip() == dot.accessibleName()
+
+
+def test_the_window_shortcuts_are_bound_to_the_existing_actions(controller, fakes):
+    """The bindings and where they apply, then the effect through the action.
+
+    Sending the key itself would depend on which window the offscreen platform
+    calls active — and the context is the load-bearing half anyway: an
+    application-wide Ctrl+Q would fire from inside this app's own modal dialogs.
+    """
+    app = controller()
+    # Let startup settle inside this test: a controller left mid-startup
+    # finishes during teardown, and the effects of that late landing restart
+    # the poll timer after teardown has already stopped it — a leaked timer
+    # that then counts gathers against a later test's fakes.
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.RUNNING)
+    window = app._window
+    window_context = Qt.ShortcutContext.WindowShortcut
+    bindings = {
+        window._refresh_action: ["F5", "Ctrl+R"],
+        window._close_action: ["Ctrl+W"],
+        window._quit_action: ["Ctrl+Q"],
+    }
+    for action, keys in bindings.items():
+        assert [s.toString() for s in action.shortcuts()] == keys
+        assert action.shortcutContext() == window_context
+
+    requested = []
+    window.refresh_requested.connect(lambda: requested.append(True))
+    window._refresh_action.trigger()
+    assert requested == [True]
+    # The controller answers that signal with a real gather worker. Let it land
+    # here: a worker still in flight when this test ends would resolve
+    # `health.gather` against the *next* test's fake and be counted there.
+    pump(2.0, until=lambda: bool(fakes.gather.count))
+
+    quits = []
+    window.quit_requested.connect(lambda: quits.append(True))
+    window._quit_action.trigger()
+    assert quits == [True]
+
+
+def test_the_close_shortcut_takes_the_same_route_as_closing_the_window(controller,
+                                                                      fakes):
+    """Ctrl+W is the close path, not a second one beside it (D54)."""
+    app = controller(with_tray=True)
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.RUNNING)
+    app._window.show()
+    app._window._close_action.trigger()
+    pump(0.2)
+    assert not app._window.isVisible()
+    assert fakes.quits == []            # hiding is not quitting
+
+
 def test_secondary_copyable_labels_remain_enabled(controller, fakes):
     app = controller()
+    # Let startup settle inside this test: a controller left mid-startup
+    # finishes during teardown, and the effects of that late landing restart
+    # the poll timer after teardown has already stopped it — a leaked timer
+    # that then counts gathers against a later test's fakes.
+    pump(2.0, until=lambda: app._model.phase is lifecycle.Phase.RUNNING)
     window = app._window
     selectable = Qt.TextInteractionFlag.TextSelectableByMouse
     for label in (window._version_label, window._setup_paths):
@@ -1491,6 +1595,81 @@ def _dir_row(window, path: str):
     item.setData(0, window_module.ROLE_KIND, "dir")
     window._row_epoch += 1
     return item
+
+
+def _key_press(widget, key, modifiers=Qt.KeyboardModifier.NoModifier):
+    QApplication.sendEvent(widget, QKeyEvent(QEvent.Type.KeyPress, key, modifiers))
+
+
+def test_space_toggles_the_selected_folder_through_the_existing_selection_path(
+        controller, fakes):
+    app, window = running_controller(controller, fakes)
+    window._wanted = []
+    window._loaded_wanted = []
+    folder = _dir_row(window, "Folder")
+    window._refresh_check_states()
+    window._tree_widget.setCurrentItem(folder)
+
+    _key_press(window._tree_widget, Qt.Key.Key_Space)
+
+    assert window._wanted == ["Folder"]
+    assert window._apply_button.isEnabled()
+
+
+def test_space_on_a_partly_excluded_folder_follows_the_mouse_rule(controller, fakes,
+                                                                 monkeypatch, dialogs):
+    """Qt turns a partially checked box *on*; the keyboard must not invert that.
+
+    The divergence would matter: turning it on is what raises the folder-wide
+    include confirmation, while turning it off would silently exclude the whole
+    subtree from one keystroke.
+    """
+    app, window = running_controller(controller, fakes)
+    folder = _dir_row(window, "Folder")
+    window._wanted = ["Folder/Inner"]
+    window._loaded_wanted = ["Folder/Inner"]
+    window._refresh_check_states()
+    assert folder.checkState(window_module.COL_INCLUDED) \
+        == Qt.CheckState.PartiallyChecked
+    dialogs.answer = dialogs.StandardButton.Yes
+    window._tree_widget.setCurrentItem(folder)
+
+    _key_press(window._tree_widget, Qt.Key.Key_Space)
+
+    assert window._wanted == []          # the inner exclusion was included again
+
+
+def test_keyboard_selection_ignores_root_and_missing_rows(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    root = QTreeWidgetItem(window._tree_widget, ["iCloud Drive", "", "", "", ""])
+    root.setData(0, window_module.ROLE_KIND, "root")
+    missing_group = QTreeWidgetItem(window._tree_widget, ["Missing", "", "", "", ""])
+    missing_group.setData(0, window_module.ROLE_KIND, "missing-group")
+    missing = QTreeWidgetItem(missing_group, ["Gone", "", "", "", ""])
+    missing.setData(0, window_module.ROLE_KIND, "missing")
+    before = list(window._wanted)
+
+    for item in (root, missing_group, missing):
+        window._tree_widget.setCurrentItem(item)
+        _key_press(window._tree_widget, Qt.Key.Key_Space)
+
+    assert window._wanted == before
+
+
+def test_enter_on_load_more_keeps_its_existing_activation(controller, fakes):
+    app, window = running_controller(controller, fakes)
+    parent = _dir_row(window, "Docs")
+    window._more_row(parent, "Docs", 100)
+    more = parent.child(0)
+    window._tree_widget.setCurrentItem(more)
+
+    _key_press(window._tree_widget, Qt.Key.Key_Return)
+
+    assert more.text(window_module.COL_NAME) == "Loading…"
+    assert pump(2.0, until=lambda: bool(fakes.request_listing.calls))
+    args, kwargs = fakes.request_listing.calls[0]
+    assert args == ("Docs",)
+    assert kwargs["offset"] == 100
 
 
 def test_state_column_skips_the_walk_when_nothing_feeding_it_moved(controller, fakes):

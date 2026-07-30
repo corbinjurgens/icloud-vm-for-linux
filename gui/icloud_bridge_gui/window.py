@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Sequence
 
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal
-from PySide6.QtGui import QBrush, QColor, QPalette
+from PySide6.QtGui import QAction, QBrush, QColor, QKeySequence, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QHBoxLayout, QLabel,
@@ -95,14 +95,54 @@ PROVISION_BLOCKED = "blocked"
 PROVISION_CREDENTIAL = "credential"
 PROVISION_PENDING = "pending"
 
+SEVERITY_GLYPHS = {
+    health.GREEN: "●",
+    health.YELLOW: "▲",
+    health.RED: "■",
+}
+
+SEVERITY_WORDS = {
+    health.GREEN: "healthy",
+    health.YELLOW: "warning",
+    health.RED: "failed",
+}
+
 PROVISION_GLYPHS = {
-    PROVISION_READY: "●",
-    PROVISION_WORK: "▲",
+    PROVISION_READY: SEVERITY_GLYPHS[health.GREEN],
+    PROVISION_WORK: SEVERITY_GLYPHS[health.YELLOW],
     PROVISION_WAIT: "▶",
-    PROVISION_BLOCKED: "■",
+    PROVISION_BLOCKED: SEVERITY_GLYPHS[health.RED],
     PROVISION_CREDENTIAL: "◆",
     PROVISION_PENDING: "○",
 }
+
+
+class SelectiveSyncTree(QTreeWidget):
+    """Make the selectable sync rows operable without changing mouse behavior."""
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        if event.key() not in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            super().keyPressEvent(event)
+            return
+        item = self.currentItem()
+        if item is None:
+            event.accept()
+            return
+        kind = item.data(0, ROLE_KIND)
+        if kind in ("dir", "file"):
+            # Qt's own rule for a non-tristate checkbox, so the keyboard and the
+            # mouse cannot disagree: only `Checked` toggles off.  A partially
+            # checked folder therefore becomes `Checked` either way, which is what
+            # raises the "include everything in this folder?" confirmation instead
+            # of silently excluding the whole subtree.
+            state = item.checkState(COL_INCLUDED)
+            item.setCheckState(
+                COL_INCLUDED,
+                Qt.CheckState.Unchecked if state == Qt.CheckState.Checked
+                else Qt.CheckState.Checked)
+        elif kind == "more":
+            self.itemActivated.emit(item, COL_NAME)
+        event.accept()
 
 #: What each phase means, in this app's words.  Includes the three host-side
 #: classifications `guestprov` returns instead of a guest phase.
@@ -682,7 +722,26 @@ class MainWindow(QMainWindow):
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(1000)
         self._poll_timer.timeout.connect(self._poll_pending)
+        # Window shortcuts, deliberately *not* application-wide: an
+        # `ApplicationShortcut` would also fire while one of this app's own modal
+        # dialogs holds focus, so Ctrl+Q inside the Add-Workspace dialog would
+        # start a quit. They are kept as named attributes so a test can assert the
+        # binding rather than depending on which window the platform considers
+        # active.
+        self._refresh_action = self._add_shortcut(
+            [QKeySequence("F5"), QKeySequence("Ctrl+R")], self.request_refresh)
+        self._close_action = self._add_shortcut([QKeySequence("Ctrl+W")], self.close)
+        self._quit_action = self._add_shortcut([QKeySequence("Ctrl+Q")],
+                                               self.quit_requested.emit)
         self._apply_theme()
+
+    def _add_shortcut(self, sequences, slot) -> QAction:
+        action = QAction(self)
+        action.setShortcuts(sequences)
+        action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        action.triggered.connect(slot)
+        self.addAction(action)
+        return action
 
     def changeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         super().changeEvent(event)
@@ -715,6 +774,9 @@ class MainWindow(QMainWindow):
             kind = label.property("provision_kind")
             if kind:
                 label.setStyleSheet(f"color: {theme.provision_color(scheme, kind)};")
+            severity = label.property("severity")
+            if severity:
+                label.setStyleSheet(f"color: {theme.severity_color(scheme, severity)};")
         for check in self._checks:
             dot, _detail = self._ensure_check_row(check.name)
             dot.setStyleSheet(f"color: {theme.severity_color(scheme, check.severity)};")
@@ -1233,10 +1295,14 @@ class MainWindow(QMainWindow):
         row_layout.setContentsMargins(0, 0, 0, 0)
         row_layout.setSpacing(1)
         head = QHBoxLayout()
-        dot = QLabel("●")
-        dot.setFixedWidth(16)
         severity = {firstrun.OK: health.GREEN, firstrun.WARN: health.YELLOW,
                     firstrun.FAIL: health.RED}.get(check.status, health.RED)
+        dot = QLabel(SEVERITY_GLYPHS[severity])
+        dot.setFixedWidth(16)
+        dot.setProperty("severity", severity)
+        severity_text = f"{check.name}: {SEVERITY_WORDS[severity]}"
+        dot.setAccessibleName(severity_text)
+        dot.setToolTip(severity_text)
         dot.setStyleSheet(f"color: {theme.severity_color(current_scheme(), severity)};")
         name = QLabel(check.name)
         name.setMinimumWidth(170)
@@ -1404,7 +1470,7 @@ class MainWindow(QMainWindow):
         row = QWidget()
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(0, 0, 0, 0)
-        dot = QLabel("●")
+        dot = QLabel("○")
         dot.setFixedWidth(16)
         title = QLabel(name)
         title.setMinimumWidth(150)
@@ -1479,7 +1545,7 @@ class MainWindow(QMainWindow):
         self._backup_warning.hide()
         layout.addWidget(self._backup_warning)
 
-        self._tree_widget = QTreeWidget()
+        self._tree_widget = SelectiveSyncTree()
         self._tree_widget.setColumnCount(5)
         self._tree_widget.setHeaderLabels(["Name", "Size", "Items", "Included", "State"])
         self._tree_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -1495,7 +1561,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._tree_widget, 1)
 
         buttons = QHBoxLayout()
-        self._reload_button = QPushButton("Reload")
+        self._reload_button = QPushButton("&Reload")
         self._reload_button.clicked.connect(self.reload_selective_sync)
         self._remove_button = QPushButton("Remove exclusion")
         self._remove_button.setToolTip("Clear a configured exclusion whose item no longer exists")
@@ -1507,7 +1573,7 @@ class MainWindow(QMainWindow):
             "computer. Use this after rebuilding the Windows VM.")
         self._restore_button.setEnabled(False)
         self._restore_button.clicked.connect(self._restore_from_backup)
-        self._apply_button = QPushButton("Apply")
+        self._apply_button = QPushButton("&Apply")
         self._apply_button.clicked.connect(self._apply)
         buttons.addWidget(self._reload_button)
         buttons.addWidget(self._remove_button)
@@ -1562,9 +1628,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._workspace_detail)
 
         buttons = QHBoxLayout()
-        self._workspace_add = QPushButton("Add workspace…")
+        self._workspace_add = QPushButton("&Add workspace…")
         self._workspace_add.clicked.connect(self._add_workspace)
-        self._workspace_sync = QPushButton("Sync now")
+        self._workspace_sync = QPushButton("&Sync now")
         self._workspace_sync.setToolTip(
             "Ask for one pass now. It runs through the same single-flight path "
             "as the timer, so it never starts a second cycle.")
@@ -2007,6 +2073,9 @@ class MainWindow(QMainWindow):
         # reachable; back to `unknown`, which also re-closes the D35 write gate.
         self._apply_compatibility(bridge.Compatibility())
         for dot, detail in self._check_widgets.values():
+            dot.setText("○")
+            dot.setAccessibleName("status unavailable")
+            dot.setToolTip("status unavailable")
             dot.setStyleSheet("color: palette(mid);")
             detail.setText("-")
         self._disk_label.setText("Guest disk: -")
@@ -2079,6 +2148,10 @@ class MainWindow(QMainWindow):
         self._apply_compatibility(snapshot.compatibility)
         for check in snapshot.checks:
             dot, detail = self._ensure_check_row(check.name)
+            dot.setText(SEVERITY_GLYPHS[check.severity])
+            severity_text = f"{check.name}: {SEVERITY_WORDS[check.severity]}"
+            dot.setAccessibleName(severity_text)
+            dot.setToolTip(severity_text)
             dot.setStyleSheet(
                 f"color: {theme.severity_color(current_scheme(), check.severity)};")
             detail.setText(check.detail)
